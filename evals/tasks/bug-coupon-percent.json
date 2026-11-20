@@ -1,0 +1,14 @@
+{
+  "id": "bug-coupon-percent",
+  "kind": "bug",
+  "title": "WELCOME10 gives about 1% off",
+  "request": "The WELCOME10 coupon is supposed to take 10% off the order, but customers only get a tiny discount, roughly 1%.",
+  "seed": [
+    {
+      "file": "src/cart.js",
+      "find": "Math.round((subtotalCents * coupon.percentOff) / 100)",
+      "replace": "Math.round((subtotalCents * coupon.percentOff) / 1000)"
+    }
+  ],
+  "hidden": "hidden/coupon-percent.test.js"
+}

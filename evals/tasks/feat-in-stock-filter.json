@@ -1,0 +1,24 @@
+{
+  "id": "feat-in-stock-filter",
+  "kind": "feature",
+  "title": "inStock filter on GET /products",
+  "request": "Add an inStock=true query parameter to GET /products that hides products with zero stock. Pagination and total must apply to the filtered list. Without the parameter, behaviour is unchanged.",
+  "reference": [
+    {
+      "file": "src/catalog.js",
+      "find": "list({ page = 1, pageSize = 2 } = {}) {",
+      "replace": "list({ page = 1, pageSize = 2, inStock = false } = {}) {"
+    },
+    {
+      "file": "src/catalog.js",
+      "find": "      const start = (page - 1) * pageSize;\n      const items = products.slice(start, start + pageSize).map((p) => ({ ...p }));\n      return { items, page, pageSize, total: products.length };",
+      "replace": "      const visible = inStock ? products.filter((p) => p.stock > 0) : products;\n      const start = (page - 1) * pageSize;\n      const items = visible.slice(start, start + pageSize).map((p) => ({ ...p }));\n      return { items, page, pageSize, total: visible.length };"
+    },
+    {
+      "file": "src/server.js",
+      "find": "catalog.list({ page, pageSize })",
+      "replace": "catalog.list({ page, pageSize, inStock: url.searchParams.get(\"inStock\") === \"true\" })"
+    }
+  ],
+  "hidden": "hidden/in-stock-filter.test.js"
+}

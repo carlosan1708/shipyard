@@ -1,0 +1,7 @@
+{
+  "name": "shipyard",
+  "version": "0.1.0",
+  "description": "A local crew of specialist Claude Code agents (backend implementer, E2E tester) with /ship and /fix-bug workflows and a hook that blocks pushes and publishes.",
+  "license": "MIT",
+  "keywords": ["agents", "testing", "workflow"]
+}

@@ -1,0 +1,31 @@
+# Shipyard configuration.
+# Relative paths are resolved against this file's folder.
+
+model: claude-opus-5-5
+effort: high
+
+# subscription: agents use your Claude Code sign-in (Pro/Max) and count against its usage limits.
+#               API key variables in your shell are ignored, so runs never switch to per-token billing.
+# api-key:      agents use ANTHROPIC_API_KEY (or a cloud provider) and are billed per token.
+auth: subscription
+
+# Hard limits per agent invocation. The SDK stops the agent when either is hit.
+# The budget is the SDK's cost estimate at API prices; on a subscription it caps usage, not a bill.
+maxBudgetUsdPerStage: 3
+maxTurnsPerStage: 60
+
+# How many times a stage may retry after its gate (test command) fails.
+maxGateRetries: 2
+
+targets:
+  # Created by `npm run demo:init` (a git copy of examples/demo-shop).
+  demo-shop:
+    path: .shipyard/targets/demo-shop
+    test: npm test
+    e2e: npm run e2e
+
+  # Add your own repos here, e.g.:
+  # my-api:
+  #   path: ~/Documents/GitHub/my-api
+  #   test: npm test
+  #   e2e: npm run test:e2e

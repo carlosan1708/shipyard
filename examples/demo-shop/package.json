@@ -1,0 +1,12 @@
+{
+  "name": "demo-shop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny coffee-shop JSON API used as the shipyard demo target and eval fixture.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "e2e": "node --test \"e2e/**/*.test.js\""
+  }
+}

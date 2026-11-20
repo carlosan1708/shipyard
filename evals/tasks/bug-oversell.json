@@ -1,0 +1,14 @@
+{
+  "id": "bug-oversell",
+  "kind": "bug",
+  "title": "One more unit than stock is accepted",
+  "request": "We sold more hand grinders than we had. Adding exactly one more unit than is in stock is accepted, and stock goes negative. Out-of-stock requests should be rejected with 409.",
+  "seed": [
+    {
+      "file": "src/catalog.js",
+      "find": "if (qty > product.stock) throw",
+      "replace": "if (qty > product.stock + 1) throw"
+    }
+  ],
+  "hidden": "hidden/oversell.test.js"
+}

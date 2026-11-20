@@ -1,0 +1,17 @@
+{
+  "name": "shipyard",
+  "owner": {
+    "name": "shipyard"
+  },
+  "metadata": {
+    "description": "Shipyard plugins for Claude Code: agent roles, workflow commands and safety hooks."
+  },
+  "plugins": [
+    {
+      "name": "shipyard",
+      "source": "./plugins/shipyard",
+      "description": "A local crew of specialist Claude Code agents (backend implementer, E2E tester) with /ship and /fix-bug workflows and a hook that blocks pushes and publishes.",
+      "version": "0.1.0"
+    }
+  ]
+}

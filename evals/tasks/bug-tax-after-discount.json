@@ -1,0 +1,14 @@
+{
+  "id": "bug-tax-after-discount",
+  "kind": "bug",
+  "title": "Tax ignores the discount",
+  "request": "When a coupon is applied, tax is still calculated on the full price. Tax must be charged on the amount after discounts.",
+  "seed": [
+    {
+      "file": "src/cart.js",
+      "find": "Math.round((subtotalCents - discountCents) * TAX_RATE)",
+      "replace": "Math.round(subtotalCents * TAX_RATE)"
+    }
+  ],
+  "hidden": "hidden/tax-after-discount.test.js"
+}

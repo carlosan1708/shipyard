@@ -1,0 +1,14 @@
+{
+  "id": "bug-pagination",
+  "kind": "bug",
+  "title": "First page skips products",
+  "request": "Customers say the first products in the catalog never show up in the shop. GET /products?page=1 seems to start somewhere in the middle of the list.",
+  "seed": [
+    {
+      "file": "src/catalog.js",
+      "find": "const start = (page - 1) * pageSize;",
+      "replace": "const start = page * pageSize;"
+    }
+  ],
+  "hidden": "hidden/pagination.test.js"
+}

@@ -1,0 +1,14 @@
+{
+  "id": "bug-product-404",
+  "kind": "bug",
+  "title": "Unknown product returns 200 null",
+  "request": "GET /products/<id> for a product that does not exist returns 200 with a body of null. It should return 404 with {\"error\": \"not_found\"}, like other missing resources.",
+  "seed": [
+    {
+      "file": "src/server.js",
+      "find": "        if (!product) return send(res, 404, { error: \"not_found\" });\n",
+      "replace": ""
+    }
+  ],
+  "hidden": "hidden/product-404.test.js"
+}

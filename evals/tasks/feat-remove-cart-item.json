@@ -1,0 +1,19 @@
+{
+  "id": "feat-remove-cart-item",
+  "kind": "feature",
+  "title": "DELETE /cart/items/:productId",
+  "request": "Add DELETE /cart/items/:productId. It removes that product line from the cart and returns its quantity to stock. Respond 200 with the updated cart, or 404 with {\"error\": \"not_found\"} if the product is not in the cart.",
+  "reference": [
+    {
+      "file": "src/cart.js",
+      "find": "    applyCoupon(code) {",
+      "replace": "    remove(productId) {\n      const qty = lines.get(productId);\n      if (!qty) throw new NotFoundError(`not in cart: ${productId}`);\n      lines.delete(productId);\n      catalog.release(productId, qty);\n      return cart.view();\n    },\n\n    applyCoupon(code) {"
+    },
+    {
+      "file": "src/server.js",
+      "find": "      if (route === \"POST /cart/coupon\") {",
+      "replace": "      const cartItemMatch = url.pathname.match(/^\\/cart\\/items\\/([\\w-]+)$/);\n      if (req.method === \"DELETE\" && cartItemMatch) return send(res, 200, cart.remove(cartItemMatch[1]));\n\n      if (route === \"POST /cart/coupon\") {"
+    }
+  ],
+  "hidden": "hidden/remove-cart-item.test.js"
+}
