@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "shipyard-ui-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "shipyard", "--", "ui", "--demo", "--no-open", "--port", "4710"],
+      "port": 4710
+    }
+  ]
+}

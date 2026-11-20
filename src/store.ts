@@ -1,23 +1,46 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { TokenUsage } from "./agent.ts";
+import type { Provider, RunEffort } from "./config.ts";
 
-export type RunKind = "feature" | "bug";
-export type RunStatus = "running" | "passed" | "failed" | "error";
+/** feature: ship something new · bug: fix a reported problem · deps: update dependencies. */
+export type RunKind = "feature" | "bug" | "deps";
+/** Stopping a run preserves its branch and worktree. */
+export type RunStatus = "running" | "passed" | "failed" | "error" | "stopped";
+
+/** What a human decided at a checkpoint. */
+export type ReviewAction = "continue" | "feedback" | "stop";
+export interface ReviewRecord {
+  action: ReviewAction;
+  message?: string;
+  at: string;
+  /** How long the run waited for the human at this checkpoint. */
+  waitMs: number;
+}
 
 export interface GateRecord {
   command: string;
+  /** For a bug triage the tests are expected to fail: that failure proves the bug. */
+  expectFailure?: boolean;
   code: number;
   durationMs: number;
   timedOut: boolean;
   outputTail: string;
 }
 
+/** Did this gate go the way it should? Normally that means it passed; for a triage, that it failed. */
+export const gateOk = (g: GateRecord): boolean => (g.expectFailure ? g.code !== 0 && !g.timedOut : g.code === 0);
+
 export interface AttemptRecord {
   attempt: number;
+  provider?: Provider;
+  interrupted?: "stopped" | "redirected";
+  interruptionWaitMs?: number;
   sessionId?: string;
   agentOk: boolean;
   agentError?: string;
-  costUsd: number;
+  costUsd: number | null;
+  usage?: TokenUsage;
   turns: number;
   durationMs: number;
   summary: string;
@@ -27,12 +50,18 @@ export interface AttemptRecord {
   noChanges?: boolean;
   gates: GateRecord[];
   passed: boolean;
+  /** Set when a checkpoint paused after this attempt. */
+  review?: ReviewRecord;
+  /** Time the agent spent blocked on a human's answer (questions, permission requests) during this attempt. */
+  askWaitMs?: number;
+  /** Structured result of the attempt, e.g. the reviewer's verdict and findings. */
+  output?: unknown;
 }
 
 export interface StageRecord {
   name: string;
   role: string;
-  status: "running" | "passed" | "failed";
+  status: "running" | "passed" | "failed" | "stopped";
   attempts: AttemptRecord[];
   commit?: string;
 }
@@ -46,13 +75,23 @@ export interface RunRecord {
   status: RunStatus;
   createdAt: string;
   finishedAt?: string;
+  archivedAt?: string;
   repo: string;
   branch: string;
   worktree: string;
   baseSha: string;
-  model: string;
+  provider?: Provider;
+  model?: string;
+  effort?: RunEffort;
+  /** The optional stages switched on for this run (implement always runs). */
+  crew?: string[];
+  /** Who implemented: backend or frontend. */
+  implementer?: string;
+  /** Estimated cost limit for the whole run. Stages stop starting once it is spent. */
+  budgetUsd?: number;
   stages: StageRecord[];
-  totals: { costUsd: number; durationMs: number; turns: number; attempts: number };
+  /** durationMs is wall-clock time; reviewWaitMs is the part spent waiting for a human (checkpoints, questions, permissions). */
+  totals: { costUsd: number | null; usage?: TokenUsage; durationMs: number; turns: number; attempts: number; reviewWaitMs: number };
   error?: string;
   /** The run errored before producing anything, so its worktree and branch were removed. */
   cleanedUp?: boolean;
@@ -80,9 +119,26 @@ export class RunStore {
     appendFileSync(join(dir, "events.jsonl"), JSON.stringify({ at: new Date().toISOString(), ...event }) + "\n");
   }
 
+  /** The last `limit` events of a run, oldest first. */
+  events(runId: string, limit = 2000): Array<Record<string, unknown>> {
+    const file = join(this.dir(runId), "events.jsonl");
+    if (!existsSync(file)) return [];
+    const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
+    return lines.slice(-limit).flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+  }
+
   get(runId: string): RunRecord | null {
     const file = join(this.dir(runId), "run.json");
-    return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as RunRecord) : null;
+    if (!existsSync(file)) return null;
+    const run = JSON.parse(readFileSync(file, "utf8")) as RunRecord;
+    run.provider ??= "claude";
+    return run;
   }
 
   list(): RunRecord[] {

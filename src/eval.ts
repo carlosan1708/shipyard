@@ -1,7 +1,8 @@
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { SHIPYARD_ROOT, type Target } from "./config.ts";
+import { addTokenUsage, type TokenUsage } from "./agent.ts";
+import { providerOptions, SHIPYARD_ROOT, type Provider, type Target } from "./config.ts";
 import { sh, type ExecResult } from "./exec.ts";
 import { runPipeline, type PipelineDeps } from "./pipeline.ts";
 import type { RunKind, RunStatus } from "./store.ts";
@@ -40,7 +41,8 @@ export interface EvalResult {
   runId?: string;
   pipeline: RunStatus;
   solved: boolean;
-  costUsd: number;
+  costUsd: number | null;
+  usage?: TokenUsage;
   durationMs: number;
   attempts: number;
   hiddenOutputTail?: string;
@@ -48,6 +50,7 @@ export interface EvalResult {
 
 export interface EvalReport {
   startedAt: string;
+  provider?: Provider;
   model: string;
   results: EvalResult[];
 }
@@ -126,9 +129,14 @@ export async function validateTask(task: EvalTask): Promise<string[]> {
   return problems;
 }
 
-export async function runEval(tasks: EvalTask[], deps: PipelineDeps): Promise<EvalReport> {
+export async function runEval(tasks: EvalTask[], deps: PipelineDeps, provider = deps.config.defaultProvider ?? "claude"): Promise<EvalReport> {
   const log = deps.log ?? (() => {});
-  const report: EvalReport = { startedAt: new Date().toISOString(), model: deps.config.model, results: [] };
+  const report: EvalReport = {
+    startedAt: new Date().toISOString(),
+    provider,
+    model: providerOptions(deps.config, provider).model ?? "Codex CLI default",
+    results: [],
+  };
 
   for (const task of tasks) {
     log(`\n━━ eval ${task.id} (${task.kind}): ${task.title}`);
@@ -136,16 +144,16 @@ export async function runEval(tasks: EvalTask[], deps: PipelineDeps): Promise<Ev
     try {
       const repo = await makeSandbox(task);
       const target: Target = { name: `eval-${task.id}`, path: repo, test: APP_TEST, e2e: APP_E2E };
-      run = await runPipeline({ target, kind: task.kind, request: task.request, tags: ["eval", task.id] }, deps);
+      run = await runPipeline({ target, kind: task.kind, request: task.request, provider, tags: ["eval", task.id] }, deps);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log(`  setup error: ${message}`);
-      report.results.push({ id: task.id, kind: task.kind, pipeline: "error", solved: false, costUsd: 0, durationMs: 0, attempts: 0, hiddenOutputTail: message });
+      report.results.push({ id: task.id, kind: task.kind, pipeline: "error", solved: false, costUsd: provider === "codex" ? null : 0, durationMs: 0, attempts: 0, hiddenOutputTail: message });
       continue;
     }
     // Grade the final state of the branch, whatever the pipeline concluded.
-    const hidden = await runHidden(task, run.worktree);
-    const solved = hidden.code === 0;
+    const hidden = run.cleanedUp ? undefined : await runHidden(task, run.worktree);
+    const solved = hidden?.code === 0;
     log(`  hidden test: ${solved ? "✓ solved" : "✗ not solved"}`);
     report.results.push({
       id: task.id,
@@ -154,9 +162,10 @@ export async function runEval(tasks: EvalTask[], deps: PipelineDeps): Promise<Ev
       pipeline: run.status,
       solved,
       costUsd: run.totals.costUsd,
+      usage: run.totals.usage,
       durationMs: run.totals.durationMs,
       attempts: run.totals.attempts,
-      hiddenOutputTail: solved ? undefined : hidden.output.slice(-2000),
+      hiddenOutputTail: solved ? undefined : hidden?.output.slice(-2000) ?? run.error,
     });
   }
 
@@ -167,20 +176,27 @@ export async function runEval(tasks: EvalTask[], deps: PipelineDeps): Promise<Ev
 }
 
 export function formatReport(report: EvalReport): string {
-  const rows = report.results.map((r) =>
-    [r.id.padEnd(22), r.kind.padEnd(8), (r.solved ? "✓" : "✗").padEnd(7), r.pipeline.padEnd(8), `$${r.costUsd.toFixed(2)}`.padStart(7), `${(r.durationMs / 1000).toFixed(0)}s`.padStart(6), String(r.attempts).padStart(8)].join(" "),
-  );
+  const codex = report.provider === "codex";
+  const usageText = (usage?: TokenUsage) => usage ? `${usage.inputTokens} in / ${usage.outputTokens} out` : "unavailable";
+  const usageWidth = codex ? 24 : 7;
+  const rows = report.results.map((r) => {
+    const usage = codex ? usageText(r.usage) : r.costUsd === null ? "n/a" : `$${r.costUsd.toFixed(2)}`;
+    return [r.id.padEnd(22), r.kind.padEnd(8), (r.solved ? "✓" : "✗").padEnd(7), r.pipeline.padEnd(8), usage.padStart(usageWidth), `${(r.durationMs / 1000).toFixed(0)}s`.padStart(6), String(r.attempts).padStart(8)].join(" ");
+  });
   const solved = report.results.filter((r) => r.solved);
-  const cost = report.results.reduce((s, r) => s + r.costUsd, 0);
+  const cost = report.results.reduce((s, r) => s + (r.costUsd ?? 0), 0);
+  const usage = report.results.reduce<TokenUsage | undefined>((total, r) => r.usage ? addTokenUsage(total, r.usage) : total, undefined);
+  const spend = codex
+    ? `tokens ${usageText(usage)} · dollar cost unavailable`
+    : `est. total $${cost.toFixed(2)} · est. $${solved.length ? (cost / solved.length).toFixed(2) : "n/a"} per solved task`;
   const n = report.results.length;
   const durations = report.results.map((r) => r.durationMs).sort((a, b) => a - b);
   const median = durations.length ? durations[Math.floor(durations.length / 2)]! : 0;
   return [
-    ["task".padEnd(22), "kind".padEnd(8), "solved".padEnd(7), "pipeline".padEnd(8), "cost".padStart(7), "time".padStart(6), "attempts".padStart(8)].join(" "),
+    ["task".padEnd(22), "kind".padEnd(8), "solved".padEnd(7), "pipeline".padEnd(8), (codex ? "tokens" : "cost").padStart(usageWidth), "time".padStart(6), "attempts".padStart(8)].join(" "),
     ...rows,
     "",
-    `solved ${solved.length}/${n} (${n ? Math.round((solved.length / n) * 100) : 0}%) · est. total $${cost.toFixed(2)} · ` +
-      `est. $${solved.length ? (cost / solved.length).toFixed(2) : "n/a"} per solved task · median ${(median / 1000).toFixed(0)}s · model ${report.model}`,
-    `(costs are the SDK's estimate at API prices; on a subscription they measure usage, not a bill)`,
+    `solved ${solved.length}/${n} (${n ? Math.round((solved.length / n) * 100) : 0}%) · ${spend} · median ${(median / 1000).toFixed(0)}s · provider ${report.provider ?? "claude"} · model ${report.model}`,
+    ...(!codex ? ["(costs are the SDK's estimate at API prices; on a subscription they measure usage, not a bill)"] : []),
   ].join("\n");
 }

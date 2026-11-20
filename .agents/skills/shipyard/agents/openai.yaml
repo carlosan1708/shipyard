@@ -1,0 +1,6 @@
+interface:
+  display_name: "Shipyard"
+  short_description: "Run the Shipyard coding fleet"
+  default_prompt: "$shipyard run a feature, bug fix, or dependency update"
+policy:
+  allow_implicit_invocation: false

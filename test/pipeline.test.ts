@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { git } from "../src/exec.ts";
-import { runPipeline, makeRunId, type PipelineDeps } from "../src/pipeline.ts";
+import { runPipeline, makeRunId, commitTitle, type PipelineDeps } from "../src/pipeline.ts";
 import { loadRoles } from "../src/roles.ts";
 import { RunStore } from "../src/store.ts";
 import type { Target } from "../src/config.ts";
@@ -57,6 +57,7 @@ test("a failed gate goes back to the same session, then the run passes and commi
     "shipyard(implement): add() subtracts instead of adding",
   ]);
   assert.equal(run.totals.attempts, 3);
+  assert.ok(run.totals.costUsd !== null);
   assert.ok(Math.abs(run.totals.costUsd - 0.3) < 1e-9);
   assert.equal(deps.store.get(run.id)?.status, "passed");
 });
@@ -94,6 +95,59 @@ test("an E2E failure is sent back to the implementer, and out-of-lane edits by t
   const e2eCommit = run.stages[1]!.commit!;
   const files = await git(["show", "--name-only", "--format=", e2eCommit], run.repo);
   assert.equal(files, "e2e/add.e2e.test.js");
+});
+
+test("a run stops before a stage it can't pay for, keeping what earlier stages committed", async () => {
+  const { runner, deps, target } = await setup([
+    (req) => {
+      fixAdd(req);
+      writeUnitTest(req);
+      return { costUsd: 0.45 };
+    },
+  ]);
+  deps.config.maxBudgetUsdPerRun = 10; // the per-run budget below wins over the config's
+
+  const run = await runPipeline({ target, kind: "bug", request: "add() subtracts", budgetUsd: 0.5 }, deps);
+
+  assert.equal(run.status, "failed");
+  assert.equal(run.budgetUsd, 0.5);
+  assert.match(run.error!, /Stopped before e2e: the run used ~\$0\.45 of its ~\$0\.5 budget/);
+  assert.equal(runner.calls.length, 1, "the E2E tester never started");
+  assert.equal(runner.calls[0]!.maxBudgetUsd, 0.5, "the agent is capped at what is left of the run budget");
+  assert.deepEqual(run.stages.map((s) => [s.name, s.status]), [["implement", "passed"]]);
+  assert.ok(run.stages[0]!.commit, "the implement stage's work is kept");
+  assert.equal(run.cleanedUp, undefined);
+  assert.equal(deps.store.get(run.id)?.status, "failed");
+});
+
+test("a retry isn't started once the run budget is spent, and each agent gets only what is left", async () => {
+  const { runner, deps, target } = await setup([
+    () => ({ costUsd: 0.25, summary: "Goal: make add() add.\nApproach: change the operator.\nFiles: src/add.js\nTasks:\n1. Fix the operator\nTests: add(2, 3) === 5" }), // planner
+    (req) => {
+      writeUnitTest(req); // gate fails: add() is still broken
+      return { costUsd: 0.7 };
+    },
+  ]);
+  deps.config.maxBudgetUsdPerRun = 1;
+
+  const run = await runPipeline({ target, kind: "bug", request: "add() subtracts", crew: ["plan"] }, deps);
+
+  assert.equal(run.status, "failed");
+  assert.equal(runner.calls[0]!.maxBudgetUsd, 1);
+  assert.ok(Math.abs(runner.calls[1]!.maxBudgetUsd! - 0.75) < 1e-9);
+  assert.equal(runner.calls.length, 2, "only ~$0.05 was left, so the retry never ran");
+  assert.deepEqual(run.stages.map((s) => [s.name, s.status, s.attempts.length]), [
+    ["plan", "passed", 1],
+    ["implement", "failed", 1],
+  ]);
+  assert.match(run.error!, /Stopped before implement: the run used ~\$0\.95 of its ~\$1 budget/);
+});
+
+test("without a run budget, agents only have the per-stage cap", async () => {
+  const { runner, deps, target } = await setup([fixAdd, writeUnitTest]);
+  const run = await runPipeline({ target, kind: "bug", request: "add() subtracts" }, deps);
+  assert.equal(run.budgetUsd, undefined);
+  assert.equal(runner.calls[0]!.maxBudgetUsd, undefined);
 });
 
 test("the run fails after the retry budget, and later stages never start", async () => {
@@ -162,6 +216,47 @@ test("the target repo's own checkout is never touched", async () => {
   await runPipeline({ target, kind: "bug", request: "add() subtracts" }, deps);
   assert.equal(await git(["status", "--porcelain"], repo), "");
   assert.equal(existsSync(join(repo, "test", "add.test.js")), false);
+});
+
+test("a run's model and effort reach every agent, and an empty crew leaves only implement", async () => {
+  const { runner, deps, target } = await setup([writeUnitTest, fixAdd]);
+
+  const run = await runPipeline({ target, kind: "bug", request: "add() subtracts", model: "claude-haiku-5-5", effort: "low", crew: [] }, deps);
+
+  assert.equal(run.status, "passed");
+  assert.deepEqual(run.stages.map((s) => s.name), ["implement"]);
+  assert.deepEqual(run.crew, []);
+  assert.equal(run.model, "claude-haiku-5-5");
+  assert.equal(run.effort, "low");
+  assert.deepEqual(runner.calls.map((c) => [c.model, c.effort]), [
+    ["claude-haiku-5-5", "low"],
+    ["claude-haiku-5-5", "low"],
+  ]);
+});
+
+test("with repair switched off, an E2E failure fails the run instead of going back to the implementer", async () => {
+  const { runner, deps, target } = await setup([
+    (req) => writeFiles(req.cwd, { "src/add.js": "export const add = (a, b) => a + b;\n", "test/add.test.js": UNIT_TEST }),
+    writeE2E('assert.equal(add("2", "3"), 5);'),
+  ]);
+
+  const run = await runPipeline({ target, kind: "feature", request: "strings", crew: ["e2e"] }, deps);
+
+  assert.equal(run.status, "failed");
+  assert.deepEqual(run.stages.map((s) => [s.name, s.status]), [
+    ["implement", "passed"],
+    ["e2e", "failed"],
+  ]);
+  assert.equal(runner.calls.length, 2, "no repair attempt");
+  assert.equal(run.model, "test-model", "without a choice the config default is used");
+});
+
+test("commit titles are cut at a word boundary", () => {
+  assert.equal(commitTitle("Fix the coupon"), "Fix the coupon");
+  const long = "Add DELETE /cart/items/:productId. It removes that product line from the cart and returns its quantity to stock.";
+  const title = commitTitle(long);
+  assert.equal(title, "Add DELETE /cart/items/:productId. It removes that product…");
+  assert.ok(title.length <= 60);
 });
 
 test("run ids are sortable and readable", () => {

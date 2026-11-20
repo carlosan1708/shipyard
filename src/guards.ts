@@ -6,23 +6,49 @@ export { checkCommand };
 
 /**
  * A lane limits which files a role may write.
- * - any: anything inside the worktree
+ * - any: anything inside the worktree (implementers)
  * - tests: only test files (the E2E tester)
  * - no-e2e: anything except E2E tests (the implementer fixing an E2E failure must not edit the test)
+ * - none: nothing at all (planner, reviewer)
+ * - docs: documentation only (docs writer)
+ * - release: version fields, lockfiles, changelog and release notes (release manager)
  */
-export type Lane = "any" | "tests" | "no-e2e";
+export type Lane = "any" | "tests" | "no-e2e" | "none" | "docs" | "release";
 
 const TEST_PATH = /(^|\/)(e2e|tests?|__tests__|spec)\/|\.(test|spec|e2e)\.[cm]?[jt]sx?$/;
 const E2E_PATH = /(^|\/)e2e\/|\.e2e\.[cm]?[jt]sx?$/;
+const DOCS_PATH = /(^|\/)docs?\/|\.(md|mdx|markdown|rst|adoc)$|(^|\/)(README|CHANGELOG|CONTRIBUTING|HISTORY)(\.[a-z]+)?$/i;
+const RELEASE_PATH =
+  /(^|\/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|pyproject\.toml|setup\.cfg|setup\.py|Cargo\.toml|Cargo\.lock|VERSION|version\.txt)$|(^|\/)(CHANGELOG|HISTORY|RELEASE[_-]?NOTES)(\.[a-z]+)?$/i;
 
 export const isTestPath = (rel: string): boolean => TEST_PATH.test(rel);
 export const isE2EPath = (rel: string): boolean => E2E_PATH.test(rel);
 
 export function inLane(rel: string, lane: Lane): boolean {
-  if (lane === "tests") return isTestPath(rel);
-  if (lane === "no-e2e") return !isE2EPath(rel);
-  return true;
+  switch (lane) {
+    case "tests":
+      return isTestPath(rel);
+    case "no-e2e":
+      return !isE2EPath(rel);
+    case "none":
+      return false;
+    case "docs":
+      return DOCS_PATH.test(rel);
+    case "release":
+      return RELEASE_PATH.test(rel);
+    default:
+      return true;
+  }
 }
+
+const LANE_WORDS: Record<Lane, string> = {
+  any: "any file",
+  tests: "test files only",
+  "no-e2e": "anything except E2E tests",
+  none: "no files (your role is read-only)",
+  docs: "documentation files only (Markdown, docs/, the changelog)",
+  release: "version files, lockfiles, the changelog and release notes only",
+};
 
 /** Path relative to root, or null when the path escapes root. */
 export function relativeInside(root: string, filePath: string): string | null {
@@ -53,8 +79,7 @@ export function checkToolUse(toolName: string, input: unknown, opts: { root: str
     const rel = relativeInside(opts.root, target);
     if (rel === null) return { allowed: false, reason: `Blocked: ${target} is outside your working directory (${opts.root}).` };
     if (!inLane(rel, opts.lane)) {
-      const what = opts.lane === "tests" ? "test files only" : "anything except E2E tests";
-      return { allowed: false, reason: `Blocked: your role may edit ${what}; ${rel} is outside that lane.` };
+      return { allowed: false, reason: `Blocked: your role may edit ${LANE_WORDS[opts.lane]}; ${rel} is outside that lane.` };
     }
   }
   return { allowed: true };

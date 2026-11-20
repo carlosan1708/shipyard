@@ -38,7 +38,7 @@ import { add } from "../src/add.js";
 test("adds", () => assert.equal(add(2, 3), 5));
 `;
 
-export type Step = (req: AgentRequest) => void | Promise<void> | Partial<AgentResult>;
+export type Step = (req: AgentRequest) => void | Partial<AgentResult> | Promise<void | Partial<AgentResult>>;
 
 /** Plays a scripted step per call, in order, and records every request it received. */
 export class FakeRunner implements AgentRunner {

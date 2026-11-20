@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>shipyard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="7" y="6" width="18" height="5" rx="1.5" />
+          <rect x="4" y="13" width="24" height="5" rx="1.5" />
+          <path d="M3 21h26l-3.2 5.2a2 2 0 0 1-1.7.8H7.9a2 2 0 0 1-1.7-.8L3 21z" />
+        </svg>
+        <span class="brand-name">shipyard</span>
+      </div>
+      <div class="topbar-meta" id="meta"></div>
+      <div class="topbar-actions">
+        <span class="conn" id="conn" role="status"><span class="conn-dot"></span><span class="conn-label">Connecting</span></span>
+        <button type="button" class="btn btn-ghost inbox-toggle" id="inbox-toggle" aria-controls="inbox" aria-expanded="false">
+          Needs you <span class="count" id="inbox-toggle-count">0</span>
+        </button>
+        <button type="button" class="btn btn-primary" id="new-run">New run</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="col runs-col" aria-label="Runs">
+        <div class="col-head">
+          <h2>Runs</h2>
+          <span class="col-sub" id="runs-sub"></span>
+          <button type="button" class="btn btn-ghost btn-sm" id="archive-toggle" aria-pressed="false">Archived</button>
+        </div>
+        <ul class="run-list" id="run-list"></ul>
+      </aside>
+
+      <main class="col detail-col" id="detail" aria-live="off"></main>
+
+      <aside class="col inbox-col" id="inbox" aria-label="Needs you">
+        <div class="col-head">
+          <h2>Needs you</h2>
+          <span class="count count-strong" id="inbox-count" aria-live="polite">0</span>
+          <button type="button" class="btn btn-ghost btn-icon inbox-close" id="inbox-close" aria-label="Close">✕</button>
+        </div>
+        <p class="col-hint">Questions, permission requests and checkpoints from every agent and run. Answer them in any order; each agent only waits for its own.</p>
+        <div class="inbox-list" id="inbox-list"></div>
+      </aside>
+    </div>
+
+    <dialog class="dialog" id="run-control-dialog" aria-labelledby="run-control-title">
+      <form method="dialog" class="dialog-body" id="run-control-form">
+        <h2 id="run-control-title"></h2>
+        <p class="field-help" id="run-control-help"></p>
+        <label class="field">
+          <span class="field-label" id="run-control-label">Instructions</span>
+          <textarea id="run-control-message" rows="4"></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="run-control-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="run-control-submit"></button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="new-run-dialog" aria-labelledby="new-run-title">
+      <form method="dialog" class="dialog-body" id="new-run-form">
+        <h2 id="new-run-title">New run</h2>
+        <p class="demo-note" id="demo-note" hidden>Demo mode: a scripted crew builds a /health endpoint on the demo shop, asks you a question and requests web access. It uses scripted agents.</p>
+
+        <div class="field">
+          <label class="field-label" for="nr-target">Target repo</label>
+          <div class="field-row">
+            <select name="target" id="nr-target" required></select>
+            <button type="button" class="btn" id="nr-add-repo">+ Add repo</button>
+          </div>
+        </div>
+
+        <fieldset class="field">
+          <legend class="field-label">What</legend>
+          <div class="segmented">
+            <label><input type="radio" name="kind" value="feature" checked /><span>Ship a feature</span></label>
+            <label><input type="radio" name="kind" value="bug" /><span>Fix a bug</span></label>
+            <label><input type="radio" name="kind" value="deps" /><span>Update dependencies</span></label>
+          </div>
+        </fieldset>
+
+        <label class="field">
+          <span class="field-label" id="nr-request-label">Feature request</span>
+          <textarea name="request" id="nr-request" rows="4" required placeholder="Add a GET /health endpoint that returns {&quot;status&quot;: &quot;ok&quot;}"></textarea>
+        </label>
+
+        <label class="field">
+          <span class="field-label">Provider</span>
+          <select name="provider" id="nr-provider">
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select>
+        </label>
+
+        <div class="field">
+          <div class="field-grid field-grid-3">
+            <label class="field">
+              <span class="field-label">Model</span>
+              <select name="model" id="nr-model"></select>
+            </label>
+            <label class="field">
+              <span class="field-label">Effort</span>
+              <select name="effort" id="nr-effort"></select>
+            </label>
+            <label class="field">
+              <span class="field-label">Budget ($, est.)</span>
+              <input type="number" name="budget" id="nr-budget" min="0.1" step="any" inputmode="decimal" required />
+            </label>
+          </div>
+          <span class="field-help" id="nr-options-help"></span>
+        </div>
+
+        <fieldset class="field">
+          <legend class="field-label">Crew</legend>
+          <table class="crew">
+            <thead>
+              <tr>
+                <th scope="col">Agent</th>
+                <th scope="col">Runs</th>
+                <th scope="col">Pause after</th>
+              </tr>
+            </thead>
+            <tbody id="nr-crew"></tbody>
+          </table>
+          <span class="field-help" id="nr-inbox-help"></span>
+        </fieldset>
+
+        <p class="form-error" id="nr-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="nr-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="nr-submit">Start run</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="add-repo-dialog" aria-labelledby="add-repo-title">
+      <form method="dialog" class="dialog-body" id="add-repo-form" autocomplete="off">
+        <div>
+          <h2 id="add-repo-title">Add a repo</h2>
+          <p class="field-help">Any git repository on this machine. Shipyard works on its own branch in a separate worktree and never touches your checkout.</p>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Folder</span>
+          <input type="text" name="path" id="ar-path" placeholder="~/code/my-app" spellcheck="false" required />
+        </label>
+
+        <div class="field" id="ar-suggestions-field" hidden>
+          <span class="field-label">Your repos</span>
+          <div class="repo-picks" id="ar-suggestions"></div>
+        </div>
+
+        <div class="repo-status" id="ar-status" aria-live="polite"></div>
+
+        <div class="ar-details" id="ar-details" hidden>
+          <label class="field">
+            <span class="field-label">Name</span>
+            <input type="text" name="name" id="ar-name" spellcheck="false" required />
+          </label>
+          <div class="field">
+            <label class="field-label" for="ar-test">Test command</label>
+            <input type="text" name="test" id="ar-test" spellcheck="false" placeholder="for example: npm test" required />
+            <div class="cmd-chips" id="ar-test-chips"></div>
+            <span class="field-help">Runs after the implement stage. Every change has to pass it.</span>
+          </div>
+          <div class="field">
+            <label class="field-label" for="ar-e2e">E2E command <span class="optional">optional</span></label>
+            <input type="text" name="e2e" id="ar-e2e" spellcheck="false" placeholder="for example: npm run test:e2e" />
+            <div class="cmd-chips" id="ar-e2e-chips"></div>
+            <span class="field-help">With one, an E2E tester checks each change from the outside. Without one, runs end after implement.</span>
+          </div>
+        </div>
+
+        <p class="form-error" id="ar-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <span class="dialog-hint" id="ar-hint" aria-live="polite"></span>
+          <button type="button" class="btn btn-ghost" id="ar-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="ar-submit" disabled>Add repo</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toasts" id="toasts" aria-live="assertive"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

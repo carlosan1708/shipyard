@@ -2,7 +2,7 @@
   "name": "shipyard",
   "version": "0.1.0",
   "private": true,
-  "description": "A local crew of specialist Claude Code agents that builds features and fixes bugs in your repos, with test gates, worktree isolation and an eval suite.",
+  "description": "A local crew of specialist Claude Code and Codex agents that builds features and fixes bugs in your repos, with test gates, worktree isolation and an eval suite.",
   "type": "module",
   "bin": {
     "shipyard": "./bin/shipyard.mjs"

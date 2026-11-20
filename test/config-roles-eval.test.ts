@@ -14,7 +14,11 @@ test("config resolves relative and home paths and applies defaults", () => {
   assert.equal(config.targets.b!.path, join(homedir(), "code/b"));
   assert.equal(config.model, "claude-opus-5-5");
   assert.equal(config.auth, "subscription", "runs default to the Claude subscription, not API billing");
+  assert.deepEqual(config.models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
+  assert.deepEqual(parseConfig({ model: "claude-fable-5-2", models: ["claude-haiku-5-5"] }, "/").models, ["claude-fable-5-2", "claude-haiku-5-5"], "the default model is always offered, first");
   assert.equal(config.maxGateRetries, 2);
+  assert.equal(config.maxBudgetUsdPerStage, 3);
+  assert.equal(config.maxBudgetUsdPerRun, 10);
 });
 
 test("config rejects bad values", () => {
@@ -22,11 +26,14 @@ test("config rejects bad values", () => {
   assert.throws(() => parseConfig({ auth: "oauth" }, "/"), /auth/);
   assert.throws(() => parseConfig({ targets: { a: { path: "x" } } }, "/"), /test is required/);
   assert.throws(() => parseConfig({ maxGateRetries: -1 }, "/"), /maxGateRetries/);
+  assert.throws(() => parseConfig({ maxBudgetUsdPerRun: "ten" }, "/"), /maxBudgetUsdPerRun/);
 });
 
 test("the shipped roles load from the plugin's agent files", () => {
   const roles = loadRoles();
-  assert.deepEqual([...roles.keys()].sort(), ["backend", "e2e-tester"]);
+  assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "planner", "release-manager", "reviewer", "security-auditor"]);
+  // Read-only roles get no editing tools at all; the lane and post-stage revert back that up.
+  for (const name of ["planner", "reviewer", "security-auditor"]) assert.ok(!roles.get(name)!.tools.some((t) => ["Edit", "Write"].includes(t)), name);
   const backend = roles.get("backend")!;
   assert.ok(backend.tools.includes("Bash"));
   assert.equal(backend.model, undefined, "model: inherit means use the configured model");

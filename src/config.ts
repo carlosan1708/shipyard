@@ -19,13 +19,36 @@ export interface Target {
   e2e?: string;
 }
 
+export const PROVIDERS = ["claude", "codex"] as const;
+export type Provider = (typeof PROVIDERS)[number];
+export const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export type CodexEffort = (typeof CODEX_EFFORTS)[number];
+export type RunEffort = EffortLevel | CodexEffort;
+export const CODEX_TIMEOUT_MS = 20 * 60_000;
+
+export interface CodexConfig {
+  model?: string;
+  models: string[];
+  effort?: CodexEffort;
+  timeoutMsPerAttempt: number;
+}
+
 export interface ShipyardConfig {
+  defaultProvider?: Provider;
+  codex?: CodexConfig;
   model: string;
+  /** Models you can pick per run (the default model is always first). */
+  models: string[];
   effort: EffortLevel;
   auth: AuthMode;
+  /** Estimated cost cap for each agent invocation. */
   maxBudgetUsdPerStage: number;
+  /** Estimated cost cap for a whole run: every stage and retry together. Can be changed per run. */
+  maxBudgetUsdPerRun: number;
   maxTurnsPerStage: number;
   maxGateRetries: number;
+  /** Tools agents may use only after a human approves each call (in `shipyard ui`). */
+  askTools: string[];
   /** Where worktrees are created. Kept outside this repo so its CLAUDE.md never leaks into target sessions. */
   worktreeRoot: string;
   /** Where run records are written. */
@@ -33,7 +56,67 @@ export interface ShipyardConfig {
   targets: Record<string, Target>;
 }
 
-const EFFORTS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+export const EFFORTS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
+
+/** A run budget must be a positive, finite number of (estimated) dollars. */
+export function isBudget(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+export function resolveProvider(value: unknown = "claude"): Provider {
+  if (value === "claude" || value === "codex") return value;
+  throw new Error("Provider must be claude or codex");
+}
+
+export function providerOptions(config: Pick<ShipyardConfig, "model"> & Partial<ShipyardConfig>, provider: Provider) {
+  return provider === "codex"
+    ? { model: config.codex?.model, models: config.codex?.models ?? [], effort: config.codex?.effort, efforts: CODEX_EFFORTS }
+    : { model: config.model, models: config.models ?? [config.model], effort: config.effort, efforts: EFFORTS };
+}
+
+export function validateRunOptions(
+  config: ShipyardConfig,
+  provider: Provider,
+  { model, effort, budgetUsd }: { model?: string; effort?: RunEffort; budgetUsd?: number },
+): void {
+  const options = providerOptions(config, provider);
+  if (model !== undefined && !options.models.includes(model)) {
+    const choices = options.models.length ? `Pick one of ${options.models.join(", ")}, or add another` : "Add model choices";
+    throw new Error(`Unknown model "${model}" for ${provider}. ${choices} under ${provider === "codex" ? "codex.models" : "models"} in shipyard.config.yaml`);
+  }
+  if (effort !== undefined && !(options.efforts as readonly RunEffort[]).includes(effort)) {
+    throw new Error(`effort must be one of ${options.efforts.join(", ")} for ${provider}`);
+  }
+  if (budgetUsd !== undefined) {
+    if (provider === "codex") throw new Error("Dollar budgets are only supported for Claude runs");
+    if (!isBudget(budgetUsd)) throw new Error("The budget must be a positive number of dollars");
+  }
+}
+
+function parseCodexConfig(value: unknown): CodexConfig {
+  if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) {
+    throw new Error("config.codex must be a mapping");
+  }
+  const raw = (value ?? {}) as Record<string, unknown>;
+  const validModel = (model: unknown): model is string => typeof model === "string" && model.trim().length > 0;
+  const { model, models, effort, timeoutMsPerAttempt = CODEX_TIMEOUT_MS } = raw;
+  if (model !== undefined && !validModel(model)) throw new Error("config.codex.model must be a non-empty string");
+  if (models !== undefined && (!Array.isArray(models) || !models.every(validModel))) {
+    throw new Error("config.codex.models must be a list of model names");
+  }
+  if (effort !== undefined && !CODEX_EFFORTS.includes(effort as CodexEffort)) {
+    throw new Error(`config.codex.effort must be one of ${CODEX_EFFORTS.join(", ")}`);
+  }
+  if (typeof timeoutMsPerAttempt !== "number" || !Number.isInteger(timeoutMsPerAttempt) || timeoutMsPerAttempt <= 0 || timeoutMsPerAttempt > 2_147_483_647) {
+    throw new Error("config.codex.timeoutMsPerAttempt must be a positive integer within the Node timer range");
+  }
+  return {
+    model,
+    models: [...new Set([...(model ? [model] : []), ...(models ?? [])])],
+    effort: effort as CodexEffort | undefined,
+    timeoutMsPerAttempt,
+  };
+}
 
 export function expandPath(p: string, baseDir: string): string {
   if (p === "~" || p.startsWith("~/")) return join(homedir(), p.slice(1));
@@ -70,13 +153,21 @@ export function parseConfig(raw: Record<string, unknown>, baseDir: string): Ship
     };
   }
 
+  const model = typeof raw.model === "string" ? raw.model : "claude-opus-5-5";
+  const listed = Array.isArray(raw.models) ? raw.models.map(String) : ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"];
+
   return {
-    model: typeof raw.model === "string" ? raw.model : "claude-opus-5-5",
+    defaultProvider: resolveProvider(raw.defaultProvider),
+    codex: parseCodexConfig(raw.codex),
+    model,
+    models: [model, ...listed.filter((m) => m !== model)],
     effort,
     auth,
     maxBudgetUsdPerStage: num("maxBudgetUsdPerStage", 3),
+    maxBudgetUsdPerRun: num("maxBudgetUsdPerRun", 10),
     maxTurnsPerStage: num("maxTurnsPerStage", 60),
     maxGateRetries: num("maxGateRetries", 2),
+    askTools: Array.isArray(raw.askTools) ? raw.askTools.map(String) : ["WebFetch", "WebSearch"],
     worktreeRoot: expandPath(typeof raw.worktreeRoot === "string" ? raw.worktreeRoot : "~/.shipyard/worktrees", baseDir),
     runsDir: expandPath(typeof raw.runsDir === "string" ? raw.runsDir : ".shipyard/runs", baseDir),
     targets,
