@@ -4,7 +4,7 @@
 
 Shipyard runs a local crew of Claude Code or Codex agents against your existing repositories. It gives each run a Git worktree, coordinates specialist roles, and runs your project’s checks before handing back the branch and its verification record.
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [How AI accelerates development](#how-ai-accelerates-development) · [Re-record the demo](#test-and-record-the-demo) · [Technical reference](docs/reference.md)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Publish from the dashboard](#publish-from-the-dashboard) · [How AI accelerates development](#how-ai-accelerates-development) · [Re-record the demo](#test-and-record-the-demo) · [Technical reference](docs/reference.md)
 
 ## Watch a run
 
@@ -48,6 +48,11 @@ flowchart LR
 ```
 
 The TypeScript pipeline controls stage order, retries, and checkpoints. Provider adapters run the agent sessions. Role-specific edit scopes constrain specialists, and review or E2E findings can go back to the implementer for another pass. The handoff records the branch, changed files, checks, and pending work. [Crew and stage order](docs/reference.md#crew-and-stage-order) · [Dashboard controls](docs/reference.md#dashboard-controls)
+
+## Publish from the dashboard
+
+- **GitHub draft PRs.** Sign in with `gh auth login`. In a completed run’s handoff, push the branch and choose **Create draft PR**. Shipyard opens the draft against GitHub’s default branch when the branches share Git history. If the run branch already has an open PR, Shipyard links it. [GitHub handoff controls](docs/reference.md#dashboard-controls)
+- **Cloud Run releases.** Add **Google Cloud release** to the crew to get a read-only release plan. In the handoff, choose **Review Cloud Run release** and supply an existing single-container service and an Artifact Registry image pinned to a digest. Review the signed-in Google Cloud account, destination, and permissions before approving a new revision with zero traffic. [Cloud Run prerequisites and permissions](docs/reference.md#google-cloud-releases)
 
 ## How AI accelerates development
 
