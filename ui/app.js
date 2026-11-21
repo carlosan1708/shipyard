@@ -921,7 +921,7 @@ function runResult(run) {
           h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pullRequestBusy,
             text: pullRequestBusy ? "Creating PR…" : "Create PR on GitHub", onclick: () => createPullRequest(run.id, publication) }),
           h("a", { class: "btn btn-sm", href: publication.compareUrl, target: "_blank", rel: "noopener noreferrer", text: "Compare on GitHub" }),
-        ] : null,
+        ] : publication?.pullRequestUnavailable ? h("span", { text: publication.pullRequestUnavailable }) : null,
       ),
     ) : null,
     result.error ? h("p", { class: "run-result-error", text: result.error }) : null,

@@ -28,7 +28,7 @@ import { git, sh } from "../exec.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, validReferenceText, type ReviewedReference } from "../references.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
-import { createRunPullRequest, pullRequestLink, pushDestination, pushRunCommit } from "./publication.ts";
+import { createRunPullRequest, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
 import { RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
 import { changedFiles, diffSinceHead, repoRoot, withRepoLock, type WorktreeDiff } from "../worktree.ts";
@@ -511,13 +511,16 @@ export class RunManager {
     const destination = remotes ? await pushDestination(run.repo, remotes).catch(() => undefined) : undefined;
     const canPush = run.status === "passed" && Boolean(run.finishedAt) && Boolean(head && head !== run.baseSha) && run.branch.startsWith("shipyard/");
     const pushed = Boolean(destination && run.publication?.head === head && run.publication?.destination === destination.key);
+    const pullRequestUrl = pushed ? run.publication?.pullRequestUrl : undefined;
+    const comparison = pushed && destination && head && !pullRequestUrl
+      ? await pullRequestOptions(run.repo, destination, run.branch, head, this.stopResultChecks.signal)
+      : {};
     const localApp = this.localApps.get(runId);
     return {
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,
         pushed,
-        pullRequestUrl: pushed ? run.publication?.pullRequestUrl : undefined,
-        compareUrl: pushed ? await pullRequestLink(run.repo, destination, run.branch) : undefined,
+        pullRequestUrl, ...comparison,
       } : undefined,
       publishUnavailable: remotes && canPush && !destination ? "Choose one push destination by configuring origin with a single supported Git URL." : undefined,
       hasRemote: remotes === undefined ? undefined : Boolean(remotes),

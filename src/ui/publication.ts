@@ -66,22 +66,51 @@ export async function pushRunCommit(repo: string, destination: Destination, bran
   }
 }
 
-export async function pullRequestLink(repo: string, destination: Destination, branch: string): Promise<string | undefined> {
-  if (!destination.repository) return;
-  const prefix = `refs/remotes/${destination.remote}/`;
-  const head = await git(["symbolic-ref", "--quiet", `${prefix}HEAD`], repo).catch(() => "");
-  const base = head.startsWith(prefix) ? head.slice(prefix.length) : undefined;
-  const selection = base ? `${encodeURIComponent(base)}...${encodeURIComponent(branch)}` : encodeURIComponent(branch);
-  return `${destination.repository}/compare/${selection}?quick_pull=1`;
+class PullRequestComparisonError extends Error {}
+
+function githubApi(repo: string, signal: AbortSignal, timeout: number) {
+  return async (...args: string[]) => (await exec("gh", ["api", "--hostname", "github.com", ...args], {
+    cwd: repo, signal, timeout, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GH_PROMPT_DISABLED: "1" },
+  })).stdout.trim();
+}
+
+async function pullRequestBase(api: ReturnType<typeof githubApi>, apiPath: string, head: string): Promise<string> {
+  const base = await api(apiPath, "--jq", ".default_branch");
+  if (!base) throw new Error("GitHub did not return the default branch");
+  try {
+    const ahead = await api(`${apiPath}/compare/${encodeURIComponent(base)}...${head}`,
+      "--method", "GET", "-F", "per_page=1", "--jq", ".ahead_by");
+    if (ahead === "0") throw new PullRequestComparisonError("The branch has no commits to merge into the repository’s default branch.");
+  } catch (error) {
+    if (/no common ancestor/i.test((error as { stderr?: string }).stderr ?? "")) {
+      throw new PullRequestComparisonError("The run branch and GitHub’s default branch have unrelated histories. Apply the run’s changes to a new branch based on the GitHub default branch.");
+    }
+    throw error;
+  }
+  return base;
+}
+
+export async function pullRequestOptions(repo: string, destination: Destination, branch: string, head: string, signal: AbortSignal) {
+  if (!destination.repository) return {};
+  const apiPath = `repos/${new URL(destination.repository).pathname.slice(1)}`;
+  const api = githubApi(repo, signal, 3_000);
+  let base: string | undefined;
+  try {
+    base = await pullRequestBase(api, apiPath, head);
+  } catch (error) {
+    if (error instanceof PullRequestComparisonError) return { pullRequestUnavailable: error.message };
+    // Keep the manual GitHub option when gh or GitHub's API is unavailable.
+  }
+  const encodedBranch = encodeURIComponent(branch);
+  const selection = base ? `${encodeURIComponent(base)}...${encodedBranch}` : encodedBranch;
+  return { compareUrl: `${destination.repository}/compare/${selection}?quick_pull=1` };
 }
 
 export async function createRunPullRequest(repo: string, repository: string, branch: string, head: string, signal: AbortSignal): Promise<string> {
   const slug = new URL(repository).pathname.slice(1);
   const apiPath = `repos/${slug}`;
-  const api = async (...args: string[]) => (await exec("gh", ["api", "--hostname", "github.com", ...args], {
-    cwd: repo, signal, timeout: 30_000, maxBuffer: 1024 * 1024,
-    env: { ...process.env, GH_PROMPT_DISABLED: "1" },
-  })).stdout.trim();
+  const api = githubApi(repo, signal, 30_000);
   const confirmedUrl = (value: string) => {
     const url = URL.canParse(value) ? new URL(value) : undefined;
     const match = url?.pathname.match(/^\/(.+)\/pull\/([1-9]\d*)$/);
@@ -98,13 +127,14 @@ export async function createRunPullRequest(repo: string, repository: string, bra
       "-f", `head=${slug.split("/")[0]}:${branch}`, "-f", "state=open", "--jq", ".[].html_url");
     pullRequestUrl = existing.split("\n").map(confirmedUrl).find(Boolean);
     if (!pullRequestUrl) {
-      const base = await api(apiPath, "--jq", ".default_branch");
+      const base = await pullRequestBase(api, apiPath, head);
       const title = await git(["show", "-s", "--format=%s", head], repo);
       const created = await api(`${apiPath}/pulls`, "--method", "POST", "-f", `head=${branch}`, "-f", `base=${base}`,
         "-f", `title=${title || branch}`, "--jq", ".html_url");
       pullRequestUrl = confirmedUrl(created);
     }
   } catch (error) {
+    if (error instanceof PullRequestComparisonError) throw error;
     const failure = error as { code?: string; message?: string; stderr?: string; killed?: boolean };
     const message = failure.stderr ?? "";
     if (failure.message === "remote head changed") {

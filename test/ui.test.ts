@@ -917,6 +917,13 @@ fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const endpoint = args[3];
 if (endpoint.includes("/git/ref/heads/")) console.log(process.env.SHIPYARD_TEST_GITHUB_HEAD);
 else if (endpoint === "repos/example/fixture") console.log("trunk");
+else if (endpoint.includes("/compare/")) {
+  const scenario = process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
+  if (scenario === "unrelated") {
+    console.error("gh: No common ancestor between trunk and the run commit. (HTTP 404)");
+    process.exitCode = 1;
+  } else console.log(scenario === "merged" ? "0" : "1");
+}
 else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
   fs.writeFileSync(${JSON.stringify(join(fake, "created"))}, ${JSON.stringify(pr)});
   console.log(${JSON.stringify(pr)});
@@ -927,12 +934,25 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
     writeFileSync(join(fake, "gh"), script, { mode: 0o755 });
     const originalPath = process.env.PATH;
     const originalHead = process.env.SHIPYARD_TEST_GITHUB_HEAD;
+    const originalComparison = process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
     process.env.PATH = `${fake}:${originalPath}`;
     try {
       process.env.SHIPYARD_TEST_GITHUB_HEAD = run.baseSha;
       assert.match((await create(confirmation)).body, /no longer matches the pushed commit/);
       process.env.SHIPYARD_TEST_GITHUB_HEAD = confirmation.head;
       assert.equal((await create({ ...confirmation, destination: "stale" })).status, 400);
+      for (const [scenario, message] of [["unrelated", /unrelated histories/], ["merged", /no commits to merge/]] as const) {
+        process.env.SHIPYARD_TEST_GITHUB_COMPARISON = scenario;
+        const blocked = (await manager.result(id)).publish!;
+        assert.equal(blocked.compareUrl, undefined);
+        assert.match(blocked.pullRequestUnavailable ?? "", message);
+        const rejected = await create(confirmation);
+        assert.equal(rejected.status, 400);
+        assert.match(rejected.body, message);
+      }
+      delete process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
+      assert.equal((await manager.result(id)).publish?.compareUrl,
+        `https://github.com/example/fixture/compare/trunk...${encodeURIComponent(run.branch)}?quick_pull=1`);
       const response = await create(confirmation);
       assert.equal(response.status, 200, response.body);
       assert.equal(JSON.parse(response.body).publish.pullRequestUrl, pr);
@@ -952,6 +972,8 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
       else process.env.PATH = originalPath;
       if (originalHead === undefined) delete process.env.SHIPYARD_TEST_GITHUB_HEAD;
       else process.env.SHIPYARD_TEST_GITHUB_HEAD = originalHead;
+      if (originalComparison === undefined) delete process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
+      else process.env.SHIPYARD_TEST_GITHUB_COMPARISON = originalComparison;
     }
   } finally {
     await Promise.all([manager.shutdown(), server.close()]);
