@@ -45,19 +45,19 @@ export async function repoRoot(path: string): Promise<string> {
   }
 }
 
-/** Parallel runs on one repo take turns adding worktrees, so git's ref and worktree locks never collide. */
+/** Serialize repository operations that update shared Git metadata. */
 const repoLocks = new Map<string, Promise<unknown>>();
-function withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+export function withRepoLock<T>(repo: string, fn: () => Promise<T>): Promise<T> {
   const previous = repoLocks.get(repo) ?? Promise.resolve();
   const next = previous.catch(() => {}).then(fn);
   repoLocks.set(repo, next);
   return next;
 }
 
-/** Create `branch` at the repo's HEAD, checked out in a new worktree at `dir`. Returns the base commit. */
-export async function createWorktree(repo: string, dir: string, branch: string): Promise<string> {
+/** Create `branch` at the requested commit or the repo's HEAD, in a new worktree. */
+export async function createWorktree(repo: string, dir: string, branch: string, startCommit?: string): Promise<string> {
   return withRepoLock(repo, async () => {
-    const baseSha = await git(["rev-parse", "HEAD"], repo).catch(() => {
+    const baseSha = startCommit ?? await git(["rev-parse", "HEAD"], repo).catch(() => {
       throw new Error(`Target repository has no commits yet: ${repo}`);
     });
     mkdirSync(dirname(dir), { recursive: true });

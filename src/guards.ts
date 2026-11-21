@@ -8,7 +8,7 @@ export { checkCommand };
  * A lane limits which files a role may write.
  * - any: anything inside the worktree (implementers)
  * - tests: only test files (the E2E tester)
- * - no-e2e: anything except E2E tests (the implementer fixing an E2E failure must not edit the test)
+ * - no-e2e: anything except E2E tests (UI/UX design and implementer repairs preserve existing E2E tests)
  * - none: nothing at all (planner, reviewer)
  * - docs: documentation only (docs writer)
  * - release: version fields, lockfiles, changelog and release notes (release manager)

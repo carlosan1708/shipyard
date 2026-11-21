@@ -47,13 +47,15 @@ Usage:
 Options for fix, ship and deps:
   --checkpoints                 pause after every stage so you can approve, give feedback or stop
   --checkpoints=plan,implement  pause only after the named stages
-                                (triage, plan, implement, review, revise, security, harden,
+                                (triage, plan, implement, design, review, revise, security, harden,
                                 e2e, repair, docs, release)
-  --crew=triage,plan,review,security,e2e,repair,docs,release
+  --crew=triage,plan,design,review,security,e2e,repair,docs,release
                                 the optional agents that run (default: e2e,repair; implement always runs;
-                                triage applies to fix, plan doesn't apply to deps)
-  --implementer=frontend        who implements: backend (default) or frontend
+                                triage applies to fix; plan and design don't apply to deps)
+  --implementer=ui-ux           who implements: backend (default), frontend, or ui-ux
   --provider=claude|codex       provider for the whole run (defaults to defaultProvider or Claude)
+  --browser / --no-browser      allow or disable the local preview browser tool for this run
+  --reference=<url>             allow one public GitHub or LinkedIn reference (repeatable)
   --model=<name>                model for the selected provider (from the config)
   --effort=medium               reasoning effort for the selected provider
   --budget=10                   estimated dollar limit for Claude runs
@@ -122,6 +124,8 @@ async function main(argv: string[]): Promise<number> {
       let crew: OptionalStage[] | undefined;
       let implementer: Implementer | undefined;
       let budgetUsd: number | undefined;
+      let browserAccess: boolean | undefined;
+      const referenceUrls: string[] = [];
       for (const flag of flags) {
         if (flag === "--checkpoints") checkpointStages = [...STAGES];
         else if (flag.startsWith("--checkpoints=")) {
@@ -134,6 +138,10 @@ async function main(argv: string[]): Promise<number> {
           checkpointStages = names as StageName[];
         } else if (flag.startsWith("--provider=")) {
           providerFlag = flag.slice("--provider=".length);
+        } else if (flag === "--browser" || flag === "--no-browser") {
+          browserAccess = flag === "--browser";
+        } else if (flag.startsWith("--reference=")) {
+          referenceUrls.push(flag.slice("--reference=".length));
         } else if (flag.startsWith("--model=")) {
           model = flag.slice("--model=".length);
         } else if (flag.startsWith("--effort=")) {
@@ -185,7 +193,7 @@ async function main(argv: string[]): Promise<number> {
       stopCodexOnExit(runner);
       const pipelineDeps = deps(config, runner);
       if (checkpointStages) pipelineDeps.checkpoints = { stages: checkpointStages, review: terminalReviewer() };
-      const run = await runPipeline({ target, kind, request, provider, model, effort, crew, implementer, budgetUsd }, pipelineDeps);
+      const run = await runPipeline({ target, kind, request, provider, model, effort, crew, implementer, budgetUsd, browserAccess, referenceUrls }, pipelineDeps);
       if (run.status === "stopped") {
         console.log(`\nStopped. The worktree is kept as it was, uncommitted work included: ${run.worktree}`);
       }
@@ -283,6 +291,7 @@ async function main(argv: string[]): Promise<number> {
         options: {
           port: { type: "string", default: "4710" },
           "no-open": { type: "boolean", default: false },
+          "quiet-link": { type: "boolean", default: false },
           demo: { type: "boolean", default: false },
           "new-token": { type: "boolean", default: false },
         },
@@ -318,7 +327,8 @@ async function main(argv: string[]): Promise<number> {
       writeSession({ port: server.port, pid: process.pid, demo: values.demo, startedAt: new Date().toISOString() });
       console.log(`shipyard ui${values.demo ? " (demo mode: scripted agents, no provider usage)" : ""}`);
       if (!values.demo) console.log(runHeader(uiConfig, uiConfig.defaultProvider ?? "claude"));
-      console.log(`\nOpen: ${server.url}\n(The link carries a private token, kept across restarts; --new-token makes a new one. Keep this terminal open: Ctrl-C stops the UI and any running agents.)\n`);
+      if (values["quiet-link"]) console.log(`Dashboard listening on 127.0.0.1:${server.port}`);
+      else console.log(`\nOpen: ${server.url}\n(The link carries a private token, kept across restarts; --new-token makes a new one. Keep this terminal open: Ctrl-C stops the UI and any running agents.)\n`);
       if (!values["no-open"]) openBrowser(server.url);
       return new Promise<number>((resolve) => {
         let closing = false;

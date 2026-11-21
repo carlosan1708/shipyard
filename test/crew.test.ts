@@ -6,6 +6,7 @@ import { git } from "../src/exec.ts";
 import { checkToolUse, inLane } from "../src/guards.ts";
 import { runPipeline, type PipelineDeps } from "../src/pipeline.ts";
 import { loadRoles } from "../src/roles.ts";
+import { RunControl } from "../src/run-control.ts";
 import { RunStore } from "../src/store.ts";
 import type { Target } from "../src/config.ts";
 import { FakeRunner, makeTargetRepo, tempDir, UNIT_TEST, writeFiles, type Step } from "./helpers.ts";
@@ -99,6 +100,58 @@ test("a review that requests changes sends the findings back to the implementer'
   assert.equal(revise.resumeSessionId, "session-backend");
   assert.match(revise.prompt, /\[major\] src\/add\.js:1: Numeric strings from the API get concatenated\.\n {2}→ Coerce with Number\(\)\./);
   assert.match(await git(["log", "-1", "--format=%s", run.branch], run.repo), /^shipyard\(revise\)/);
+});
+
+test("the UI/UX stage polishes the implemented work before review and preserves E2E tests", async () => {
+  const { runner, deps, target } = await setup([
+    fix,
+    (req) => {
+      assert.equal(req.role.name, "ui-ux");
+      assert.equal(req.resumeSessionId, undefined);
+      assert.match(req.prompt, /Polish the interface/);
+      assert.match(readFileSync(join(req.cwd, "src/add.js"), "utf8"), /Number\(a\)/);
+      writeFiles(req.cwd, { "styles.css": "body { color: navy; }\n", "e2e/stray.e2e.test.js": "// outside the lane" });
+    },
+    () => ({ structured: approve }),
+  ]);
+  const run = await runPipeline({ target, kind: "feature", request: "Polish the interface", crew: ["design", "review"] }, deps);
+  assert.equal(run.status, "passed");
+  assert.deepEqual(run.stages.map((stage) => stage.name), ["implement", "design", "review"]);
+  assert.equal(run.stages[1]!.attempts[0]!.gates[0]!.code, 0);
+  assert.deepEqual(run.stages[1]!.attempts[0]!.revertedFiles, ["e2e/stray.e2e.test.js"]);
+  assert.ok(run.stages[1]!.commit);
+  assert.equal(runner.calls.length, 3);
+});
+
+test("resuming a revision replays its assignments without re-running the orchestrator or completed specialists", async () => {
+  const control = new RunControl();
+  const { deps, target } = await setup([
+    () => ({ structured: { assignments: [
+      { role: "backend", task: "Fix addition" },
+      { role: "ui-ux", task: "Improve the colors" },
+    ] } }),
+    fix,
+    () => { control.stop(); },
+  ], { e2e: undefined });
+  const baseSha = await git(["rev-parse", "HEAD"], target.path);
+  const req = {
+    target, kind: "feature" as const, request: "Fix and restyle", crew: [],
+    followUp: { runId: "source", brief: "Make a tiny app", baseSha, orchestrated: true as const },
+  };
+  const stopped = await runPipeline(req, { ...deps, control });
+  assert.equal(stopped.status, "stopped");
+  const backendCommit = stopped.stages[1]?.commit;
+  assert.ok(backendCommit);
+  const runner = new FakeRunner([(req) => {
+    assert.equal(req.role.name, "ui-ux");
+    assert.match(req.prompt, /Improve the colors/);
+    writeFiles(req.cwd, { "styles.css": "body { color: navy; }\n" });
+  }]);
+  const revised = await runPipeline({ ...req, resume: stopped }, { ...deps, runner });
+  assert.equal(revised.status, "passed");
+  assert.equal(revised.stages[1]?.commit, backendCommit);
+  assert.equal(runner.calls.length, 1);
+  assert.ok(revised.stages[2]?.commit);
 });
 
 test("the implementer may disagree with a finding: no change, an explanation, and the tests still gate it", async () => {

@@ -17,6 +17,10 @@ export interface Target {
   test: string;
   /** E2E command, run as the gate after the E2E stage. Optional. */
   e2e?: string;
+  /** Verify static pages in a host-managed Chrome session. */
+  browserCheck?: boolean;
+  /** Default browser-tool permission for new runs against this target. */
+  browserAccess?: boolean;
 }
 
 export const PROVIDERS = ["claude", "codex"] as const;
@@ -145,11 +149,15 @@ export function parseConfig(raw: Record<string, unknown>, baseDir: string): Ship
   for (const [name, t] of Object.entries(rawTargets)) {
     if (typeof t?.path !== "string") throw new Error(`targets.${name}.path is required`);
     if (typeof t.test !== "string") throw new Error(`targets.${name}.test is required`);
+    if (t.browserCheck !== undefined && typeof t.browserCheck !== "boolean") throw new Error(`targets.${name}.browserCheck must be true or false`);
+    if (t.browserAccess !== undefined && typeof t.browserAccess !== "boolean") throw new Error(`targets.${name}.browserAccess must be true or false`);
     targets[name] = {
       name,
       path: expandPath(t.path, baseDir),
       test: t.test,
       e2e: typeof t.e2e === "string" ? t.e2e : undefined,
+      ...(t.browserCheck === undefined ? {} : { browserCheck: t.browserCheck }),
+      ...(t.browserAccess === undefined ? {} : { browserAccess: t.browserAccess }),
     };
   }
 

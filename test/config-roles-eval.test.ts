@@ -31,9 +31,9 @@ test("config rejects bad values", () => {
 
 test("the shipped roles load from the plugin's agent files", () => {
   const roles = loadRoles();
-  assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "planner", "release-manager", "reviewer", "security-auditor"]);
+  assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "local-app", "orchestrator", "planner", "release-manager", "reviewer", "security-auditor", "ui-ux"]);
   // Read-only roles get no editing tools at all; the lane and post-stage revert back that up.
-  for (const name of ["planner", "reviewer", "security-auditor"]) assert.ok(!roles.get(name)!.tools.some((t) => ["Edit", "Write"].includes(t)), name);
+  for (const name of ["local-app", "orchestrator", "planner", "reviewer", "security-auditor"]) assert.ok(!roles.get(name)!.tools.some((t) => ["Edit", "Write"].includes(t)), name);
   const backend = roles.get("backend")!;
   assert.ok(backend.tools.includes("Bash"));
   assert.equal(backend.model, undefined, "model: inherit means use the configured model");

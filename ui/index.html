@@ -45,7 +45,8 @@
           <span class="count count-strong" id="inbox-count" aria-live="polite">0</span>
           <button type="button" class="btn btn-ghost btn-icon inbox-close" id="inbox-close" aria-label="Close">✕</button>
         </div>
-        <p class="col-hint">Questions, permission requests and checkpoints from every agent and run. Answer them in any order; each agent only waits for its own.</p>
+        <p class="col-hint">Questions, approvals, and run results appear here.</p>
+        <button type="button" class="btn btn-ghost btn-sm inbox-alerts" id="notifications-enable" hidden>Enable desktop alerts</button>
         <div class="inbox-list" id="inbox-list"></div>
       </aside>
     </div>
@@ -58,9 +59,103 @@
           <span class="field-label" id="run-control-label">Instructions</span>
           <textarea id="run-control-message" rows="4"></textarea>
         </label>
+        <label class="field">
+          <span class="field-label">Attach files or images</span>
+          <input id="run-control-attachments" type="file" multiple aria-describedby="run-control-attachment-help">
+          <span id="run-control-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
+        </label>
         <div class="dialog-actions">
           <button type="button" class="btn btn-ghost" id="run-control-cancel">Cancel</button>
           <button type="submit" class="btn btn-primary" id="run-control-submit"></button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="git-remote-dialog" aria-labelledby="git-remote-title">
+      <form method="dialog" class="dialog-body" id="git-remote-form">
+        <h2 id="git-remote-title">Connect Git remote</h2>
+        <p class="field-help" id="git-remote-context"></p>
+        <label class="field">
+          <span class="field-label">Repository clone URL</span>
+          <input id="git-remote-url" type="text" maxlength="2048" required spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="https://github.com/owner/repo.git" aria-describedby="git-remote-context" />
+          <span class="field-help">Use the HTTPS or SSH clone URL from your Git host. This saves the remote locally. Publishing the branch is a separate step.</span>
+        </label>
+        <p class="form-error" id="git-remote-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="git-remote-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="git-remote-submit">Save origin</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="publish-dialog" aria-labelledby="publish-title">
+      <form method="dialog" class="dialog-body" id="publish-form">
+        <h2 id="publish-title">Push branch</h2>
+        <p class="field-help">Send the committed result from this run to the Git remote below.</p>
+        <dl class="run-result-facts">
+          <dt>Destination</dt><dd id="publish-destination"></dd>
+          <dt>Branch</dt><dd class="mono" id="publish-branch"></dd>
+          <dt>Commit</dt><dd class="mono" id="publish-commit"></dd>
+        </dl>
+        <p id="publish-status" class="field-help" role="status"></p>
+        <p id="publish-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="publish-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="publish-submit">Push branch</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="reference-handoff-dialog" aria-labelledby="reference-handoff-title">
+      <form method="dialog" class="dialog-body" id="reference-handoff-form">
+        <h2 id="reference-handoff-title">Research a reference</h2>
+        <a id="reference-handoff-link" target="_blank" rel="noopener noreferrer"></a>
+        <p class="field-help">Shipyard opens a draft in the run’s provider. Send it there and approve any browser prompts. Returned notes appear here for review.</p>
+        <div class="field-row reference-handoff-actions">
+          <a class="btn btn-primary" id="reference-handoff-continue" hidden></a>
+          <button type="button" class="btn btn-sm" id="reference-handoff-copy" hidden>Copy task</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="reference-handoff-retry" hidden>Start a new handoff</button>
+        </div>
+        <p id="reference-handoff-status" class="field-help" role="status"></p>
+        <ul id="reference-handoff-coverage" class="field-help" hidden></ul>
+        <button type="button" class="btn btn-sm" id="reference-handoff-load" hidden>Load returned notes</button>
+        <label class="field"><span class="field-label">Notes to share with the crew</span><textarea id="reference-handoff-text" rows="8" maxlength="24000" required placeholder="Review the returned notes here, or paste the relevant information."></textarea></label>
+        <label class="field">
+          <span class="field-label">Attach files or images</span>
+          <input id="reference-handoff-attachments" type="file" multiple aria-describedby="reference-attachment-help">
+          <span id="reference-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
+        </label>
+        <p class="form-error" id="reference-handoff-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="reference-handoff-revoke" hidden>Cancel handoff</button>
+          <button type="button" class="btn btn-ghost" id="reference-handoff-close">Close</button>
+          <button type="submit" class="btn btn-primary" id="reference-handoff-submit">Use reviewed text</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="dialog" id="feedback-dialog" aria-labelledby="feedback-title">
+      <form method="dialog" class="dialog-body" id="feedback-form">
+        <h2 id="feedback-title">Give feedback</h2>
+        <p class="field-help" id="feedback-context">This starts a new revision run linked to the completed run, using its latest commit. Include any GitHub or LinkedIn links in your feedback. Shipyard asks for browser help in Needs you when needed.</p>
+        <label class="field">
+          <span class="field-label">What should change?</span>
+          <textarea id="feedback-message" rows="6" maxlength="8000" required aria-describedby="feedback-context" placeholder="Describe what to change, what to keep, and how you’ll know it’s right."></textarea>
+        </label>
+        <label class="field">
+          <span class="field-label">Attach files or images</span>
+          <input id="feedback-attachments" type="file" multiple aria-describedby="feedback-attachment-help">
+          <span id="feedback-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
+        </label>
+        <label class="field">
+          <span class="field-label">Provider</span>
+          <select id="feedback-provider"><option value="claude">Claude</option><option value="codex">Codex</option></select>
+        </label>
+        <label class="browser-permission"><input type="checkbox" id="feedback-browser"><span><strong>Allow local browser access</strong><small>Agents can inspect and test the static app in this run’s worktree.</small></span></label>
+        <p class="form-error" id="feedback-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="feedback-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="feedback-submit">Start revision run</button>
         </div>
       </form>
     </dialog>
@@ -91,6 +186,11 @@
           <span class="field-label" id="nr-request-label">Feature request</span>
           <textarea name="request" id="nr-request" rows="4" required placeholder="Add a GET /health endpoint that returns {&quot;status&quot;: &quot;ok&quot;}"></textarea>
         </label>
+        <label class="field">
+          <span class="field-label">Attach files or images</span>
+          <input id="nr-attachments" type="file" multiple aria-describedby="nr-attachment-help">
+          <span id="nr-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
+        </label>
 
         <label class="field">
           <span class="field-label">Provider</span>
@@ -99,6 +199,7 @@
             <option value="codex">Codex</option>
           </select>
         </label>
+        <label class="browser-permission"><input type="checkbox" id="nr-browser"><span><strong>Allow local browser access</strong><small>Agents can inspect and test the static app in this run’s worktree.</small></span></label>
 
         <div class="field">
           <div class="field-grid field-grid-3">
@@ -145,12 +246,12 @@
       <form method="dialog" class="dialog-body" id="add-repo-form" autocomplete="off">
         <div>
           <h2 id="add-repo-title">Add a repo</h2>
-          <p class="field-help">Any git repository on this machine. Shipyard works on its own branch in a separate worktree and never touches your checkout.</p>
+          <p class="field-help">Choose a local Git folder or clone from an HTTPS or SSH URL. Shipyard runs changes on a separate branch and worktree.</p>
         </div>
 
         <label class="field">
-          <span class="field-label">Folder</span>
-          <input type="text" name="path" id="ar-path" placeholder="~/code/my-app" spellcheck="false" required />
+          <span class="field-label">Folder or Git URL</span>
+          <input type="text" name="path" id="ar-path" placeholder="~/code/my-app or https://github.com/owner/repo" spellcheck="false" required />
         </label>
 
         <div class="field" id="ar-suggestions-field" hidden>
@@ -160,7 +261,7 @@
 
         <div class="repo-status" id="ar-status" aria-live="polite"></div>
 
-        <div class="ar-details" id="ar-details" hidden>
+        <fieldset class="ar-details" id="ar-details" hidden disabled>
           <label class="field">
             <span class="field-label">Name</span>
             <input type="text" name="name" id="ar-name" spellcheck="false" required />
@@ -177,7 +278,7 @@
             <div class="cmd-chips" id="ar-e2e-chips"></div>
             <span class="field-help">With one, an E2E tester checks each change from the outside. Without one, runs end after implement.</span>
           </div>
-        </div>
+        </fieldset>
 
         <p class="form-error" id="ar-error" role="alert" hidden></p>
         <div class="dialog-actions">

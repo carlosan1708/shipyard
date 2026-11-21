@@ -12,5 +12,5 @@
     "noUncheckedIndexedAccess": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src", "test", "plugins/shipyard/hooks/*.mjs"]
+  "include": ["src", "test", "e2e/*.ts", "playwright.config.ts", "plugins/shipyard/hooks/*.mjs"]
 }

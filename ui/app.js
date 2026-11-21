@@ -2,8 +2,10 @@
 // Everything agents write is untrusted text: it only ever reaches the page through textContent.
 
 const STAGE_ROLE = {
+  orchestrate: "orchestrator",
   triage: "bug-triager",
   plan: "planner",
+  design: "ui-ux",
   review: "reviewer",
   security: "security-auditor",
   e2e: "e2e-tester",
@@ -12,7 +14,8 @@ const STAGE_ROLE = {
 };
 /** implement, revise, harden and repair belong to the run's implementer. */
 const stageRole = (name, run) => STAGE_ROLE[name] ?? run?.implementer ?? "backend";
-const PIPELINE_ORDER = ["triage", "plan", "implement", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"];
+const PIPELINE_ORDER = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"];
+const roleLabel = (role) => ({ orchestrator: "Orchestrator", "ui-ux": "UI/UX specialist", "dependency-updater": "Dependency updater", "docs-writer": "Docs writer", "e2e-tester": "E2E tester" })[role] ?? role;
 const KIND_LABEL = { feature: "Feature", bug: "Bug fix", deps: "Dependency update" };
 const KIND_SHORT = { feature: "ship", bug: "fix", deps: "deps" };
 
@@ -32,6 +35,7 @@ const STATUS_LABEL = {
   error: "Error",
   stopped: "Stopped",
   interrupted: "Interrupted",
+  redirected: "Redirected",
   changes: "Changes requested",
 };
 
@@ -42,14 +46,23 @@ const state = {
   runs: new Map(),
   active: new Set(),
   inbox: new Map(),
+  referenceDrafts: new Map(),
   events: new Map(), // runId -> events, once loaded
   buffers: new Map(), // runId -> events that arrived while its history was loading
   lastActivity: new Map(), // runId -> last tool/text event
   starting: new Map(), // runId -> request, until its first record arrives
   open: new Map(), // <details> open state, so re-renders keep what you expanded
   selected: null,
+  focusHandoff: null,
   showArchived: false,
   stopping: new Set(),
+  resuming: new Set(),
+  results: new Map(),
+  previewPending: new Set(),
+  localAppPending: new Set(),
+  browserPending: new Set(),
+  verificationPending: new Set(),
+  pullRequestPending: new Set(),
   wasDown: false,
 };
 
@@ -74,11 +87,20 @@ function h(tag, props, ...children) {
   return el;
 }
 
-/** A <details> whose open state survives re-renders. */
-function details(key, summaryText, content, defaultOpen = false, cls = "block") {
+/** A disclosure whose open state survives re-renders. A function defers building its contents. */
+function details(key, title, content, defaultOpen = false, cls = "block") {
   const open = state.open.has(key) ? state.open.get(key) : defaultOpen;
-  const el = h("details", { class: cls, open }, h("summary", { text: summaryText }), content);
-  el.addEventListener("toggle", () => state.open.set(key, el.open));
+  const deferred = typeof content === "function";
+  const el = h("details", { class: cls, open, "data-disclosure": key }, h("summary", {}, title), deferred ? null : content);
+  const load = () => {
+    if (deferred && el.open && el.childElementCount === 1) el.append(content());
+  };
+  load();
+  el.addEventListener("toggle", () => {
+    if (!el.isConnected) return;
+    state.open.set(key, el.open);
+    load();
+  });
   return el;
 }
 
@@ -88,6 +110,7 @@ function details(key, summaryText, content, defaultOpen = false, cls = "block") 
 
 const MD_FENCE = /^\s*(`{3,}|~{3,})/;
 const MD_HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/;
+const MD_SECTION_LABEL = /^\s{0,3}(\*\*|__)([^*_]+)\1(:?)\s*$/;
 const MD_RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
 const MD_QUOTE = /^\s{0,3}>\s?/;
 const MD_LIST = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
@@ -104,8 +127,13 @@ function md(text, cls = "") {
 
 const mdBlank = (line) => line === undefined || !line.trim();
 const mdIsTable = (line, next) => line.includes("|") && next !== undefined && MD_TABLE_SEP.test(next);
+function mdSectionLabel(line) {
+  const match = line.match(MD_SECTION_LABEL);
+  return match && (match[2].endsWith(":") || match[3]) ? (match[2] + match[3]).trim() : "";
+}
+
 const mdStartsBlock = (line, next) =>
-  MD_FENCE.test(line) || MD_HEADING.test(line) || MD_RULE.test(line) || MD_QUOTE.test(line) || MD_LIST.test(line) || mdIsTable(line, next);
+  MD_FENCE.test(line) || MD_HEADING.test(line) || mdSectionLabel(line) || MD_RULE.test(line) || MD_QUOTE.test(line) || MD_LIST.test(line) || mdIsTable(line, next);
 
 function mdBlocks(lines) {
   const out = [];
@@ -113,6 +141,7 @@ function mdBlocks(lines) {
   while (i < lines.length) {
     const line = lines[i];
     let m;
+    let label;
     if (mdBlank(line)) {
       i++;
     } else if ((m = line.match(MD_FENCE))) {
@@ -123,6 +152,9 @@ function mdBlocks(lines) {
     } else if ((m = line.match(MD_HEADING))) {
       // Headings stay small: they sit inside cards, under the page's own headings.
       out.push(h(`h${Math.min(m[1].length + 2, 6)}`, { class: "md-h" }, mdInline(m[2])));
+      i++;
+    } else if ((label = mdSectionLabel(line))) {
+      out.push(h("h4", { class: "md-h" }, mdInline(label)));
       i++;
     } else if (MD_RULE.test(line)) {
       out.push(h("hr", {}));
@@ -291,8 +323,10 @@ function ago(iso) {
 }
 
 const INITIALS = {
+  orchestrator: "OR",
   backend: "BE",
   frontend: "FE",
+  "ui-ux": "UX",
   "e2e-tester": "E2E",
   planner: "PL",
   reviewer: "RV",
@@ -339,6 +373,31 @@ function targetHasE2E(run) {
   return target ? target.e2e : run.stages.some((s) => s.name === "e2e");
 }
 
+function completionLabel(run) {
+  return { passed: "Run completed", failed: "Run failed", stopped: "Run stopped", error: "Run ended with an error" }[run.status];
+}
+
+function unreadResults() {
+  const newest = new Set();
+  return [...state.runs.values()]
+    .filter((run) => run.finishedAt && completionLabel(run) && !run.archivedAt)
+    .sort((a, b) => b.finishedAt.localeCompare(a.finishedAt))
+    .filter((run) => {
+      const first = !newest.has(run.target);
+      newest.add(run.target);
+      // Existing histories did not track read state. Surface the latest result for each target.
+      return run.completionRead === false || (first && run.completionRead === undefined);
+    });
+}
+
+function activeReferenceAlerts() {
+  return [...state.active].flatMap((id) => {
+    const run = state.runs.get(id);
+    return run ? (run.references ?? []).filter((check) => check.status !== "read" && !check.browserHelpSkipped && ![...state.inbox.values()].some((item) =>
+      item.kind === "reference" && item.runId === id && item.url === check.url)).map((check) => ({ run, check })) : [];
+  });
+}
+
 function workingTime(run) {
   const wall = run.finishedAt ? run.totals.durationMs : Date.now() - new Date(run.createdAt).getTime();
   const waiting = run.totals.reviewWaitMs ?? 0;
@@ -363,15 +422,17 @@ async function api(path, { method = "GET", body } = {}) {
 async function loadState() {
   const s = await api("/api/state");
   state.config = s.config;
+  state.acceptsAttachments = s.acceptsAttachments === true;
   state.stages = s.stages;
   state.efforts = s.efforts;
   state.codexEfforts = s.codexEfforts;
-  state.implementers = s.implementers;
   state.roles = s.roles;
   state.targets = s.targets;
   state.runs = new Map(s.runs.map((r) => [r.id, r]));
+  state.results.clear();
   state.active = new Set(s.active);
   state.inbox = new Map(s.inbox.map((i) => [i.id, i]));
+  state.referenceDrafts = new Map((s.referenceHandoffs ?? []).map(({ runId, url, status }) => [referenceKey(runId, url), status]));
   if ($("new-run-dialog").open) {
     fillTargets(); // after a reconnect, an open dialog shows the current repos
     updateCrew();
@@ -379,6 +440,29 @@ async function loadState() {
   if (!state.selected || (!state.runs.has(state.selected) && !state.starting.has(state.selected))) state.selected = initialSelection();
   schedule();
   if (state.selected) loadEvents(state.selected);
+  if ($("reference-handoff-dialog").open) void refreshReferenceHandoff();
+}
+
+async function readAttachments(input) {
+  const files = [...input.files];
+  if (!files.length) return undefined;
+  if (!state.acceptsAttachments) throw new Error("This Shipyard server cannot receive attachments. Restart the dashboard before sending files.");
+  const mb = 1024 * 1024;
+  if (files.length > 6 || files.some((file) => file.size > 3 * mb) || files.reduce((total, file) => total + file.size, 0) > 8 * mb) {
+    throw new Error("Attach up to 6 files, at most 3 MB each and 8 MB total.");
+  }
+  return Promise.all(files.map((file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve({ name: file.name, data: String(reader.result).split(",", 2)[1] });
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+    reader.readAsDataURL(file);
+  })));
+}
+
+function attachmentField(input, id) {
+  input.setAttribute("aria-describedby", id);
+  return h("label", { class: "field" }, h("span", { class: "field-label", text: "Attach files or images" }),
+    input, h("span", { id, class: "field-help", text: "Up to 6 files, 3 MB each and 8 MB total." }));
 }
 
 function initialSelection() {
@@ -419,8 +503,9 @@ function connect() {
     if (state.wasDown) {
       state.wasDown = false;
       state.events.clear();
-      loadState().catch(() => {});
     }
+    // Reconcile any completions that landed between loading the page and subscribing.
+    loadState().catch(() => {});
   });
   es.addEventListener("error", () => {
     setConn("down");
@@ -435,12 +520,57 @@ function connect() {
   const on = (type, fn) => es.addEventListener(type, (e) => fn(JSON.parse(e.data)));
 
   on("run", ({ run }) => {
+    const previous = state.runs.get(run.id);
     state.runs.set(run.id, run);
+    if (previous?.finishedAt !== run.finishedAt) {
+      state.results.delete(run.id);
+      if (run.finishedAt && !run.completionRead && completionLabel(run)) notifyCompletion(run);
+    }
+    if (previous?.publication?.pullRequestUrl !== run.publication?.pullRequestUrl) state.results.delete(run.id);
+    if (run.id === state.selected && run.status === "running" && !run.archivedAt && state.active.has(run.id)) state.showArchived = false;
     state.starting.delete(run.id);
+    schedule();
+  });
+  on("run-deleted", ({ runId }) => {
+    const dialog = $("reference-handoff-dialog");
+    if (dialog.open && $("reference-handoff-form").dataset.runId === runId) dialog.close();
+    forgetRun(runId);
+  });
+  on("preview", ({ runId, url }) => {
+    const result = state.results.get(runId);
+    if (result && !result.loading) result.previewUrl = url;
+    if (runId === state.selected) schedule("detail");
+  });
+  on("local-app", ({ runId, app }) => {
+    const result = state.results.get(runId);
+    if (result && !result.loading) result.localApp = app;
+    if (runId === state.selected) schedule("detail");
+  });
+  on("git-remote", ({ repo }) => refreshRepoResults(repo));
+  on("reference-handoff", ({ runId, url, status }) => {
+    if (url && status) state.referenceDrafts.set(referenceKey(runId, url), status);
+    else if (url) state.referenceDrafts.delete(referenceKey(runId, url));
+    else {
+      for (const key of state.referenceDrafts.keys()) if (key.startsWith(`${runId}\n`)) state.referenceDrafts.delete(key);
+    }
+    const form = $("reference-handoff-form");
+    const open = $("reference-handoff-dialog").open && form.dataset.runId === runId && (!url || form.dataset.url === url);
+    if (open && (status || !url)) void refreshReferenceHandoff();
+    else if (!open && status) toast(status === "ready" ? "Reference notes ready for review" : "The browser reference needs attention", status === "blocked");
     schedule();
   });
   on("event", ({ runId, event }) => {
     if (event.type === "tool" || event.type === "text") state.lastActivity.set(runId, event);
+    const run = state.runs.get(runId);
+    const willAsk = run?.browserReferenceHelp && run.referenceUrls?.includes(event.url) && ["partial", "blocked"].includes(event.status);
+    if (event.type === "reference" && event.status !== "read" && event.source !== "manual" && !willAsk) {
+      const message = `Reference needs attention · ${state.runs.get(runId)?.target ?? "Shipyard"}`;
+      toast(message, true);
+      if (document.hidden && "Notification" in window && Notification.permission === "granted") {
+        const notice = new Notification(message, { body: event.detail });
+        notice.onclick = () => { window.focus(); select(runId); notice.close(); };
+      }
+    }
     if (state.buffers.has(runId)) state.buffers.get(runId).push(event);
     else state.events.get(runId)?.push(event);
     schedule(runId === state.selected ? "detail" : null, "runs");
@@ -451,6 +581,8 @@ function connect() {
     schedule();
   });
   on("inbox-resolved", ({ id }) => {
+    const dialog = $("reference-handoff-dialog");
+    if (dialog.open && !$("reference-handoff-close").disabled && $("reference-handoff-form").dataset.itemId === id) dialog.close();
     state.inbox.delete(id);
     schedule();
   });
@@ -496,8 +628,21 @@ function setConn(kind) {
 
 function notify(item) {
   if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
-  const what = item.kind === "checkpoint" ? "a checkpoint review" : item.kind === "question" ? "a question" : "permission";
+  const what = item.needsApproval ? "approval to read a public reference" :
+    { checkpoint: "a checkpoint review", question: "a question", permission: "permission", reference: "browser help to read a reference" }[item.kind];
   new Notification("shipyard", { body: `${item.role} needs ${what}` });
+}
+
+function notifyCompletion(run) {
+  const message = `${completionLabel(run)} · ${run.target}`;
+  toast(message, run.status === "failed" || run.status === "error");
+  if (!document.hidden || !("Notification" in window) || Notification.permission !== "granted") return;
+  const notice = new Notification(message, { body: firstLine(run.request) });
+  notice.onclick = () => {
+    window.focus();
+    viewResult(run);
+    notice.close();
+  };
 }
 
 // ── Render scheduling ────────────────────────────────────
@@ -542,12 +687,13 @@ function renderMeta() {
     const cap = state.config.maxBudgetUsdPerRun ? ` · up to ${dollars(state.config.maxBudgetUsdPerRun)} a run` : "";
     meta.append(h("span", { text: `Default Claude · ${state.config.model} · effort ${state.config.effort} · runs on ${auth}${cap}` }));
   }
-  const n = state.inbox.size;
+  const n = state.inbox.size + unreadResults().length + activeReferenceAlerts().length;
   for (const el of [$("inbox-count"), $("inbox-toggle-count")]) {
     el.textContent = String(n);
     el.classList.toggle("has", n > 0);
   }
   document.title = n ? `(${n}) shipyard` : "shipyard";
+  $("notifications-enable").hidden = !("Notification" in window) || Notification.permission !== "default";
   $("new-run").disabled = state.targets.length === 0 && !state.config?.canAddTargets;
 }
 
@@ -601,6 +747,7 @@ function runItem({ id, title, status, meta, badge, live }) {
 }
 
 function select(id) {
+  if (state.focusHandoff !== id) state.focusHandoff = null;
   state.selected = id;
   if (id) {
     state.showArchived = Boolean(state.runs.get(id)?.archivedAt);
@@ -611,6 +758,12 @@ function select(id) {
   }
   schedule("runs", "detail");
   closeInboxDrawer();
+}
+
+function viewResult(run) {
+  state.focusHandoff = run.id;
+  select(run.id);
+  void acknowledgeResult(run);
 }
 
 // ── Detail column ────────────────────────────────────────
@@ -642,15 +795,25 @@ function renderDetail() {
   }
 
   const status = runStatus(run);
+  const assignments = revisionAssignments(run);
   const waiting = inboxFor(run.id);
   const events = state.events.get(run.id);
+  const focused = document.activeElement;
+  const restoreHandoff = root.contains(focused) && focused.id === "run-handoff";
+  const disclosure = root.contains(focused) && focused.matches("details[data-disclosure] > summary") ? focused.parentElement : null;
+  if (disclosure) state.open.set(disclosure.dataset.disclosure, disclosure.open);
   const inner = h(
     "div",
     { class: "detail-inner" },
     h(
       "section",
       { class: "run-head" },
-      h("div", { class: "run-head-top" }, h("h1", { text: run.request }), h("span", { class: `pill s-${status}`, text: STATUS_LABEL[status] ?? status })),
+      h("div", { class: "run-head-top" }, h("h1", { text: run.followUp ? "Revision" : run.request }), h("span", { class: `pill s-${status}`, text: STATUS_LABEL[status] ?? status })),
+      run.followUp ? h("div", { class: "feedback-brief" },
+        h("strong", { text: "Your feedback" }),
+        h("p", { text: run.request }),
+        state.runs.has(run.followUp.runId) ? h("button", { type: "button", class: "btn btn-sm", onclick: () => select(run.followUp.runId) }, "View source run") : null,
+      ) : null,
       h(
         "div",
         { class: "run-facts" },
@@ -675,21 +838,285 @@ function renderDetail() {
       ? h(
           "div",
           { class: "banner", role: "status" },
-          `${waiting.length === 1 ? "An agent is" : `${waiting.length} agents are`} waiting for your answer`,
-          h("button", { type: "button", class: "btn btn-sm", onclick: () => focusItem(waiting[0].id) }, "Answer"),
+          waiting[0].kind === "reference" ? `${waiting.length === 1 ? "1 reference needs" : `${waiting.length} references need`} your input in Needs you.` :
+            `${waiting.length === 1 ? "An agent is" : `${waiting.length} agents are`} waiting for your answer`,
+          h("button", { type: "button", class: "btn btn-sm", onclick: () => focusItem(waiting[0].id) }, "Review"),
         )
       : null,
-    run.error ? h("div", { class: "banner banner-error", text: run.error }) : null,
-    renderPipeline(run),
+    run.finishedAt && completionLabel(run) ? runResult(run) : null,
+    renderPipeline(run, assignments),
+    assignments.length ? details(`${run.id}:assignments`, "Specialist assignments", h("ol", { class: "revision-assignments" },
+      assignments.map(({ role, task }) => h("li", {}, h("strong", { text: roleLabel(role) }), h("p", { text: task }))),
+    ), true) : null,
     h("section", { class: "lanes", "aria-label": "Agents" }, run.stages.map((stage) => renderLane(run, stage, events))),
     events === undefined ? h("div", { class: "working" }, h("span", { class: "spinner" }), "Loading activity…") : null,
   );
   const scroll = root.scrollTop;
   root.replaceChildren(inner);
+  if (disclosure) {
+    root.querySelector(`details[data-disclosure="${CSS.escape(disclosure.dataset.disclosure)}"] > summary`)?.focus({ preventScroll: true });
+  }
   root.scrollTop = scroll;
+  const handoffHeading = $("run-handoff");
+  if (handoffHeading && state.focusHandoff === run.id) {
+    state.focusHandoff = null;
+    handoffHeading.focus({ preventScroll: true });
+    handoffHeading.scrollIntoView({ block: "start" });
+  } else if (restoreHandoff) handoffHeading?.focus({ preventScroll: true });
 }
 
-function renderPipeline(run) {
+function loadResult(runId) {
+  const pending = { loading: true };
+  state.results.set(runId, pending);
+  api(`/api/runs/${runId}/result`)
+    .then((result) => { if (state.results.get(runId) === pending) state.results.set(runId, result); })
+    .catch((error) => { if (state.results.get(runId) === pending) state.results.set(runId, { error: error.message }); })
+    .finally(() => { if (state.selected === runId) schedule("detail"); });
+}
+
+function runResult(run) {
+  if (!state.results.has(run.id)) loadResult(run.id);
+  const result = state.results.get(run.id);
+  const commits = run.stages.filter((stage) => stage.commit).length;
+  const latest = new Map(run.stages.flatMap((stage) => stage.attempts.at(-1)?.gates ?? []).map((gate) => [gate.command, gate]));
+  if (run.verification && run.verification.head === result.handoff?.head && result.handoff.uncommittedCount === 0) {
+    for (const gate of run.verification.checks) latest.set(gate.command, gate);
+  }
+  const browserCheck = run.browserCheck ?? latest.get("Chrome browser check (desktop and phone)");
+  if (browserCheck) latest.set(browserCheck.command, browserCheck);
+  const gates = [...latest.values()];
+  const passed = gates.filter(gateOk).length;
+  const publication = result.publish;
+  const gitStatus = result.loading ? "Checking Git remotes…" :
+    result.hasRemote === false ? "Local branch awaiting a remote." :
+    publication?.pushed ? `Branch pushed to ${publication.label}.` :
+    publication ? `Ready to push to ${publication.label}.` :
+    result.publishUnavailable ?? (result.hasRemote ? "No completed branch changes to push." : "Git remote status unavailable.");
+  const previewBusy = state.previewPending.has(run.id);
+  const localAppBusy = state.localAppPending.has(run.id) || result.localApp?.starting;
+  const browserBusy = state.browserPending.has(run.id);
+  const pullRequestBusy = state.pullRequestPending.has(run.id);
+  const button = (label, onclick, disabled = false) =>
+    h("button", { type: "button", class: "btn btn-sm", text: label, onclick, disabled });
+  return h("section", { class: "run-result", "aria-label": "Run result" },
+    h("div", { class: "run-result-heading" },
+      h("h2", { id: "run-handoff", tabindex: "-1", text: "Run handoff" }),
+      h("span", { class: `pill s-${run.status}`, text: completionLabel(run) }),
+      h("time", { datetime: run.finishedAt, text: ago(run.finishedAt), "data-time": run.finishedAt }),
+    ),
+    run.error ? h("p", { class: "run-result-error", text: run.error }) : null,
+    h("p", { text: [
+      gates.length ? `${passed}/${gates.length} checks passed` : "No recorded checks",
+      run.cleanedUp ? "Empty worktree removed" : `${commits} local commit${commits === 1 ? "" : "s"}`,
+    ].join(" · ") }),
+    !run.cleanedUp ? h("dl", { class: "run-result-facts" },
+      h("dt", { text: "Branch" }), h("dd", { class: "mono", text: run.branch }),
+      h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
+        h("span", { text: gitStatus }),
+        result.hasRemote === false ? button("Connect Git remote", () => openGitRemote(run)) : null,
+        publication && !publication.pushed ? button("Push branch", () => openPublish(run, publication)) : null,
+        publication?.pullRequestUrl ? h("a", {
+          class: "btn btn-primary btn-sm", href: publication.pullRequestUrl, target: "_blank", rel: "noopener noreferrer", text: "Open PR on GitHub",
+        }) : publication?.compareUrl ? [
+          h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pullRequestBusy,
+            text: pullRequestBusy ? "Creating PR…" : "Create PR on GitHub", onclick: () => createPullRequest(run.id, publication) }),
+          h("a", { class: "btn btn-sm", href: publication.compareUrl, target: "_blank", rel: "noopener noreferrer", text: "Compare on GitHub" }),
+        ] : null,
+      ),
+    ) : null,
+    result.error ? h("p", { class: "run-result-error", text: result.error }) : null,
+    h("div", { class: "run-result-actions" },
+      run.status === "passed" && !run.cleanedUp ? button("Give feedback", () => openFeedback(run)) : null,
+      !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
+      result.localApp?.url ? [
+        h("a", { class: "btn btn-primary btn-sm", href: result.localApp.url, target: "_blank", rel: "noopener noreferrer", text: "Open local app" }),
+        button(localAppBusy ? "Stopping app…" : "Stop local app", () => updateLocalApp(run.id, "DELETE"), localAppBusy),
+      ] : result.canRunLocally ? h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: localAppBusy,
+        text: localAppBusy ? "Local app agent is starting…" : "Run locally", onclick: () => updateLocalApp(run.id, "POST") }) : null,
+      result.previewUrl ? [
+        h("a", { class: "btn btn-primary btn-sm", href: result.previewUrl, target: "_blank", rel: "noopener noreferrer", text: "Open local preview" }),
+        button(previewBusy ? "Stopping…" : "Stop preview", () => updatePreview(run.id, "DELETE"), previewBusy),
+      ] : result.canPreview ? h("button", { type: "button", class: "btn btn-primary btn-sm", text: previewBusy ? "Opening preview…" : "Open local preview", disabled: previewBusy, onclick: () => openRunPreview(run.id) }) : null,
+      result.canPreview ? button(browserBusy ? "Running browser check…" : "Run browser check", () => checkRunBrowser(run.id), browserBusy) : null,
+    ),
+    result.canPreview ? h("p", { class: "browser-run-status", role: "status", text: browserBusy ? "Testing desktop and phone layouts in the background…" : "The browser check tests desktop and phone layouts in the background." }) : null,
+    browserCheck && !browserBusy ? details(`${run.id}:browser-check`, h("span", {},
+      `Browser check ${gateOk(browserCheck) ? "passed" : "failed"}`,
+      browserCheck.checkedAt ? h("time", { class: "browser-checked-at", datetime: browserCheck.checkedAt, "data-time": browserCheck.checkedAt, text: ago(browserCheck.checkedAt) }) : null,
+    ), h("pre", { class: "browser-check-output", text: browserCheck.outputTail }), !gateOk(browserCheck)) : null,
+    renderHandoff(run, result, latest),
+    [...state.runs.values()].filter((child) => child.followUp?.runId === run.id).map((child) =>
+      h("button", { type: "button", class: "btn btn-sm feedback-child", onclick: () => select(child.id) }, `Revision · ${firstLine(child.request)}`),
+    ),
+  );
+}
+
+function reportSections(text) {
+  const sections = new Map();
+  let current = "";
+  for (const line of text.split("\n")) {
+    const label = line.match(/^#{1,6}\s+(Delivered|Verified|Remaining)\s*:?[ \t]*$/i)?.[1]?.toLowerCase();
+    if (label) current = label;
+    else if (current) sections.set(current, (sections.get(current) ?? "") + line + "\n");
+  }
+  return sections;
+}
+
+function renderHandoff(run, result, checks) {
+  const info = result.handoff;
+  const reports = run.stages.filter((stage) => stage.name !== "orchestrate" && stage.name !== "plan")
+    .flatMap((stage) => {
+      const summary = stage.attempts.at(-1)?.summary?.trim();
+      return summary ? [{ stage, summary, sections: reportSections(summary) }] : [];
+    });
+  const missing = (info?.configuredChecks ?? []).filter((command) => !checks.has(command) || checks.get(command).expectFailure);
+  const unfinished = revisionAssignments(run).filter(({ role }) => !run.stages.some((stage) => stage.role === role && stage.status === "passed"));
+  const blocked = [...checks.values()].filter((gate) => !gateOk(gate));
+  const needsProjectChecks = [...missing, ...blocked.map((gate) => gate.command)].some((command) =>
+    info?.configuredChecks?.includes(command) && command !== "Chrome browser check (desktop and phone)");
+  const verifying = state.verificationPending.has(run.id);
+  const pending = [
+    ...(run.status !== "passed" && !unfinished.length ? [run.status === "stopped" ? "The run stopped before completion." : "Resolve the failed stage or run error before continuing."] : []),
+    ...unfinished.map(({ role, task }) => `${roleLabel(role)} · ${task}`),
+    ...blocked.map((gate) => `${gate.command} · ${gate.timedOut ? "timed out" : "failed"}`),
+    ...missing.map((command) => `${command} · awaiting verification`),
+    ...((info?.uncommittedCount ?? 0) ? [`${info.uncommittedCount} uncommitted file${info.uncommittedCount === 1 ? "" : "s"} in the worktree`] : []),
+  ];
+  const agentPending = reports.flatMap(({ stage, sections }) => {
+    const text = sections.get("remaining")?.trim();
+    return text && !/^(?:[-*]\s+)?(?:none|nothing pending|no outstanding items)\.?$/i.test(text) ? [{ stage, text }] : [];
+  });
+  const referenceGaps = (run.references ?? []).filter((check) => check.status !== "read");
+  const inspections = run.stages.flatMap((stage) => stage.attempts.flatMap((attempt) => (attempt.browserInspections ?? []).map((label) => `${roleLabel(stage.role)} · ${label}`)));
+  return h("div", { class: "handoff-grid" },
+    h("section", { class: "handoff-panel" },
+      h("h3", { text: "What changed" }),
+      info?.head ? h("p", { class: "muted", text: `${info.fileCount ?? "—"} committed files · ${info.head.slice(0, 8)}` }) : null,
+      reports.length ? reports.map(({ stage, summary, sections }) => {
+        const excerpt = (sections.get("delivered") ?? summary).split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#"));
+        const intro = excerpt?.replace(/^[-*]\s+/, "").replace(/\*\*|`/g, "");
+        return details(`${run.id}:report:${stage.name}`, h("span", { class: "handoff-report-line" },
+          h("strong", { text: roleLabel(stage.role) }),
+          intro ? h("span", { class: "muted", text: intro.length > 160 ? `${intro.slice(0, 157)}…` : intro }) : null,
+        ), h("div", { class: "handoff-report md" }, md(summary)));
+      }) : h("p", { class: "muted", text: "No specialist report was recorded." }),
+      info?.files?.length ? details(`${run.id}:committed-files`, info.files.length < info.fileCount ? `Changed files · first ${info.files.length}` : "Changed files",
+        h("ul", { class: "handoff-files mono" }, info.files.map(({ status, path }) => h("li", { text: `${status}  ${path}` })))) : null,
+    ),
+    h("section", { class: "handoff-panel" },
+      h("h3", { text: "Verified" }),
+      checks.size ? h("ul", {}, [...checks.values()].map((gate) => h("li", {},
+        h("span", { class: `handoff-check ${gateOk(gate) ? "is-pass" : "is-fail"}`, text: gateOk(gate) ? gate.expectFailure ? "Reproduced" : "Passed" : "Failed" }),
+        gate.command,
+        !gateOk(gate) && gate.outputTail ? details(`${run.id}:check:${gate.command}`, "Check output", h("pre", { class: "browser-check-output", text: gate.outputTail })) : null,
+      ))) : h("p", { class: "muted", text: "No automated checks were recorded." }),
+      inspections.length ? details(`${run.id}:browser-inspections`, "Agent browser inspections", h("ul", {}, inspections.map((label) => h("li", { text: label })))) : null,
+    ),
+    h("section", { class: "handoff-panel" },
+      h("h3", { text: "Pending" }),
+      pending.length ? h("ul", {}, pending.map((item) => h("li", { text: item }))) : null,
+      referenceGaps.map((check) => h("div", { class: "handoff-report reference-warning" },
+        h("strong", { text: `${({ partial: "Incomplete reference", blocked: "Reference blocked", "permission-required": "Reference needs approval" })[check.status]} · ${check.url ? check.url.replace(/^https:\/\/(?:www\.)?/, "") : check.label}` }),
+        h("p", { text: check.detail }),
+        check.coverage?.length ? h("p", { text: `Read: ${check.coverage.join(", ")}` }) : null,
+        check.missing?.length ? h("ul", {}, check.missing.map((line) => h("li", { text: line }))) : null,
+        check.url && run.referenceUrls?.includes(check.url) ? h("button", { class: "btn btn-sm", type: "button",
+          text: state.referenceDrafts.has(referenceKey(run.id, check.url)) ? "Review reference" : "Retry in browser",
+          onclick: () => openReferenceHandoff(run.id, check.url) }) : null,
+      )),
+      agentPending.map(({ stage, text }) => h("div", { class: "handoff-report md" }, h("strong", { text: `From ${roleLabel(stage.role)}` }), md(text))),
+      !pending.length && !agentPending.length && !referenceGaps.length ? h("p", { class: "muted", text: "No open work or checks recorded." }) : null,
+      needsProjectChecks && !run.cleanedUp && run.status !== "stopped" ? h("button", { type: "button", class: "btn btn-sm handoff-action", onclick: () => verifyRunResult(run.id), disabled: verifying, text: verifying ? "Running project checks…" : "Run project checks" }) : null,
+    ),
+  );
+}
+
+async function checkRunBrowser(runId) {
+  if (state.browserPending.has(runId)) return;
+  state.browserPending.add(runId);
+  schedule("detail");
+  try {
+    const { check } = await api(`/api/runs/${runId}/browser-check`, { method: "POST" });
+    const run = state.runs.get(runId);
+    if (run) run.browserCheck = check;
+    state.open.set(`${runId}:browser-check`, true);
+    toast(gateOk(check) ? "Browser check passed on desktop and phone" : "Browser check failed. See the result for details.", !gateOk(check));
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    state.browserPending.delete(runId);
+    schedule("detail");
+  }
+}
+
+async function verifyRunResult(runId) {
+  if (state.verificationPending.has(runId)) return;
+  state.verificationPending.add(runId);
+  schedule("detail");
+  try {
+    const { verification } = await api(`/api/runs/${runId}/verify`, { method: "POST" });
+    const run = state.runs.get(runId);
+    if (run) run.verification = verification;
+    const ok = verification.checks.every(gateOk);
+    toast(ok ? "Project checks passed" : "A project check failed. See the handoff.", !ok);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    state.verificationPending.delete(runId);
+    schedule("detail");
+  }
+}
+
+function openRunPreview(runId) {
+  const tab = window.open("about:blank", "_blank");
+  if (tab) tab.opener = null;
+  void updatePreview(runId, "POST", tab);
+}
+
+async function updatePreview(runId, method, tab) {
+  if (state.previewPending.has(runId)) return;
+  state.previewPending.add(runId);
+  schedule("detail");
+  try {
+    const result = await api(`/api/runs/${runId}/preview`, { method });
+    const info = state.results.get(runId);
+    if (info) info.previewUrl = result.url;
+    if (method === "POST") {
+      if (tab && !tab.closed) tab.location.replace(result.url);
+      else toast("Preview ready. Click Open local preview.");
+    }
+  } catch (error) {
+    tab?.close();
+    toast(error.message, true);
+  } finally {
+    state.previewPending.delete(runId);
+    schedule("detail");
+  }
+}
+
+async function updateLocalApp(runId, method) {
+  if (state.localAppPending.has(runId)) return;
+  state.localAppPending.add(runId);
+  schedule("detail");
+  try {
+    await api(`/api/runs/${runId}/local-app`, { method });
+    state.results.delete(runId);
+    if (method === "POST") toast("Local app is ready");
+  } catch (error) {
+    state.results.delete(runId);
+    toast(error.message, true);
+  } finally {
+    state.localAppPending.delete(runId);
+    schedule("detail");
+  }
+}
+
+function revisionAssignments(run) {
+  const stage = run.stages.find((stage) => stage.name === "orchestrate");
+  return stage?.status === "passed" ? stage.attempts.at(-1)?.output?.assignments ?? [] : [];
+}
+
+function renderPipeline(run, assignments) {
   const nodes = [];
   const done = new Map(run.stages.map((s) => [s.name, s]));
   // Runs from before crews existed ran e2e + repair.
@@ -703,13 +1130,14 @@ function renderPipeline(run) {
     if (name === "harden") return running && crew.has("security");
     return crew.has(name);
   };
-  const names = PIPELINE_ORDER.filter(show);
+  const orchestrated = run.followUp?.orchestrated;
+  const names = orchestrated ? ["orchestrate", ...assignments.map(({ role }) => role)] : PIPELINE_ORDER.filter(show);
   const conditional = { repair: "only if E2E fails", revise: "only if review asks for changes", harden: "only if the audit requires fixes" };
 
   names.forEach((name, i) => {
     const stage = done.get(name);
     const status = stage ? stageStatus(run, stage) : "planned";
-    const role = stage?.role ?? stageRole(name, run);
+    const role = roleLabel(stage?.role ?? (orchestrated && name !== "orchestrate" ? name : stageRole(name, run)));
     const sub = stage
       ? `${role} · ${stage.attempts.length} attempt${stage.attempts.length === 1 ? "" : "s"} · ${stageUsage(run, stage)}`
       : conditional[name] ?? (running ? `${role} · waiting to start` : `${role} · didn't run`);
@@ -718,7 +1146,7 @@ function renderPipeline(run) {
       h(
         "div",
         { class: `stage-node${stage ? "" : " planned"}` },
-        h("span", { class: "stage-name" }, h("span", { class: `stage-icon s-${status}`, "aria-hidden": "true", text: stageGlyph(status) }), name),
+        h("span", { class: "stage-name" }, h("span", { class: `stage-icon s-${status}`, "aria-hidden": "true", text: stageGlyph(status) }), orchestrated ? role : name),
         h("span", { class: "stage-sub", text: stage ? `${STATUS_LABEL[status] ?? status} · ${sub}` : sub }),
       ),
     );
@@ -742,9 +1170,9 @@ function renderLane(run, stage, events) {
     if (!byAttempt.has(n)) byAttempt.set(n, []);
     byAttempt.get(n).push(e);
   }
-  const count = Math.max(stage.attempts.length, ...byAttempt.keys(), 1);
-  const attempts = [];
-  for (let n = 1; n <= count; n++) attempts.push(renderAttempt(run, stage, n, byAttempt.get(n) ?? [], n === count, status));
+  const numbers = [...new Set([...stage.attempts.map((attempt) => attempt.attempt), ...byAttempt.keys()])].sort((a, b) => b - a);
+  if (!numbers.length) numbers.push(1);
+  const attempts = numbers.map((n, index) => renderAttempt(run, stage, n, byAttempt.get(n) ?? [], index === 0, status));
 
   return h(
     "article",
@@ -753,7 +1181,7 @@ function renderLane(run, stage, events) {
       "header",
       { class: "lane-head" },
       avatar(stage.role),
-      h("div", { class: "lane-title" }, h("strong", { text: stage.role }), h("span", { text: `${stage.name} stage` })),
+      h("div", { class: "lane-title" }, h("strong", { text: roleLabel(stage.role) }), h("span", { text: `${stage.name} stage` })),
       h(
         "div",
         { class: "lane-stats" },
@@ -765,47 +1193,69 @@ function renderLane(run, stage, events) {
   );
 }
 
-function renderAttempt(run, stage, n, events, isLast, status) {
-  const record = stage.attempts[n - 1];
-  const prev = stage.attempts[n - 2];
-  const why = !prev ? "" : prev.interrupted === "redirected" ? "after your update" : prev.review?.action === "feedback" ? "after your feedback" : prev.passed ? "" : prev.noChanges ? "after no changes" : "after a failed gate";
-  const key = `${run.id}:${stage.name}:${n}`;
-  const start = events.find((e) => e.type === "attempt_start");
+function attemptStatus(record, isLatest, stageStatus) {
+  if (isLatest && stageStatus === "waiting") return "waiting";
+  if (!record) return isLatest && stageStatus === "running" ? "running" : "interrupted";
+  if (record.interrupted) return record.interrupted;
+  if (record.review?.action === "stop") return "stopped";
+  if (record.review?.action === "feedback") return "changes";
+  if (record.passed) return "passed";
+  const verdict = record.output?.verdict;
+  return verdict === "request_changes" || verdict === "fix_required" ? "changes" : "failed";
+}
 
+function renderAttempt(run, stage, n, events, isLatest, stageStatus) {
+  const record = stage.attempts.find((attempt) => attempt.attempt === n);
+  const prev = stage.attempts.find((attempt) => attempt.attempt === n - 1);
+  const reason = !prev ? "" : prev.interrupted === "redirected" ? "After your update" : prev.interrupted ? "After an interruption" : prev.review?.action === "feedback" ? "After your feedback" : prev.passed ? "" : prev.noChanges ? "After no changes" : "After a failed gate";
+  const key = `${run.id}:${stage.name}:${n}`;
+  const start = events.find((event) => event.type === "attempt_start");
+  const status = attemptStatus(record, isLatest, stageStatus);
+  const title = h("span", { class: "attempt-line" },
+    h("strong", { text: `Attempt ${n}` }),
+    h("span", { class: "attempt-meta", text: providerLabel(record?.provider ?? start?.provider ?? run.provider) }),
+    record?.durationMs > 0 ? h("span", { class: "attempt-meta", text: secs(record.durationMs) }) : null,
+    h("span", { class: `attempt-outcome pill s-${status}`, text: STATUS_LABEL[status] }),
+  );
+
+  const part = (name, label, content, open = false) => details(`${key}:${name}`, label, content, open, "attempt-part");
+  return details(`${key}:attempt`, title, () => h(
+    "div",
+    { class: "attempt-body" },
+    reason ? h("p", { class: "attempt-meta", text: reason }) : null,
+    record?.summary ? part("summary", "Summary", () => md(record.summary, "prose"), true) : null,
+    start?.prompt ? part("prompt", "Prompt", () => h("pre", { class: "prose", text: start.prompt })) : null,
+    part("activity", "Activity", () => attemptActivity(record, events, key)),
+  ), false, "attempt");
+}
+
+function attemptActivity(record, events, key) {
   const rows = [];
-  // A checkpoint is reached after the gates run, so its "waiting" row goes after the gate rows.
-  const isCheckpointWait = (e) => e.type === "waiting" && e.kind === "checkpoint";
-  for (const e of events.filter((e) => !isCheckpointWait(e))) {
-    const row = eventRow(e);
-    if (row) rows.push(row);
+  // A checkpoint is reached after the gates run, so its waiting row follows the gate rows.
+  const isCheckpointWait = (event) => event.type === "waiting" && event.kind === "checkpoint";
+  for (const event of events) {
+    if (isCheckpointWait(event)) continue;
+    const entry = eventRow(event);
+    if (entry) rows.push(entry);
   }
   if (record) {
-    if (record.interrupted) rows.push(row("interrupted", record.interrupted === "stopped" ? "You stopped this attempt" : "Waiting for the updated attempt", "warn"));
-    else if (!record.agentOk && record.agentError) rows.push(row("stopped", record.agentError, "bad"));
+    if (record.interrupted) {
+      const description = { stopped: "You stopped this attempt", redirected: "The attempt was redirected", interrupted: "Shipyard exited during this attempt" };
+      rows.push(row("interrupted", description[record.interrupted], "warn"));
+    } else if (!record.agentOk && record.agentError) {
+      rows.push(row("stopped", record.agentError, "bad"));
+    }
     if (record.revertedFiles?.length) rows.push(row("reverted", `out-of-lane edits: ${record.revertedFiles.join(", ")}`, "warn"));
     if (record.noChanges) rows.push(row("gate", "No changes in the worktree, so the gates didn't run", "bad"));
-    for (const g of record.gates) {
-      const label = gateLabel(g);
-      if (gateOk(g) && !g.expectFailure) rows.push(row("gate", label, "ok", true));
-      else rows.push(h("li", { class: "row bad" }, h("span", { class: "row-tag", text: "gate" }), h("div", { class: "row-body mono" }, details(`${key}:gate:${g.command}`, label, h("pre", { class: "prose mono", text: g.outputTail }), isLast, ""))));
+    for (const gate of record.gates) {
+      const label = gateLabel(gate);
+      if (gateOk(gate) && !gate.expectFailure) rows.push(row("gate", label, "ok", true));
+      else rows.push(h("li", { class: "row bad" }, h("span", { class: "row-tag", text: "gate" }), h("div", { class: "row-body mono" }, details(`${key}:gate:${gate.command}`, label, h("pre", { class: "prose mono", text: gate.outputTail }), false, ""))));
     }
   }
-  for (const e of events.filter(isCheckpointWait)) rows.push(eventRow(e));
-  for (const e of events.filter((e) => e.type === "checkpoint")) rows.push(checkpointRow(e));
-
-  let tail = null;
-  if (!record && status === "waiting") tail = h("div", { class: "working s-waiting" }, `${stage.role} is waiting for you`);
-  else if (!record && state.active.has(run.id) && isLast) tail = h("div", { class: "working" }, h("span", { class: "spinner" }), `${stage.role} is working…`);
-
-  return h(
-    "div",
-    { class: "attempt" },
-    h("div", { class: "attempt-label" }, `Attempt ${n} · ${providerLabel(record?.provider ?? start?.provider ?? run.provider)}`, why ? h("span", { text: `· ${why}` }) : null),
-    start?.prompt ? details(`${key}:prompt`, "What it was told", h("pre", { class: "prose", text: start.prompt })) : null,
-    h("ul", { class: "feed" }, rows),
-    tail,
-    record?.summary ? details(`${key}:summary`, `${stage.role}'s summary`, md(record.summary, "prose"), isLast) : null,
-  );
+  for (const event of events.filter(isCheckpointWait)) rows.push(eventRow(event));
+  for (const event of events.filter((entry) => entry.type === "checkpoint")) rows.push(checkpointRow(event));
+  return rows.length ? h("ul", { class: "feed" }, rows) : h("p", { class: "attempt-meta", text: "No activity recorded yet." });
 }
 
 function row(tag, body, cls = "", mono = false) {
@@ -822,7 +1272,8 @@ function eventRow(e) {
       return row("blocked", `${e.tool}: ${e.reason}`, "bad");
     case "waiting": {
       const pending = state.inbox.has(e.item);
-      const what = e.kind === "checkpoint" ? "your checkpoint review" : e.kind === "question" ? "your answer to a question" : "your permission";
+      const what = e.kind === "checkpoint" ? "your checkpoint review" : e.kind === "question" ? "your answer to a question" :
+        e.kind === "reference" ? "your input on a reference" : "your permission";
       return h(
         "li",
         { class: "row warn" },
@@ -833,6 +1284,7 @@ function eventRow(e) {
     case "answered":
       if (e.kind === "checkpoint") return null; // shown by the pipeline's own checkpoint event
       if (e.kind === "question") return row("you", `answered: ${Object.values(e.answer?.answers ?? {}).join("; ")}`, "you");
+      if (e.kind === "reference") return row("you", { approve: "approved reference access", share: "shared reviewed reference notes", skip: "skipped the reference" }[e.answer?.action], "you");
       return row("you", e.answer?.decision === "deny" ? `denied${e.answer?.message ? `: ${e.answer.message}` : ""}` : e.answer?.decision === "allow-run" ? "allowed for this run" : "allowed once", "you");
     case "auto-allowed":
       return row("allowed", `${e.tool} (you allowed it for this run)`, "you");
@@ -852,26 +1304,84 @@ function checkpointRow(e) {
 function renderInbox() {
   const list = $("inbox-list");
   const items = [...state.inbox.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const outcomes = unreadResults();
+  const references = activeReferenceAlerts();
+  const oldOutcomes = list.querySelector(".inbox-results");
+  const oldReferences = list.querySelector(".inbox-references");
+
   for (const el of [...list.children]) {
-    if (el.dataset.id ? !state.inbox.has(el.dataset.id) : items.length) el.remove();
+    if (el === oldOutcomes || el === oldReferences) continue;
+    if (!el.dataset.id || !state.inbox.has(el.dataset.id)) el.remove();
   }
-  if (!items.length) {
-    if (!list.children.length) list.append(h("p", { class: "inbox-empty", text: "Nothing needs you right now. Agents will ask here when they need a decision." }));
+  if (!items.length && !outcomes.length && !references.length) {
+    list.replaceChildren(h("p", { class: "inbox-empty", text: "You're caught up. Questions and results will appear here." }));
     return;
   }
+  if (references.length) {
+    const alerts = h("section", { class: "inbox-references", "aria-label": "Reference access" },
+      h("h3", { class: "section-label", text: "Reference access" }),
+      references.map(({ run, check }) => h("article", { class: "card completion-card" }, h("div", { class: "card-body" },
+        h("strong", { text: `${run.target} · ${check.label ?? new URL(check.url).hostname}` }),
+        h("p", { class: "reference-warning", text: check.detail }),
+        h("button", { type: "button", class: "btn btn-sm", onclick: () => select(run.id) }, "View run"),
+      ))),
+    );
+    if (oldReferences) oldReferences.replaceWith(alerts);
+    else list.insertBefore(alerts, oldOutcomes);
+  } else oldReferences?.remove();
   for (const item of items) {
     const existing = list.querySelector(`[data-id="${item.id}"]`);
     if (existing) {
       existing.querySelector(".card-time").textContent = ago(item.createdAt);
+      if (item.kind === "reference" && !item.needsApproval) {
+        existing.querySelector(".reference-handoff-card-action").textContent = referenceAction(state.runs.get(item.runId), item.url);
+      }
       continue;
     }
-    list.append(card(item));
+    list.insertBefore(card(item), oldOutcomes);
+  }
+  if (!outcomes.length) {
+    oldOutcomes?.remove();
+  } else {
+    const resultList = h("section", { class: "inbox-results", "aria-label": "Run results" },
+      h("h3", { class: "section-label", text: "Run results" }),
+      outcomes.map(completionCard),
+    );
+    if (oldOutcomes) oldOutcomes.replaceWith(resultList);
+    else list.append(resultList);
+  }
+}
+
+function completionCard(run) {
+  return h("article", { class: "card completion-card" },
+    h("header", { class: "card-head" },
+      h("span", { class: `pill s-${run.status}`, text: completionLabel(run) }),
+      h("time", { class: "card-time", datetime: run.finishedAt, "data-time": run.finishedAt, text: ago(run.finishedAt) }),
+    ),
+    h("div", { class: "card-body" },
+      h("div", { class: "completion-title", title: run.request, text: `${run.target} · ${firstLine(run.request)}` }),
+      h("div", { class: "actions" },
+        h("button", { type: "button", class: "btn btn-sm btn-primary", onclick: () => viewResult(run) }, "View result"),
+        h("button", { type: "button", class: "btn btn-sm btn-ghost", onclick: () => acknowledgeResult(run) }, "Dismiss"),
+      ),
+    ),
+  );
+}
+
+async function acknowledgeResult(run) {
+  try {
+    const { run: saved } = await api(`/api/runs/${run.id}`, { method: "PATCH", body: { acknowledgeCompletion: run.finishedAt } });
+    state.runs.set(saved.id, saved);
+    schedule();
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
 function card(item) {
   const run = state.runs.get(item.runId);
-  const kindLabel = { checkpoint: "Checkpoint", question: "Question", permission: "Permission" }[item.kind];
+  const kindLabel = item.needsApproval ? "Reference approval" :
+    { checkpoint: "Checkpoint", question: "Question", permission: "Permission", reference: "Browser help" }[item.kind];
   const error = h("p", { class: "card-error", role: "alert", hidden: true });
   const el = h(
     "article",
@@ -887,11 +1397,13 @@ function card(item) {
     h("button", { type: "button", class: "card-run", onclick: () => select(item.runId), title: "Open this run" }, run ? firstLine(run.request) : item.runId),
   );
 
-  const send = async (answer) => {
+  const send = async (answer, files) => {
+    if (el.classList.contains("sending")) return;
     el.classList.add("sending");
     error.hidden = true;
     try {
-      await api(`/api/inbox/${item.id}`, { method: "POST", body: answer });
+      const attachments = files ? await readAttachments(files) : undefined;
+      await api(`/api/inbox/${item.id}`, { method: "POST", body: { ...answer, attachments } });
       state.inbox.delete(item.id);
       schedule();
     } catch (err) {
@@ -901,10 +1413,69 @@ function card(item) {
     }
   };
 
-  const body = item.kind === "checkpoint" ? checkpointBody(item, send) : item.kind === "question" ? questionBody(item, send) : permissionBody(item, send);
+  const body = item.kind === "checkpoint" ? checkpointBody(item, send) : item.kind === "question" ? questionBody(item, send)
+    : item.kind === "reference" ? h("div", { class: "card-body" },
+      h("p", { class: "card-title", text: item.url.replace(/^https:\/\/(?:www\.)?/, "") }),
+      h("p", { text: item.detail }),
+      h("div", { class: "actions" },
+        item.needsApproval
+          ? h("button", { type: "button", class: "btn btn-primary btn-sm", text: "Approve reference", onclick: () => send({ kind: "reference", action: "approve" }) })
+          : h("button", { type: "button", class: "btn btn-primary btn-sm reference-handoff-card-action", text: referenceAction(run, item.url), onclick: () => openReferenceHandoff(item.runId, item.url, item.id) }),
+        h("button", { type: "button", class: "btn btn-ghost btn-sm", text: "Skip reference", onclick: () => send({ kind: "reference", action: "skip" }) }),
+      ),
+    ) : permissionBody(item, send);
   body.append(error);
   el.append(body);
   return el;
+}
+
+/** Break a plan at its own headings after Markdown has been parsed into safe DOM nodes. */
+function checkpointSummary(text, key) {
+  const rendered = md(text, "summary");
+  const overview = { title: "Overview", blocks: [] };
+  const sections = [overview];
+  let section = overview;
+  for (const block of rendered.children) {
+    if (block.classList.contains("md-h")) {
+      section = { title: block.textContent, blocks: [] };
+      sections.push(section);
+    } else {
+      section.blocks.push(block);
+    }
+  }
+  if (sections.length > 1 && !overview.blocks.length) sections.shift();
+
+  if (sections.length === 1) {
+    const short = text.length <= 300 && rendered.querySelectorAll("li, br").length < 5;
+    return details(`${key}:summary`, "Summary", h("div", { class: "checkpoint-section-body" }, rendered), short, "checkpoint-section");
+  }
+
+  const panels = [];
+  const rows = sections.map(({ title, blocks }, index) => {
+    if (!blocks.length) return h("div", { class: "checkpoint-section-heading", text: title });
+    const panel = details(
+      `${key}:summary:${index}`,
+      title,
+      h("div", { class: "checkpoint-section-body md summary" }, blocks),
+      false,
+      "checkpoint-section",
+    );
+    panels.push(panel);
+    return panel;
+  });
+
+  const all = panels.length > 1 ? h("button", { type: "button", class: "link" }) : null;
+  if (all) {
+    const update = () => { all.textContent = panels.every((panel) => panel.open) ? "Collapse all" : "Expand all"; };
+    update();
+    all.addEventListener("click", () => {
+      const open = panels.some((panel) => !panel.open);
+      for (const panel of panels) panel.open = open;
+      update();
+    });
+    for (const panel of panels) panel.addEventListener("toggle", update);
+  }
+  return h("div", { class: "checkpoint-summary" }, all, rows);
 }
 
 function checkpointBody(item, send) {
@@ -922,63 +1493,44 @@ function checkpointBody(item, send) {
         : c.outcome === "passed" ? `${c.stage} passed its gates` : c.noChanges ? `${c.stage} made no changes` : `${c.stage} is still failing`;
   const body = h("div", { class: "card-body" }, h("div", { class: "card-title", text: `${title} (attempt ${c.attempt})` }));
 
-  if (c.summary?.trim()) {
-    const summary = md(c.summary.trim(), "summary");
-    body.append(summary);
-    requestAnimationFrame(() => {
-      if (summary.scrollHeight > summary.clientHeight + 4) {
-        summary.classList.add("clamped");
-        const more = h("button", { type: "button", class: "link" }, "Show all");
-        more.addEventListener("click", () => {
-          const open = summary.classList.toggle("open");
-          summary.classList.toggle("clamped", !open);
-          more.textContent = open ? "Show less" : "Show all";
-        });
-        summary.after(more);
-      }
-    });
+  const key = `checkpoint:${item.id}`;
+  const section = (name, title, ...children) =>
+    details(`${key}:${name}`, title, h("div", { class: "checkpoint-section-body" }, children), false, "checkpoint-section");
+  if (c.summary?.trim()) body.append(checkpointSummary(c.summary.trim(), key));
+
+  if (!readOnly) {
+    const files = item.diff.summary;
+    body.append(section("files", `Changed files (${files.length})`,
+      h("ul", { class: "files" }, files.length ? files.map((line) => h("li", { title: line, text: line })) : h("li", { text: "(none)" })),
+    ));
   }
 
-  // Planner and reviewer never change files, so there is no diff to show for them.
-  if (!readOnly) {
-    body.append(
-      h("div", {}, h("div", { class: "section-label", text: "Changes" }), h("ul", { class: "files" }, item.diff.summary.length ? item.diff.summary.map((line) => h("li", { title: line, text: line })) : h("li", { text: "(none)" }))),
-    );
-  }
   if (c.gates.length) {
-    body.append(
-      h(
-        "div",
-        {},
-        h("div", { class: "section-label", text: "Gates" }),
-        h("ul", { class: "gates" }, c.gates.map((g) => h("li", { class: gateOk(g) ? "ok" : "bad", text: gateLabel(g) }))),
-      ),
-    );
-    // The output matters for a real failure, and for a triage it shows the reproduction failing.
-    const failed = c.gates.find((g) => !gateOk(g) || (g.expectFailure && g.code !== 0));
-    if (failed) body.append(h("pre", { class: "code", text: failed.outputTail.trim().split("\n").slice(-15).join("\n") }));
+    const failures = c.gates.filter((gate) => !gateOk(gate));
+    const detail = failures[0] ?? c.gates.find((gate) => gate.expectFailure && gate.code !== 0);
+    const title = failures.length ? `Checks (${failures.length} failed)` : `Checks (${c.gates.length} passed)`;
+    body.append(section("checks", title,
+      h("ul", { class: "gates" }, c.gates.map((gate) => h("li", { class: gateOk(gate) ? "ok" : "bad", text: gateLabel(gate) }))),
+      detail ? h("pre", { class: "code", text: detail.outputTail.trim().split("\n").slice(-15).join("\n") }) : null,
+    ));
   }
 
   if (item.diff.patch.trim()) {
-    let diffEl = null;
-    const toggle = h("button", { type: "button", class: "link" }, "View diff");
-    toggle.addEventListener("click", () => {
-      diffEl ??= renderDiff(item.diff.patch);
-      if (diffEl.isConnected) {
-        diffEl.remove();
-        toggle.textContent = "View diff";
-      } else {
-        toggle.after(diffEl);
-        toggle.textContent = "Hide diff";
-      }
-    });
-    body.append(toggle);
+    const patch = h("div", { class: "checkpoint-section-body" });
+    const panel = details(`${key}:diff`, "Diff", patch, false, "checkpoint-section");
+    const load = () => {
+      if (panel.open && !patch.hasChildNodes()) patch.append(renderDiff(item.diff.patch));
+    };
+    load();
+    panel.addEventListener("toggle", load);
+    body.append(panel);
   }
 
   const feedback = h("textarea", { rows: "3", placeholder: `Feedback for ${item.role}: what should change?`, "aria-label": `Feedback for ${item.role}` });
+  const attachments = h("input", { type: "file", multiple: true });
   const sendFeedback = h("button", { type: "button", class: "btn btn-sm", disabled: true }, "Send feedback");
   feedback.addEventListener("input", () => (sendFeedback.disabled = !feedback.value.trim()));
-  sendFeedback.addEventListener("click", () => send({ kind: "checkpoint", action: "feedback", message: feedback.value }));
+  sendFeedback.addEventListener("click", () => send({ kind: "checkpoint", action: "feedback", message: feedback.value }, attachments));
 
   const actions = h("div", { class: "actions" });
   if (c.canContinue) {
@@ -992,7 +1544,8 @@ function checkpointBody(item, send) {
   }
   actions.append(h("span", { class: "spacer" }), armedButton("Stop run", "Confirm stop", () => send({ kind: "checkpoint", action: "stop" })));
 
-  body.append(h("div", { class: "feedback" }, feedback, h("div", { class: "actions" }, sendFeedback)), actions);
+  body.append(section("feedback", "Write feedback", h("div", { class: "feedback" }, feedback,
+    attachmentField(attachments, `${item.id}-checkpoint-files`), h("div", { class: "actions" }, sendFeedback))), actions);
   return body;
 }
 
@@ -1065,7 +1618,8 @@ function questionBody(item, send) {
       question: q.question,
     };
   });
-  body.append(...groups.map((g) => g.group));
+  const attachments = h("input", { type: "file", multiple: true });
+  body.append(...groups.map((g) => g.group), attachmentField(attachments, `${item.id}-answer-files`));
   const submit = h("button", { type: "button", class: "btn btn-primary btn-sm" }, item.questions.length > 1 ? "Send answers" : "Send answer");
   submit.addEventListener("click", () => {
     const answers = {};
@@ -1076,7 +1630,7 @@ function questionBody(item, send) {
       err.hidden = false;
       return;
     }
-    send({ kind: "question", answers });
+    send({ kind: "question", answers }, attachments);
   });
   body.append(h("div", { class: "actions" }, submit));
   return body;
@@ -1084,6 +1638,8 @@ function questionBody(item, send) {
 
 function permissionBody(item, send) {
   const note = h("input", { type: "text", placeholder: "Note for the agent (optional)", "aria-label": "Note for the agent" });
+  const attachments = h("input", { type: "file", multiple: true });
+  const decide = (decision) => send({ kind: "permission", decision, message: note.value }, attachments);
   return h(
     "div",
     { class: "card-body" },
@@ -1091,13 +1647,14 @@ function permissionBody(item, send) {
     item.reason ? h("div", { class: "field-help", text: item.reason }) : null,
     h("pre", { class: "code", text: JSON.stringify(item.input, null, 2) }),
     note,
+    attachmentField(attachments, `${item.id}-permission-files`),
     h(
       "div",
       { class: "actions" },
-      h("button", { type: "button", class: "btn btn-primary btn-sm", onclick: () => send({ kind: "permission", decision: "allow", message: note.value }) }, "Allow once"),
-      h("button", { type: "button", class: "btn btn-sm", onclick: () => send({ kind: "permission", decision: "allow-run", message: note.value }) }, `Allow ${item.tool} for this run`),
+      h("button", { type: "button", class: "btn btn-primary btn-sm", onclick: () => decide("allow") }, "Allow once"),
+      h("button", { type: "button", class: "btn btn-sm", onclick: () => decide("allow-run") }, `Allow ${item.tool} for this run`),
       h("span", { class: "spacer" }),
-      h("button", { type: "button", class: "btn btn-sm btn-danger", onclick: () => send({ kind: "permission", decision: "deny", message: note.value }) }, "Deny"),
+      h("button", { type: "button", class: "btn btn-sm btn-danger", onclick: () => decide("deny") }, "Deny"),
     ),
   );
 }
@@ -1129,11 +1686,12 @@ function closeInboxDrawer() {
 const MODEL_NAMES = { "claude-opus-5-5": "Opus 5.5", "claude-sonnet-5-5": "Sonnet 5.5", "claude-haiku-5-5": "Haiku 5.5", "claude-fable-5-2": "Fable 5.2" };
 const modelLabel = (id) => MODEL_NAMES[id] ?? id ?? "Codex CLI default";
 
-/** The crew, in pipeline order. "implementer" rows follow the backend/frontend choice. */
+/** The crew, in pipeline order. */
 const CREW = [
   { stage: "triage", role: "bug-triager", title: "bug-triager", what: "Proves the bug with a failing test before anyone fixes it", on: true, only: "bug" },
   { stage: "plan", role: "planner", title: "planner", what: "Studies the repo, asks you questions, writes the plan", on: true, pause: true, not: "deps" },
   { stage: "implement", role: "implementer", title: "implementer", what: "Builds the change and its unit tests", required: true, pause: true },
+  { stage: "design", role: "ui-ux", title: "UI/UX specialist", what: "Refines the interface, interaction, accessibility, and motion after implementation", on: false, pause: true, not: "deps" },
   { stage: "review", role: "reviewer", title: "reviewer", what: "Fresh-eyes review; blocking findings go back for a revision", on: true },
   { stage: "security", role: "security-auditor", title: "security-auditor", what: "Audits it like an attacker; critical/high findings go back to be fixed", on: false },
   { stage: "e2e", role: "e2e-tester", title: "e2e-tester", what: "Tests it end to end, from the outside", on: true },
@@ -1206,19 +1764,10 @@ function fillRunOptions() {
 
   const pause = new Set(prefs.pause ?? CREW.filter((c) => c.pause).map((c) => c.stage));
   const runs = Object.fromEntries(CREW.filter((c) => !c.required).map((c) => [c.stage, prefs.run?.[c.stage] ?? c.on]));
-  const implementer = (state.implementers ?? ["backend", "frontend"]).includes(prefs.implementer) ? prefs.implementer : "backend";
   $("nr-crew").replaceChildren(
     ...CREW.map((c) => {
-      const roleName = c.role === "implementer" ? implementer : c.role;
-      const role = state.roles?.find((r) => r.name === roleName);
-      const title =
-        c.stage === "implement"
-          ? h(
-              "select",
-              { class: "crew-implementer", id: "nr-implementer", "aria-label": "Who implements" },
-              (state.implementers ?? ["backend", "frontend"]).map((i) => h("option", { value: i, selected: i === implementer, text: i })),
-            )
-          : h("strong", { class: c.role === "implementer" ? "crew-implementer-name" : null, text: c.role === "implementer" ? `${implementer} · ${c.title}` : c.title });
+      const role = state.roles?.find((r) => r.name === c.role);
+      const title = h("strong", { class: c.role === "implementer" ? "crew-implementer-name" : null, text: c.title });
       return h(
         "tr",
         { "data-stage": c.stage },
@@ -1228,7 +1777,7 @@ function fillRunOptions() {
           h(
             "div",
             { class: "crew-agent", title: role?.description ?? "" },
-            h("span", { class: "crew-avatar", "data-role": c.role }, avatar(roleName, true)),
+            h("span", { class: "crew-avatar", "data-role": c.role }, c.role === "implementer" ? null : avatar(c.role, true)),
             h("div", {}, title, h("span", { class: "crew-what", text: c.what })),
           ),
         ),
@@ -1263,14 +1812,12 @@ function crewState() {
   for (const c of CREW) if (!c.required) on[c.stage] = available[c.stage] !== false && checked(c.stage);
   available.repair = on.e2e;
   on.repair = on.e2e && checked("repair");
-  // Dependency updates always have the dependency-updater as their implementer.
-  const implementer = kind === "deps" ? "dependency-updater" : ($("nr-implementer")?.value ?? "backend");
-  return { hasE2E, kind, box, on, available, implementer };
+  return { hasE2E, kind, box, on, available };
 }
 
 function updateCrew() {
   if (!$("nr-crew").children.length) return;
-  const { hasE2E, kind, box, on, available, implementer } = crewState();
+  const { hasE2E, kind, box, on, available } = crewState();
   // A box that can't apply shows a dash, not a greyed tick that reads as "on".
   for (const c of CREW) {
     if (!c.required) setCell(box(c.stage), available[c.stage] === false);
@@ -1285,20 +1832,15 @@ function updateCrew() {
   what("triage").textContent = kind === "bug" ? spec("triage").what : "Only for bug fixes";
   what("plan").textContent = kind === "deps" ? "Not used for dependency updates" : spec("plan").what;
   what("implement").textContent = kind === "deps" ? "Upgrades the dependencies and keeps the tests green" : spec("implement").what;
-  // For dependency runs the implementer is fixed, so the backend/frontend picker steps aside.
-  const picker = $("nr-implementer");
-  picker.hidden = kind === "deps";
-  let fixed = picker.parentElement.querySelector(".crew-fixed-implementer");
-  if (!fixed) {
-    fixed = h("strong", { class: "crew-fixed-implementer", text: "dependency-updater" });
-    picker.after(fixed);
+  const implementer = kind === "deps" ? "dependency-updater" : "backend";
+  const implementerLabel = kind === "deps" ? roleLabel(implementer) : "BE-FE";
+  const description = state.roles?.find((r) => r.name === implementer)?.description ?? "";
+  for (const icon of $("nr-crew").querySelectorAll('.crew-avatar[data-role="implementer"]')) {
+    const row = icon.closest("tr");
+    row.querySelector(".crew-implementer-name").textContent = row.dataset.stage === "implement" ? implementerLabel : `${implementerLabel} · ${spec(row.dataset.stage).title}`;
+    icon.replaceChildren(avatar(implementer, true));
+    row.querySelector(".crew-agent").title = description;
   }
-  fixed.hidden = kind !== "deps";
-  // Rows done by the implementer follow the backend/frontend choice.
-  for (const el of $("nr-crew").querySelectorAll(".crew-implementer-name")) {
-    el.textContent = `${implementer} · ${spec(el.closest("tr").dataset.stage).title}`;
-  }
-  for (const el of $("nr-crew").querySelectorAll('.crew-avatar[data-role="implementer"]')) el.replaceChildren(avatar(implementer, true));
 }
 
 function setCell(input, notApplicable) {
@@ -1317,6 +1859,7 @@ function openNewRun(selected) {
   if (!state.targets.length && state.config?.canAddTargets) return openAddRepo();
   const dialog = $("new-run-dialog");
   fillTargets(typeof selected === "string" ? selected : undefined);
+  if (!dialog.open || typeof selected === "string") $("nr-browser").checked = Boolean(state.targets.find((t) => t.name === $("nr-target").value)?.browserAccess);
   $("nr-add-repo").hidden = !state.config?.canAddTargets;
   if (!dialog.open) fillRunOptions();
   applyKind($("new-run-form").querySelector('input[name="kind"]:checked')?.value ?? "feature");
@@ -1328,17 +1871,21 @@ function openNewRun(selected) {
 
 // ── Add repo dialog ──────────────────────────────────────
 
-const addRepo = { inspected: null, seq: 0, timer: 0, edited: new Set() };
+const addRepo = { inspected: null, seq: 0, timer: 0, edited: new Set(), busy: false };
+const cloneUrlEntered = () => /^(?:[a-z][\w+.-]*:\/\/|[\w.-]+@[\w.-]+:)/i.test($("ar-path").value.trim());
 
 async function openAddRepo() {
   const dialog = $("add-repo-dialog");
   $("add-repo-form").reset();
+  clearTimeout(addRepo.timer);
+  addRepo.seq++;
   addRepo.inspected = null;
   addRepo.edited.clear();
   $("ar-status").replaceChildren();
-  $("ar-details").hidden = true;
+  $("ar-details").hidden = $("ar-details").disabled = true;
   $("ar-error").hidden = true;
   $("ar-submit").disabled = true;
+  $("ar-submit").textContent = "Add repo";
   $("ar-hint").textContent = "";
   $("ar-suggestions").replaceChildren();
   $("ar-suggestions-field").hidden = true;
@@ -1364,6 +1911,8 @@ async function openAddRepo() {
 }
 
 function pickRepo(path) {
+  if (addRepo.busy) return;
+  clearTimeout(addRepo.timer);
   $("ar-path").value = path;
   addRepo.edited.clear(); // a new repo: let detection fill the fields again
   inspectPath();
@@ -1372,10 +1921,11 @@ function pickRepo(path) {
 async function inspectPath() {
   const path = $("ar-path").value.trim();
   const seq = ++addRepo.seq;
-  if (!path) {
-    $("ar-status").replaceChildren();
-    $("ar-details").hidden = true;
-    $("ar-submit").disabled = true;
+  addRepo.inspected = null;
+  $("ar-details").hidden = $("ar-details").disabled = true;
+  updateAddRepoSubmit();
+  if (!path || cloneUrlEntered()) {
+    $("ar-status").replaceChildren(path ? h("span", { class: "muted", text: "Clone the repository to inspect its test commands before adding it." }) : null);
     return;
   }
   $("ar-status").replaceChildren(h("span", { class: "muted", text: "Checking…" }));
@@ -1387,6 +1937,10 @@ async function inspectPath() {
     return;
   }
   if (seq !== addRepo.seq) return; // a newer path was typed meanwhile
+  showRepoInspection(info);
+}
+
+function showRepoInspection(info) {
   addRepo.inspected = info;
 
   for (const el of document.querySelectorAll(".repo-pick")) el.classList.toggle("chosen", el.dataset.path === info.path);
@@ -1396,7 +1950,7 @@ async function inspectPath() {
   for (const w of info.warnings) lines.push(h("span", { class: "warn", text: w }));
   $("ar-status").replaceChildren(...lines);
 
-  $("ar-details").hidden = !info.ok;
+  $("ar-details").hidden = $("ar-details").disabled = !info.ok;
   if (info.ok) {
     const fill = (id, value) => {
       if (!addRepo.edited.has(id)) $(id).value = value ?? "";
@@ -1442,6 +1996,14 @@ function commandChips(containerId, inputId, candidates) {
 }
 
 function updateAddRepoSubmit() {
+  const clone = cloneUrlEntered();
+  const submit = $("ar-submit");
+  submit.textContent = clone ? addRepo.busy ? "Cloning…" : "Clone repo" : addRepo.busy ? "Adding…" : "Add repo";
+  if (clone) {
+    $("ar-hint").textContent = state.config?.canCloneTargets ? "" : "Restart Shipyard to enable cloning from URLs";
+    submit.disabled = addRepo.busy || !state.config?.canCloneTargets;
+    return;
+  }
   const missing = !addRepo.inspected
     ? "Pick or type a repo first"
     : !addRepo.inspected.ok
@@ -1452,16 +2014,26 @@ function updateAddRepoSubmit() {
           ? "Enter a test command to continue"
           : "";
   $("ar-hint").textContent = missing;
-  $("ar-submit").disabled = !addRepo.inspected?.ok || Boolean(missing);
+  submit.disabled = addRepo.busy || !addRepo.inspected?.ok || Boolean(missing);
 }
 
 function wireAddRepo() {
   const dialog = $("add-repo-dialog");
+  const cancel = $("ar-cancel");
+  const path = $("ar-path");
   $("nr-add-repo").addEventListener("click", openAddRepo);
-  $("ar-cancel").addEventListener("click", () => dialog.close());
-  $("ar-path").addEventListener("input", () => {
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (addRepo.busy) event.preventDefault(); });
+  path.addEventListener("input", () => {
     clearTimeout(addRepo.timer);
-    addRepo.timer = setTimeout(inspectPath, 400);
+    addRepo.seq++;
+    addRepo.inspected = null;
+    addRepo.edited.clear();
+    $("ar-error").hidden = true;
+    $("ar-details").hidden = $("ar-details").disabled = true;
+    updateAddRepoSubmit();
+    if (!path.value.trim() || cloneUrlEntered()) void inspectPath();
+    else addRepo.timer = setTimeout(inspectPath, 400);
   });
   for (const id of ["ar-name", "ar-test", "ar-e2e"]) {
     $(id).addEventListener("input", () => {
@@ -1471,11 +2043,19 @@ function wireAddRepo() {
   }
   $("add-repo-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (!addRepo.inspected?.ok) return;
-    const submit = $("ar-submit");
-    submit.disabled = true;
+    const clone = cloneUrlEntered();
+    if (addRepo.busy || (clone ? !state.config?.canCloneTargets : !addRepo.inspected?.ok)) return;
+    addRepo.busy = cancel.disabled = path.disabled = true;
+    updateAddRepoSubmit();
     $("ar-error").hidden = true;
     try {
+      if (clone) {
+        const info = await api("/api/targets/clone", { method: "POST", body: { url: path.value.trim() } });
+        path.value = info.displayPath;
+        showRepoInspection(info);
+        if (info.ok) $("ar-name").focus();
+        return;
+      }
       const { target } = await api("/api/targets", {
         method: "POST",
         body: { path: addRepo.inspected.path, name: $("ar-name").value.trim(), test: $("ar-test").value.trim(), e2e: $("ar-e2e").value.trim() },
@@ -1487,6 +2067,8 @@ function wireAddRepo() {
     } catch (err) {
       $("ar-error").textContent = err.message;
       $("ar-error").hidden = false;
+    } finally {
+      addRepo.busy = cancel.disabled = path.disabled = false;
       updateAddRepoSubmit();
     }
   });
@@ -1520,11 +2102,16 @@ function wireNewRun() {
   });
   $("nr-cancel").addEventListener("click", () => dialog.close());
   $("nr-crew").addEventListener("change", updateCrew);
-  $("nr-target").addEventListener("change", updateCrew);
+  $("nr-target").addEventListener("change", () => {
+    $("nr-browser").checked = Boolean(state.targets.find((t) => t.name === $("nr-target").value)?.browserAccess);
+    updateCrew();
+  });
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submit = $("nr-submit");
+    if (submit.disabled) return;
     const data = new FormData(form);
-    const { box, on, implementer, kind } = crewState();
+    const { box, on } = crewState();
     const paused = [...$("nr-crew").querySelectorAll('input[name="checkpoints"]:checked')].map((i) => i.value);
     // Only pause after agents that will actually run. A revision after review pauses like implement.
     const checkpoints = paused.filter((s) => on[s]);
@@ -1534,10 +2121,11 @@ function wireNewRun() {
       kind: data.get("kind"),
       request: String(data.get("request") ?? "").trim(),
       provider: $("nr-provider").value,
+      browserAccess: $("nr-browser").checked,
+      browserReferenceHelp: true,
       model: $("nr-model").value || undefined,
       effort: $("nr-effort").value || undefined,
       budgetUsd: $("nr-budget").required ? Number($("nr-budget").value) : undefined,
-      implementer: kind === "deps" ? undefined : implementer,
       crew: CREW.filter((c) => !c.required && on[c.stage]).map((c) => c.stage),
       checkpoints,
     };
@@ -1545,17 +2133,17 @@ function wireNewRun() {
       provider: body.provider,
       model: body.model,
       effort: body.effort,
-      implementer: $("nr-implementer").value,
       run: Object.fromEntries(CREW.filter((c) => !c.required).map((c) => [c.stage, Boolean(box(c.stage)?.checked)])),
       pause: paused,
     });
-    const submit = $("nr-submit");
     submit.disabled = true;
     try {
+      body.attachments = await readAttachments($("nr-attachments"));
       const { id } = await api("/api/runs", { method: "POST", body });
       state.starting.set(id, body.request);
       dialog.close();
       $("nr-request").value = "";
+      $("nr-attachments").value = "";
       select(id);
     } catch (err) {
       $("nr-error").textContent = err.message;
@@ -1587,7 +2175,50 @@ function runActions(run) {
         button("Steer", () => openRunControl(run.id), "btn-ghost", stopping),
         state.config?.demo ? null : button(`Switch to ${providerLabel(nextProvider)}`, () => openRunControl(run.id, nextProvider), "btn-ghost", stopping),
       ]
-    : button(run.archivedAt ? "Restore run" : "Archive run", () => archiveRun(run.id, !run.archivedAt), "btn-ghost", state.active.has(run.id)));
+    : [
+        !run.cleanedUp && (run.status === "stopped" || run.status === "running")
+          ? button(state.resuming.has(run.id) ? "Resuming…" : "Resume run", () => resumeRun(run.id), "btn-primary", state.active.has(run.id) || state.resuming.has(run.id))
+          : null,
+        button(run.archivedAt ? "Restore run" : "Archive run", () => archiveRun(run.id, !run.archivedAt), "btn-ghost", state.active.has(run.id)),
+        button("Delete run", () => deleteRun(run.id), "btn-danger", state.active.has(run.id)),
+      ]);
+}
+
+async function resumeRun(id) {
+  if (state.resuming.has(id)) return;
+  state.resuming.add(id);
+  schedule("detail");
+  try {
+    await api(`/api/runs/${id}/resume`, { method: "POST" });
+    if (state.selected === id) state.showArchived = false;
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    state.resuming.delete(id);
+    schedule("runs", "detail");
+  }
+}
+
+function forgetRun(id) {
+  state.runs.delete(id);
+  state.events.delete(id);
+  state.buffers.delete(id);
+  state.lastActivity.delete(id);
+  state.results.delete(id);
+  state.starting.delete(id);
+  if (state.selected === id) select(visibleRuns()[0]?.id ?? null);
+  schedule("runs", "detail");
+}
+
+async function deleteRun(id) {
+  if (!window.confirm("Permanently delete this run’s history and activity? Its Git branch and worktree stay available.")) return;
+  try {
+    await api(`/api/runs/${id}`, { method: "DELETE", body: { confirm: true } });
+    forgetRun(id);
+    toast("Run history deleted");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function stopRun(id) {
@@ -1629,6 +2260,7 @@ function openRunControl(id, provider) {
   $("run-control-label").textContent = provider ? "Instructions for the new agent (optional)" : "Instructions";
   const input = $("run-control-message");
   input.value = "";
+  $("run-control-attachments").value = "";
   input.required = !provider;
   dialog.showModal();
   input.focus();
@@ -1647,11 +2279,13 @@ function wireRunControls() {
     const message = $("run-control-message").value.trim();
     if (!provider && !message) return toast("Enter an instruction for the agent", true);
     const button = $("run-control-submit");
+    if (button.disabled) return;
     button.disabled = true;
     try {
       await api(`/api/runs/${runId}/control`, {
         method: "POST",
-        body: { action: provider ? "switch-provider" : "steer", provider: provider || undefined, message },
+        body: { action: provider ? "switch-provider" : "steer", provider: provider || undefined, message,
+          attachments: await readAttachments($("run-control-attachments")) },
       });
       dialog.close();
       toast(provider ? `Switching to ${providerLabel(provider)}` : "Instruction sent");
@@ -1663,12 +2297,323 @@ function wireRunControls() {
   });
 }
 
-async function copy(text) {
+function openFeedback(run) {
+  $("feedback-form").dataset.runId = run.id;
+  $("feedback-message").value = "";
+  $("feedback-attachments").value = "";
+  $("feedback-provider").value = run.provider ?? "claude";
+  $("feedback-browser").checked = Boolean(run.browserAccess ?? state.targets.find((target) => target.name === run.target)?.browserAccess);
+  $("feedback-error").hidden = true;
+  $("feedback-dialog").showModal();
+  $("feedback-message").focus();
+}
+
+const referenceKey = (runId, url) => `${runId}\n${url}`;
+
+function referenceAction(run, url) {
+  if (state.referenceDrafts.has(referenceKey(run?.id, url))) return "Review reference";
+  return `Continue in ${providerLabel(run?.provider)}`;
+}
+
+let shownHandoff;
+let handoffRequest = 0;
+
+function openReferenceHandoff(runId, url, itemId = "") {
+  const form = $("reference-handoff-form");
+  form.dataset.runId = runId;
+  form.dataset.url = url;
+  form.dataset.itemId = itemId;
+  const link = $("reference-handoff-link");
+  link.href = url;
+  link.textContent = url;
+  shownHandoff = undefined;
+  $("reference-handoff-text").value = "";
+  $("reference-handoff-attachments").value = "";
+  $("reference-handoff-status").textContent = "Preparing the handoff…";
+  $("reference-handoff-coverage").replaceChildren();
+  for (const id of ["continue", "copy", "retry", "revoke", "coverage", "load", "error"]) $("reference-handoff-" + id).hidden = true;
+  $("reference-handoff-dialog").showModal();
+  void refreshReferenceHandoff(true);
+}
+
+function referenceHandoffRequest() {
+  const { runId, url, itemId } = $("reference-handoff-form").dataset;
+  return { runId, url, itemId, path: `/api/runs/${runId}/references/handoff` };
+}
+
+function loadReturnedReference() {
+  const draft = shownHandoff?.draft;
+  if (draft?.status !== "ready") return;
+  $("reference-handoff-text").value = draft.text;
+  $("reference-handoff-text").scrollTop = 0;
+  $("reference-handoff-load").hidden = true;
+}
+
+async function refreshReferenceHandoff(focus = false) {
+  const request = ++handoffRequest;
+  const { url, itemId, path } = referenceHandoffRequest();
+  const dialog = $("reference-handoff-dialog");
+  const error = $("reference-handoff-error");
+  const status = $("reference-handoff-status");
+  try {
+    const info = await api(path, { method: "POST", body: { url, itemId } });
+    if (!dialog.open || request !== handoffRequest) return;
+    const old = shownHandoff;
+    shownHandoff = info;
+    error.hidden = true;
+    const link = $("reference-handoff-continue");
+    link.href = info.href;
+    link.textContent = `Continue in ${providerLabel(info.provider)}`;
+    link.hidden = $("reference-handoff-copy").hidden = Boolean(info.draft);
+    $("reference-handoff-retry").hidden = false;
+    $("reference-handoff-revoke").hidden = false;
+    const coverage = $("reference-handoff-coverage");
+    coverage.replaceChildren(
+      ...(info.draft?.coverage ?? []).map((line) => h("li", { text: `Read: ${line}` })),
+      ...(info.draft?.missing ?? []).map((line) => h("li", { class: "reference-warning", text: `Missing: ${line}` })),
+    );
+    coverage.hidden = !coverage.childElementCount;
+    if (info.draft?.status === "ready") {
+      const linkedin = url.startsWith("https://www.linkedin.com/");
+      status.textContent = info.draft.missing?.length || (linkedin && (!info.draft.coverage.length || !info.draft.missing))
+        ? "The browser returned notes with incomplete or unverified coverage."
+        : "Notes returned. Review them before sharing with the crew.";
+      const input = $("reference-handoff-text");
+      if (!input.value || input.value === old?.draft?.text) loadReturnedReference();
+      $("reference-handoff-load").hidden = input.value === info.draft.text;
+    } else {
+      $("reference-handoff-load").hidden = true;
+      status.textContent = info.draft?.status === "blocked" ? info.draft.reason : "Waiting for the provider to return notes.";
+    }
+    if (focus && !link.hidden) link.focus();
+  } catch (err) {
+    if (!dialog.open || request !== handoffRequest) return;
+    status.textContent = "";
+    error.textContent = err.message;
+    error.hidden = false;
+  }
+}
+
+function wireReferenceHandoff() {
+  const dialog = $("reference-handoff-dialog");
+  const form = $("reference-handoff-form");
+  const input = $("reference-handoff-text");
+  const close = $("reference-handoff-close");
+  const retry = $("reference-handoff-retry");
+  const revoke = $("reference-handoff-revoke");
+  const submit = $("reference-handoff-submit");
+  const status = $("reference-handoff-status");
+  const error = $("reference-handoff-error");
+
+  async function revokeHandoff(startNew) {
+    const { path, url, itemId } = referenceHandoffRequest();
+    revoke.disabled = retry.disabled = true;
+    try {
+      await api(path, { method: "DELETE", body: { url, itemId } });
+      if (startNew) {
+        status.textContent = "Preparing a fresh handoff…";
+        await refreshReferenceHandoff();
+      } else dialog.close();
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      revoke.disabled = retry.disabled = false;
+    }
+  }
+
+  close.addEventListener("click", () => dialog.close());
+  retry.addEventListener("click", () => revokeHandoff(true));
+  revoke.addEventListener("click", () => revokeHandoff(false));
+  $("reference-handoff-load").addEventListener("click", loadReturnedReference);
+  $("reference-handoff-copy").addEventListener("click", () => {
+    if (shownHandoff) void copy(shownHandoff.prompt, "Browser task");
+  });
+  dialog.addEventListener("cancel", (event) => { if (close.disabled) event.preventDefault(); });
+  dialog.addEventListener("close", () => {
+    if (dialog.open) return;
+    handoffRequest++;
+    shownHandoff = undefined;
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    submit.disabled = close.disabled = revoke.disabled = retry.disabled = true;
+    error.hidden = true;
+    try {
+      const { itemId, url } = referenceHandoffRequest();
+      const text = input.value.trim();
+      const attachments = await readAttachments($("reference-handoff-attachments"));
+      if (itemId) {
+        await api(`/api/inbox/${itemId}`, { method: "POST", body: { kind: "reference", action: "share", text, attachments } });
+        state.inbox.delete(itemId);
+      } else {
+        const { run } = await api(`/api/runs/${form.dataset.runId}/references/shared`, { method: "POST", body: { url, text, attachments } });
+        state.runs.set(run.id, run);
+      }
+      dialog.close();
+      schedule();
+      toast(itemId ? "Reference shared with the crew." : "Reference notes saved for the next revision.");
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      submit.disabled = close.disabled = revoke.disabled = retry.disabled = false;
+    }
+  });
+}
+
+function refreshRepoResults(repo) {
+  for (const run of state.runs.values()) if (run.repo === repo) state.results.delete(run.id);
+  if (state.runs.get(state.selected)?.repo === repo) schedule("detail");
+}
+
+function openGitRemote(run) {
+  $("git-remote-form").dataset.runId = run.id;
+  $("git-remote-context").textContent = `Add origin to the ${run.target} repository.`;
+  $("git-remote-url").value = "";
+  $("git-remote-error").hidden = true;
+  $("git-remote-dialog").showModal();
+  $("git-remote-url").focus();
+}
+
+function openPublish(run, publication) {
+  const form = $("publish-form");
+  form.dataset.runId = run.id;
+  form.dataset.destination = publication.destination;
+  form.dataset.head = publication.head;
+  $("publish-destination").textContent = `${publication.remote} · ${publication.label}`;
+  $("publish-branch").textContent = run.branch;
+  $("publish-commit").textContent = publication.head.slice(0, 12);
+  $("publish-status").textContent = "";
+  $("publish-error").hidden = true;
+  $("publish-dialog").showModal();
+  $("publish-submit").focus();
+}
+
+async function createPullRequest(runId, { destination, head }) {
+  if (state.pullRequestPending.has(runId)) return;
+  state.pullRequestPending.add(runId);
+  schedule("detail");
+  try {
+    const result = await api(`/api/runs/${runId}/pull-request`, { method: "POST", body: { destination, head } });
+    state.results.set(runId, result);
+    toast("Pull request ready");
+  } catch (error) {
+    toast(error.message, true);
+    state.results.delete(runId);
+  } finally {
+    state.pullRequestPending.delete(runId);
+    schedule("detail");
+  }
+}
+
+function wirePublish() {
+  const dialog = $("publish-dialog");
+  const form = $("publish-form");
+  const submit = $("publish-submit");
+  const cancel = $("publish-cancel");
+  const status = $("publish-status");
+  const error = $("publish-error");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (submit.disabled) event.preventDefault(); });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    const { runId, destination, head } = form.dataset;
+    submit.disabled = cancel.disabled = true;
+    status.textContent = "Pushing the run branch…";
+    error.hidden = true;
+    try {
+      const result = await api(`/api/runs/${runId}/publish`, { method: "POST", body: { destination, head } });
+      state.results.set(runId, result);
+      dialog.close();
+      toast("Branch pushed");
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+      state.results.delete(runId);
+    } finally {
+      status.textContent = "";
+      submit.disabled = cancel.disabled = false;
+      schedule("detail");
+    }
+  });
+}
+
+function wireGitRemote() {
+  const dialog = $("git-remote-dialog");
+  const form = $("git-remote-form");
+  const button = $("git-remote-submit");
+  const cancel = $("git-remote-cancel");
+  const error = $("git-remote-error");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (button.disabled) event.preventDefault(); });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (button.disabled) return;
+    const id = form.dataset.runId;
+    const url = $("git-remote-url").value.trim();
+    button.disabled = true;
+    button.textContent = "Saving origin…";
+    cancel.disabled = true;
+    error.hidden = true;
+    try {
+      await api(`/api/runs/${id}/remote`, { method: "POST", body: { url } });
+      refreshRepoResults(state.runs.get(id)?.repo);
+      dialog.close();
+      toast("Git remote saved as origin");
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      button.disabled = false;
+      button.textContent = "Save origin";
+      cancel.disabled = false;
+    }
+  });
+}
+
+function wireFeedback() {
+  const dialog = $("feedback-dialog");
+  const button = $("feedback-submit");
+  const cancel = $("feedback-cancel");
+  const error = $("feedback-error");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (button.disabled) event.preventDefault(); });
+  $("feedback-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (button.disabled) return;
+    const { runId } = event.currentTarget.dataset;
+    const message = $("feedback-message").value.trim();
+    const body = {
+      message, provider: $("feedback-provider").value, browserAccess: $("feedback-browser").checked,
+    };
+    button.disabled = true;
+    cancel.disabled = true;
+    error.hidden = true;
+    try {
+      body.attachments = await readAttachments($("feedback-attachments"));
+      const { id } = await api(`/api/runs/${runId}/feedback`, { method: "POST", body });
+      if (!state.runs.has(id)) state.starting.set(id, "Revision");
+      dialog.close();
+      select(id);
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      button.disabled = false;
+      cancel.disabled = false;
+    }
+  });
+}
+
+async function copy(text, label = "Branch name") {
   try {
     await navigator.clipboard.writeText(text);
-    toast("Branch name copied");
+    toast(`${label} copied`);
   } catch {
-    toast("Couldn't copy: select the branch name instead", true);
+    toast(`Couldn't copy the ${label.toLowerCase()}`, true);
   }
 }
 
@@ -1701,6 +2646,15 @@ async function main() {
   $("new-run").addEventListener("click", openNewRun);
   $("inbox-toggle").addEventListener("click", () => ($("inbox").classList.contains("open") ? closeInboxDrawer() : openInboxDrawer()));
   $("inbox-close").addEventListener("click", closeInboxDrawer);
+  $("notifications-enable").addEventListener("click", async () => {
+    try {
+      if (await Notification.requestPermission() === "granted") toast("Desktop alerts enabled");
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      schedule("meta");
+    }
+  });
   window.addEventListener("hashchange", () => {
     const id = location.hash.match(/^#run\/([\w-]+)$/)?.[1];
     if (id && id !== state.selected && state.runs.has(id)) select(id);
@@ -1708,6 +2662,10 @@ async function main() {
   wireNewRun();
   wireAddRepo();
   wireRunControls();
+  wireFeedback();
+  wireGitRemote();
+  wirePublish();
+  wireReferenceHandoff();
   try {
     await loadState();
   } catch (err) {

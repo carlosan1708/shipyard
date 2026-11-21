@@ -2,6 +2,7 @@ import type { ExecResult } from "./exec.ts";
 import { tail } from "./exec.ts";
 import type { RunKind } from "./store.ts";
 import type { Target } from "./config.ts";
+import type { Role } from "./roles.ts";
 
 const kindLabel = (kind: RunKind) => (kind === "bug" ? "Bug report" : kind === "deps" ? "Dependency update request" : "Feature request");
 const kindNoun = (kind: RunKind) => (kind === "bug" ? "bug fix" : kind === "deps" ? "dependency update" : "feature");
@@ -44,6 +45,51 @@ export function implementPrompt(kind: RunKind, request: string, target: Target, 
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+export function designPrompt(request: string, target: Target, implementation: string): string {
+  return [
+    `Current request:\n<request>\n${request}\n</request>`,
+    `Implementer’s summary:\n<implementation>\n${implementation}\n</implementation>`,
+    `Work from the existing version in this worktree. Shipyard runs \`${target.test}\` after your changes.`,
+  ].join("\n\n");
+}
+
+export function feedbackPrompt(request: string, target: Target, brief: string): string {
+  return [
+    `Original project brief for context:\n<brief>\n${brief}\n</brief>`,
+    `User feedback on the completed result:\n<feedback>\n${request}\n</feedback>`,
+    "Inspect the existing result in this worktree, implement the requested revisions, and verify the affected behavior.",
+    `Shipyard runs \`${target.test}\`${target.e2e ? ` and \`${target.e2e}\`` : ""} after your changes.`,
+  ].join("\n\n");
+}
+
+export function orchestrationPrompt(request: string, target: Target, brief: string, specialists: readonly Role[]): string {
+  return [
+    `Original project brief for context:\n<brief>\n${brief}\n</brief>`,
+    `User feedback on the completed result:\n<feedback>\n${request}\n</feedback>`,
+    `Project checks: \`${target.test}\`${target.e2e ? ` and \`${target.e2e}\`` : ""}.`,
+    `Available specialists:\n${specialists.map((role) => `- ${role.name}: ${role.description}`).join("\n")}`,
+  ].join("\n\n");
+}
+
+export function orchestrationSchema(roles: readonly string[]): Record<string, unknown> {
+  return {
+    type: "object", additionalProperties: false, required: ["assignments"],
+    properties: {
+      assignments: {
+        type: "array",
+        items: {
+          type: "object", additionalProperties: false, required: ["role", "task"],
+          properties: { role: { type: "string", enum: roles }, task: { type: "string" } },
+        },
+      },
+    },
+  };
+}
+
+export function specialistPrompt(request: string, target: Target, brief: string, task: string): string {
+  return `${feedbackPrompt(request, target, brief)}\n\nYour assignment in this revision:\n<assignment>\n${task}\n</assignment>\nWork on your assignment and leave the other tasks to their assigned specialists.`;
 }
 
 /** The reviewer's answer, enforced by the SDK as structured output. */

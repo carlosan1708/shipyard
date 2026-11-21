@@ -28,6 +28,21 @@ export class DemoRunner implements AgentRunner {
     let summary: string;
     let structured: unknown;
     switch (req.role.name) {
+      case "local-app":
+        await tool("Read", join(req.cwd, "package.json"));
+        structured = existsSync(join(req.cwd, "index.html"))
+          ? { framework: "static", directory: ".", entry: "", detail: "" }
+          : { framework: "unsupported", directory: ".", entry: "", detail: "The demo shop is a JSON API. Start it from the run worktree with npm start." };
+        summary = "Identified the demo’s local launch options.";
+        break;
+      case "orchestrator":
+        await tool("Read", join(req.cwd, "README.md"));
+        structured = { assignments: [
+          { role: "ui-ux", task: "Improve the landing page and verify its layout." },
+          { role: "docs-writer", task: "Document how to check the demo locally." },
+        ] };
+        summary = "Assigned the landing page and documentation to two specialists.";
+        break;
       case "planner":
         summary = await this.planner(req, tool);
         break;
@@ -51,6 +66,14 @@ export class DemoRunner implements AgentRunner {
         break;
       case "dependency-updater":
         summary = await this.updater(tool);
+        break;
+      case "ui-ux":
+        await tool("Edit", join(req.cwd, "index.html"), () => {
+          const previous = existsSync(join(req.cwd, "index.html")) ? readFileSync(join(req.cwd, "index.html"), "utf8") : "";
+          const intro = previous.includes("Browse the sample shop") ? "Explore products and test the cart through the local API." : "Browse the sample shop through its local API.";
+          writeFile(req.cwd, "index.html", `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Demo shop</title><main><h1>Demo shop</h1><p>${intro}</p></main></html>\n`);
+        });
+        summary = "Updated the landing page for the demo shop.";
         break;
       default: // backend or frontend
         summary = req.resumeSessionId ? await this.followUp(req, tool) : await this.implementer(req, tool, say);

@@ -1,7 +1,9 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TokenUsage } from "./agent.ts";
+import type { FeedbackAttachment } from "./attachments.ts";
 import type { Provider, RunEffort } from "./config.ts";
+import type { ReferenceCheck } from "./references.ts";
 
 /** feature: ship something new · bug: fix a reported problem · deps: update dependencies. */
 export type RunKind = "feature" | "bug" | "deps";
@@ -13,6 +15,7 @@ export type ReviewAction = "continue" | "feedback" | "stop";
 export interface ReviewRecord {
   action: ReviewAction;
   message?: string;
+  attachments?: FeedbackAttachment[];
   at: string;
   /** How long the run waited for the human at this checkpoint. */
   waitMs: number;
@@ -26,6 +29,7 @@ export interface GateRecord {
   durationMs: number;
   timedOut: boolean;
   outputTail: string;
+  checkedAt?: string;
 }
 
 /** Did this gate go the way it should? Normally that means it passed; for a triage, that it failed. */
@@ -34,7 +38,7 @@ export const gateOk = (g: GateRecord): boolean => (g.expectFailure ? g.code !== 
 export interface AttemptRecord {
   attempt: number;
   provider?: Provider;
-  interrupted?: "stopped" | "redirected";
+  interrupted?: "stopped" | "redirected" | "interrupted";
   interruptionWaitMs?: number;
   sessionId?: string;
   agentOk: boolean;
@@ -56,6 +60,8 @@ export interface AttemptRecord {
   askWaitMs?: number;
   /** Structured result of the attempt, e.g. the reviewer's verdict and findings. */
   output?: unknown;
+  /** Reports from browser inspections the specialist requested during this attempt. */
+  browserInspections?: string[];
 }
 
 export interface StageRecord {
@@ -64,6 +70,15 @@ export interface StageRecord {
   status: "running" | "passed" | "failed" | "stopped";
   attempts: AttemptRecord[];
   commit?: string;
+  finalized?: boolean;
+}
+
+export interface RunFollowUp {
+  runId: string;
+  brief: string;
+  baseSha: string;
+  orchestrated?: true;
+  attachments?: FeedbackAttachment[];
 }
 
 export interface RunRecord {
@@ -75,17 +90,23 @@ export interface RunRecord {
   status: RunStatus;
   createdAt: string;
   finishedAt?: string;
+  completionRead?: boolean;
+  publication?: { head: string; destination: string; pushedAt: string; pullRequestUrl?: string };
   archivedAt?: string;
+  ownerPid?: number;
+  checkpointStages?: string[];
   repo: string;
   branch: string;
   worktree: string;
   baseSha: string;
+  followUp?: RunFollowUp;
+  attachments?: FeedbackAttachment[];
   provider?: Provider;
   model?: string;
   effort?: RunEffort;
   /** The optional stages switched on for this run (implement always runs). */
   crew?: string[];
-  /** Who implemented: backend or frontend. */
+  /** The role that implemented the request. */
   implementer?: string;
   /** Estimated cost limit for the whole run. Stages stop starting once it is spent. */
   budgetUsd?: number;
@@ -95,6 +116,13 @@ export interface RunRecord {
   error?: string;
   /** The run errored before producing anything, so its worktree and branch were removed. */
   cleanedUp?: boolean;
+  /** Most recent browser verification requested from the completed result. */
+  browserCheck?: GateRecord;
+  verification?: { head: string; checks: GateRecord[] };
+  browserAccess?: boolean;
+  referenceUrls?: string[];
+  browserReferenceHelp?: boolean;
+  references?: ReferenceCheck[];
 }
 
 /** File-backed run history: `<runsDir>/<runId>/run.json` plus an append-only `events.jsonl`. */
@@ -136,9 +164,22 @@ export class RunStore {
   get(runId: string): RunRecord | null {
     const file = join(this.dir(runId), "run.json");
     if (!existsSync(file)) return null;
-    const run = JSON.parse(readFileSync(file, "utf8")) as RunRecord;
+    const { designFollowUp, ...run } = JSON.parse(readFileSync(file, "utf8")) as RunRecord & { designFollowUp?: RunFollowUp };
     run.provider ??= "claude";
+    run.followUp ??= designFollowUp;
+    for (const reference of run.references ?? []) {
+      if (reference.shared && reference.status === "read" && reference.url?.startsWith("https://www.linkedin.com/") &&
+          (!reference.coverage?.length || !reference.missing)) {
+        reference.status = "partial";
+        reference.detail = "Reviewed notes are available, but LinkedIn coverage was not recorded.";
+      }
+    }
     return run;
+  }
+
+  delete(runId: string): void {
+    if (!/^[\w-]+$/.test(runId)) throw new Error("Invalid run ID");
+    rmSync(this.dir(runId), { recursive: true, force: true });
   }
 
   list(): RunRecord[] {

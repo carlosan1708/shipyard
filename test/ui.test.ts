@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { execFile } from "node:child_process";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { decidePermission, type AgentAnswer, type AgentAsk } from "../src/agent.ts";
 import { parseConfig } from "../src/config.ts";
 import { loadRoles } from "../src/roles.ts";
@@ -43,6 +47,9 @@ function nextItem(manager: RunManager, pred: (i: InboxItem) => boolean = () => t
 }
 
 const fix: Step = (req) => writeFiles(req.cwd, { "src/add.js": "export const add = (a, b) => Number(a) + Number(b);\n", "test/add.test.js": UNIT_TEST });
+const imageAttachment = (name: string) => ({
+  name, data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jkX8AAAAASUVORK5CYII=",
+});
 const e2e: Step = (req) =>
   writeFiles(req.cwd, { "e2e/add.e2e.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("e2e", () => assert.equal(add(2, 2), 4));\n' });
 
@@ -96,7 +103,11 @@ test("an agent's question reaches the inbox and the answer goes back to that age
       });
       fix(req);
     },
-    e2e,
+    (req) => {
+      assert.doesNotMatch(req.prompt, /answer-example\.png/);
+      assert.equal(req.images, undefined);
+      e2e(req);
+    },
   ]);
   const id = manager.start({ target: "t0", kind: "feature", request: "health check", checkpoints: [] });
 
@@ -104,20 +115,24 @@ test("an agent's question reaches the inbox and the answer goes back to that age
   assert.equal(item.kind, "question");
   assert.throws(() => manager.answer(item.id, { kind: "question", answers: {} }), /Answer every question/);
   await new Promise((r) => setTimeout(r, 25)); // a human takes a moment; an instant answer can round to 0 ms
-  manager.answer(item.id, { kind: "question", answers: { "Which status code?": "200" } });
+  manager.answer(item.id, { kind: "question", answers: { "Which status code?": "200" }, attachments: [imageAttachment("answer-example.png")] });
 
   const run = await manager.whenDone(id);
   assert.equal(run?.status, "passed");
-  assert.deepEqual(received, { kind: "question", answers: { "Which status code?": "200" } });
+  assert.ok(received?.kind === "question");
+  assert.deepEqual(received.answers, { "Which status code?": "200" });
+  assert.match(received.attachmentContext ?? "", /answer-example\.png/);
   assert.ok((run!.stages[0]!.attempts[0]!.askWaitMs ?? 0) > 0, "time blocked on the question counts as waiting for you");
   assert.equal(run!.totals.reviewWaitMs, run!.stages[0]!.attempts[0]!.askWaitMs);
 });
 
 test("'allow for this run' stops asking for that tool, but only in that run", async () => {
   const decisions: boolean[] = [];
+  const evidence: Array<string | undefined> = [];
   const askWeb = async (req: Parameters<Step>[0]) => {
     const a = await req.ask!({ kind: "permission", tool: "WebFetch", input: { url: "https://example.com" } });
     decisions.push(a.kind === "permission" && a.allow);
+    evidence.push(a.attachmentContext);
   };
   const { manager } = await makeManager([
     async (req) => {
@@ -130,9 +145,11 @@ test("'allow for this run' stops asking for that tool, but only in that run", as
   const id = manager.start({ target: "t0", kind: "feature", request: "x", checkpoints: [] });
   const item = await nextItem(manager);
   assert.equal(item.kind, "permission");
-  manager.answer(item.id, { kind: "permission", decision: "allow-run" });
+  manager.answer(item.id, { kind: "permission", decision: "allow-run", attachments: [imageAttachment("permission-context.png")] });
   assert.equal((await manager.whenDone(id))?.status, "passed");
   assert.deepEqual(decisions, [true, true]);
+  assert.match(evidence[0] ?? "", /permission-context\.png/);
+  assert.equal(evidence[1], undefined);
   const events = manager.store.events(id);
   assert.equal(events.filter((e) => e.type === "waiting").length, 1);
   assert.equal(events.filter((e) => e.type === "auto-allowed").length, 1);
@@ -213,8 +230,10 @@ test("ui-link lists the running UIs (real first), ignores crashed ones, and a de
 
 function request(port: number, path: string, opts: { method?: string; headers?: Record<string, string>; body?: unknown } = {}) {
   return new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
+    const payload = opts.body === undefined ? undefined : JSON.stringify(opts.body);
+    const headers = { host: `127.0.0.1:${port}`, ...opts.headers, ...(payload !== undefined && { "content-length": String(Buffer.byteLength(payload)) }) };
     const req = http.request(
-      { host: "127.0.0.1", port, path, method: opts.method ?? "GET", headers: { host: `127.0.0.1:${port}`, ...opts.headers } },
+      { host: "127.0.0.1", port, path, method: opts.method ?? "GET", headers },
       (res) => {
         let body = "";
         res.on("data", (d) => (body += d));
@@ -222,8 +241,7 @@ function request(port: number, path: string, opts: { method?: string; headers?: 
       },
     );
     req.on("error", reject);
-    if (opts.body !== undefined) req.end(JSON.stringify(opts.body));
-    else req.end();
+    req.end(payload);
   });
 }
 
@@ -255,13 +273,14 @@ test("the server needs its token, checks Host and Origin, and serves the API", a
     assert.match(String(page.headers["content-security-policy"]), /script-src 'self'/);
 
     const state = JSON.parse((await request(server.port, "/api/state", { headers: auth })).body);
+    assert.equal(state.acceptsAttachments, true);
     assert.deepEqual(state.targets.map((t: { name: string }) => t.name), ["t0"]);
-    assert.deepEqual(state.stages, ["triage", "plan", "implement", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"]);
-    assert.deepEqual(state.optionalStages, ["triage", "plan", "review", "security", "e2e", "repair", "docs", "release"]);
-    assert.deepEqual(state.implementers, ["backend", "frontend"]);
+    assert.deepEqual(state.stages, ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"]);
+    assert.deepEqual(state.optionalStages, ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release"]);
+    assert.deepEqual(state.implementers, ["backend", "frontend", "ui-ux"]);
     assert.deepEqual(state.config.models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
     assert.deepEqual(state.efforts, ["low", "medium", "high", "xhigh", "max"]);
-    assert.equal(state.roles.length, 10);
+    assert.equal(state.roles.length, 13);
 
     const cross = await request(server.port, "/api/runs", { method: "POST", headers: { ...auth, origin: "http://evil.example" }, body: {} });
     assert.equal(cross.status, 403);
@@ -342,12 +361,17 @@ test("the UI routes concurrent Claude and Codex runs, and checkpoint feedback re
       assert.equal(req.ask, undefined);
       assert.equal(req.model, "codex-test");
       assert.equal(req.effort, "xhigh");
+      assert.match(req.prompt, /initial\.png/);
+      assert.ok(req.images?.[0]?.path.endsWith("initial.png"));
       fix(req);
       return { sessionId: "codex-thread", costUsd: null, usage };
     },
     (req) => {
       assert.equal(req.resumeSessionId, "codex-thread");
       assert.match(req.prompt, /Add one more case/);
+      assert.match(req.prompt, /checkpoint\.png/);
+      assert.equal(req.images?.length, 1);
+      assert.ok(req.images?.[0]?.path.endsWith("checkpoint.png"));
       writeFiles(req.cwd, { "test/extra.test.js": UNIT_TEST });
       return { sessionId: "codex-thread", costUsd: null, usage };
     },
@@ -362,7 +386,9 @@ test("the UI routes concurrent Claude and Codex runs, and checkpoint feedback re
     assert.match((await post({ ...base, model: config.model })).body, /Unknown model.*for codex/);
     assert.match((await post({ ...base, budgetUsd: 3 })).body, /Dollar budgets are only supported for Claude/);
     assert.match((await post({ ...base, provider: "invalid" })).body, /Provider must be claude or codex/);
-    const [codexResponse, claudeResponse] = await Promise.all([post(base), post({ ...base, provider: "claude" })]);
+    const [codexResponse, claudeResponse] = await Promise.all([
+      post({ ...base, attachments: [imageAttachment("initial.png")] }), post({ ...base, provider: "claude" }),
+    ]);
     assert.equal(codexResponse.status, 201);
     assert.equal(claudeResponse.status, 201);
     const codexId = JSON.parse(codexResponse.body).id;
@@ -373,7 +399,10 @@ test("the UI routes concurrent Claude and Codex runs, and checkpoint feedback re
     ]);
     assert.ok(codexItem.kind === "checkpoint" && codexItem.checkpoint.provider === "codex");
     assert.ok(claudeItem.kind === "checkpoint" && claudeItem.checkpoint.provider === "claude");
-    manager.answer(codexItem.id, { kind: "checkpoint", action: "feedback", message: "Add one more case" });
+    assert.equal((await request(server.port, `/api/inbox/${codexItem.id}`, {
+      method: "POST", headers: { "x-shipyard-token": server.token },
+      body: { kind: "checkpoint", action: "feedback", message: "Add one more case", attachments: [imageAttachment("checkpoint.png")] },
+    })).status, 200);
     manager.answer(claudeItem.id, { kind: "checkpoint", action: "continue" });
     const codexRetry = await nextItem(manager, (item) => item.runId === codexId);
     manager.answer(codexRetry.id, { kind: "checkpoint", action: "continue" });
@@ -405,6 +434,7 @@ test("steer interrupts a Claude question, then switching at a checkpoint continu
     (req) => {
       assert.equal(req.resumeSessionId, "claude-implement");
       assert.match(req.prompt, /Keep the original tests/);
+      assert.ok(req.images?.[0]?.path.endsWith("steer.png"));
       return { sessionId: "claude-implement" };
     },
   ]);
@@ -415,6 +445,7 @@ test("steer interrupts a Claude question, then switching at a checkpoint continu
       assert.match(req.prompt, /Original request: Fix addition/);
       assert.match(req.prompt, /Keep the original tests/);
       assert.match(req.prompt, /Also cover strings/);
+      assert.deepEqual(req.images?.map(({ path }) => path.split("-").at(-1)), ["steer.png", "switch.png"]);
       assert.equal(req.cwd, claude.calls[0]!.cwd);
       assert.match(readFileSync(join(req.cwd, "src/add.js"), "utf8"), /Number\(a\)/);
       writeFiles(req.cwd, { "test/strings.test.js": UNIT_TEST.replace("add(2, 3)", 'add("2", "3")') });
@@ -431,11 +462,11 @@ test("steer interrupts a Claude question, then switching at a checkpoint continu
   try {
     const question = await nextItem(manager, (item) => item.kind === "question");
     assert.equal((await archive(true)).status, 400, "an active run must stop before it can be archived");
-    assert.equal((await controls({ action: "steer", message: "Keep the original tests" })).status, 202);
+    assert.equal((await controls({ action: "steer", message: "Keep the original tests", attachments: [imageAttachment("steer.png")] })).status, 202);
     const claudeCheckpoint = await nextItem(manager, (item) => item.kind === "checkpoint");
     assert.ok(claudeCheckpoint.kind === "checkpoint" && claudeCheckpoint.checkpoint.provider === "claude");
     assert.ok(!manager.inbox().some((item) => item.id === question.id));
-    assert.equal((await controls({ action: "switch-provider", provider: "codex", message: "Also cover strings" })).status, 202);
+    assert.equal((await controls({ action: "switch-provider", provider: "codex", message: "Also cover strings", attachments: [imageAttachment("switch.png")] })).status, 202);
     const codexCheckpoint = await nextItem(manager, (item) => item.kind === "checkpoint" && item.checkpoint.provider === "codex");
     assert.ok(!manager.inbox().some((item) => item.id === claudeCheckpoint.id));
     manager.answer(codexCheckpoint.id, { kind: "checkpoint", action: "continue" });
@@ -530,5 +561,769 @@ test("switching an active Codex run to Claude enables the Claude budget and star
     ]);
   } finally {
     await manager.shutdown();
+  }
+});
+
+for (const provider of ["claude", "codex"] as const) {
+  test(`resuming an interrupted ${provider} run preserves completed work and recovers the active attempt`, { timeout: 20_000 }, async () => {
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { git } = await import("../src/exec.ts");
+    const { config } = await makeManager([]);
+    const roles = loadRoles();
+    const first = new FakeRunner([fix]);
+    const initial = new RunManager({ config, roles, runner: first, codexRunner: first });
+    const id = initial.start({ provider, target: "t0", kind: "feature", request: "Fix addition", crew: [], checkpoints: [] });
+    const run = await initial.whenDone(id);
+    assert.equal(run?.status, "passed");
+    assert.ok(run);
+    const commit = run.stages[0]?.commit;
+    assert.ok(commit);
+
+    run.status = "running";
+    run.finishedAt = undefined;
+    run.crew = ["review"];
+    run.stages.push({ name: "review", role: "reviewer", status: "running", attempts: [] });
+    initial.store.save(run);
+    initial.store.event(id, { stage: "review", attempt: 1, type: "attempt_start", provider, prompt: "Interrupted review" });
+    if (provider === "codex") {
+      initial.store.event(id, { stage: "review", attempt: 1, type: "session", sessionId: "review-codex" });
+    } else {
+      // Legacy records did not persist either the checkpoint selection or early session IDs.
+      delete run.checkpointStages;
+      initial.store.save(run);
+    }
+
+    const review = new FakeRunner([(req) => {
+      assert.equal(req.role.name, "reviewer");
+      assert.equal(req.cwd, run.worktree);
+      assert.equal(req.resumeSessionId, provider === "codex" ? "review-codex" : undefined);
+      assert.match(req.prompt, /Resume the interrupted stage/);
+      assert.match(req.prompt, /Fix addition/);
+      assert.match(readFileSync(join(req.cwd, "src/add.js"), "utf8"), /Number\(a\)/);
+      return { structured: { verdict: "approve", summary: "Reviewed", findings: [] } };
+    }]);
+    const manager = new RunManager({ config, roles, runner: review, codexRunner: review });
+    const auth = { "x-shipyard-token": "q".repeat(48) };
+    const server = await startUiServer({ manager, config, token: auth["x-shipyard-token"] });
+    const deleteRun = (body: object) => request(server.port, `/api/runs/${id}`, { method: "DELETE", headers: auth, body });
+    try {
+      const accepted = await request(server.port, `/api/runs/${id}/resume`, { method: "POST", headers: auth });
+      assert.equal(accepted.status, 202);
+      if (provider === "claude") {
+        const checkpoint = await nextItem(manager);
+        assert.equal(checkpoint.stage, "review");
+        assert.equal((await deleteRun({ confirm: true })).status, 400);
+        manager.answer(checkpoint.id, { kind: "checkpoint", action: "continue" });
+      }
+      const resumed = await manager.whenDone(id);
+      assert.equal(resumed?.status, "passed");
+      assert.equal(resumed?.id, id);
+      assert.equal(resumed?.stages[0]?.commit, commit);
+      assert.deepEqual(resumed?.stages[1]?.attempts.map((attempt) => [attempt.attempt, attempt.interrupted]), [
+        [1, "interrupted"], [2, undefined],
+      ]);
+      assert.equal(review.calls.length, 1);
+
+      assert.equal((await deleteRun({})).status, 400);
+      const crossSite = await request(server.port, `/api/runs/${id}`, {
+        method: "DELETE", headers: { ...auth, origin: "http://evil.example" }, body: { confirm: true },
+      });
+      assert.equal(crossSite.status, 403);
+      assert.equal((await deleteRun({ confirm: true })).status, 200);
+      assert.equal(manager.store.get(id), null);
+      assert.ok(existsSync(run.worktree));
+      assert.equal(await git(["rev-parse", run.branch], run.repo), commit);
+    } finally {
+      await Promise.all([manager.shutdown(), server.close()]);
+    }
+  });
+}
+
+test("completed runs persist an unread result and can acknowledge only the current finish", async () => {
+  const { manager, config } = await makeManager([fix]);
+  const id = manager.start({ target: "t0", kind: "feature", request: "Show run result", crew: [], checkpoints: [] });
+  const run = await manager.whenDone(id);
+  assert.equal(run?.status, "passed");
+  assert.equal(run?.completionRead, false);
+  assert.ok(run?.finishedAt);
+  const restarted = new RunManager({ config, roles: loadRoles(), runner: new FakeRunner([]) });
+  assert.equal(restarted.store.get(id)?.completionRead, false);
+  assert.throws(() => restarted.acknowledgeCompletion(id, "stale"), /result has changed/);
+  assert.equal(restarted.acknowledgeCompletion(id, run.finishedAt).completionRead, true);
+  assert.equal(manager.store.get(id)?.completionRead, true);
+});
+
+test("multiple references request approval and browser help independently before either provider starts", { timeout: 45_000 }, async (t) => {
+  const { config } = await makeManager([]);
+  config.targets.t0!.test = "true";
+  const source = "https://www.linkedin.com/in/example";
+  const other = "https://www.linkedin.com/in/another";
+  const skipped = "https://www.linkedin.com/in/skip";
+  const review = "Reviewed reference content from the profile";
+  const otherReview = "Notes for the second source";
+  const fetched: string[] = [];
+  const reads = t.mock.method(globalThis, "fetch", async (input: unknown) => {
+    fetched.push(String(input));
+    return new Response(null, { status: 302, headers: { location: "/authwall" } });
+  });
+  const work: Step = (req) => {
+    assert.ok(req.prompt.includes(review));
+    assert.ok(req.prompt.includes(otherReview));
+    return fix(req);
+  };
+  const claude = new FakeRunner([work]);
+  const codex = new FakeRunner([work]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config, token: "a".repeat(48) });
+  const headers = { "x-shipyard-token": server.token };
+  try {
+    for (const [provider, runner] of [["claude", claude], ["codex", codex]] as const) {
+      const readCount = fetched.length;
+      const id = manager.start({ target: "t0", kind: "feature", request: `Build with ${source}, ${other}, and ${skipped}`, provider,
+        referenceUrls: [source], browserReferenceHelp: true, crew: [], checkpoints: [] });
+      const itemFor = (url: string, needsApproval = false) => nextItem(manager, (item) =>
+        item.kind === "reference" && item.runId === id && item.url === url && Boolean(item.needsApproval) === needsApproval);
+      const [item, approval, skip] = await Promise.all([itemFor(source), itemFor(other, true), itemFor(skipped, true)]);
+      assert.deepEqual(fetched.slice(readCount), [source]);
+      assert.equal(manager.store.get(id)?.stages.length, 0);
+      assert.equal(runner.calls.length, 0);
+      const answer = (id: string, action: string, text?: string) => request(server.port, `/api/inbox/${id}`, {
+        method: "POST", headers, body: { kind: "reference", action, text },
+      });
+      assert.equal((await answer(approval.id, "share", otherReview)).status, 400);
+      assert.equal((await answer(skip.id, "skip")).status, 200);
+      assert.equal((await answer(approval.id, "approve")).status, 200);
+      const second = await itemFor(other);
+      assert.ok(manager.inbox().some((pending) => pending.id === item.id));
+      const handoffFor = (url: string, itemId: string) => manager.openReferenceHandoff(id, { url, itemId }, server.port);
+      const firstHandoff = handoffFor(source, item.id);
+      const ticket = firstHandoff.prompt.match(/\b[0-9a-f]{48}\b/)?.[0];
+      assert.ok(ticket);
+      const draft = { status: "ready", text: review, coverage: ["Profile"], missing: ["Earlier experience required sign-in"] };
+      manager.returnReferenceHandoff(ticket, draft);
+      assert.equal(handoffFor(other, second.id).draft, undefined);
+      assert.equal((await answer(second.id, "share", otherReview)).status, 200);
+      assert.deepEqual(handoffFor(source, item.id).draft, draft);
+      assert.equal(runner.calls.length, 0);
+      assert.equal((await answer(item.id, "share", review)).status, 200);
+      const run = await manager.whenDone(id);
+      assert.equal(run?.status, "passed");
+      assert.deepEqual(run?.referenceUrls, [source, other]);
+      assert.deepEqual(run?.references?.filter((ref) => ref.shared).map(({ url, content }) => [url, content]), [
+        [other, otherReview], [source, review],
+      ]);
+      const partial = run?.references?.find(({ url }) => url === source);
+      assert.equal(partial?.status, "partial");
+      assert.deepEqual(partial?.coverage, draft.coverage);
+      assert.deepEqual(partial?.missing, draft.missing);
+      const shared = manager.store.events(id).find((event) => event.kind === "reference" && event.type === "answered" && (event.answer as { action?: string })?.action === "share");
+      assert.deepEqual(shared?.answer, { kind: "reference", action: "share" });
+      assert.deepEqual(fetched.slice(readCount), [source, other]);
+    }
+    assert.equal(reads.mock.callCount(), 4);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("checking another reference after completion preserves previously reviewed notes", async (t) => {
+  const { manager, config } = await makeManager([fix]);
+  config.targets.t0!.test = "true";
+  const first = "https://www.linkedin.com/in/first";
+  const second = "https://www.linkedin.com/in/second";
+  const fetched = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 302, headers: { location: "/authwall" } }));
+  const id = manager.start({ target: "t0", kind: "feature", request: `Research ${first} and ${second}`,
+    referenceUrls: [first], crew: [], checkpoints: [] });
+  assert.equal((await manager.whenDone(id))?.status, "passed");
+  manager.saveSharedReference(id, first, "Reviewed notes for the first profile");
+  const updated = await manager.checkResultReferences(id, [second]);
+  assert.deepEqual(updated.referenceUrls, [first, second]);
+  assert.deepEqual(updated.references?.map(({ url, status, content }) => [url, status, content]), [
+    [first, "partial", "Reviewed notes for the first profile"], [second, "blocked", undefined],
+  ]);
+  const handoff = manager.openReferenceHandoff(id, { url: first }, 3000);
+  const ticket = handoff.prompt.match(/\b[0-9a-f]{48}\b/)?.[0];
+  assert.ok(ticket);
+  manager.returnReferenceHandoff(ticket, { status: "ready", text: "Full work history", coverage: ["Experience"], missing: [] });
+  const completed = manager.saveSharedReference(id, first, "Full work history");
+  assert.equal(completed.references?.find(({ url }) => url === first)?.status, "read");
+  assert.equal(fetched.mock.callCount(), 2);
+});
+
+test("native handoffs open the selected provider and return a draft for human review", { timeout: 25_000 }, async (t) => {
+  const { config } = await makeManager([]);
+  config.targets.t0!.test = "true";
+  const source = "https://www.linkedin.com/in/example";
+  const text = "Reviewed notes returned by the interactive browser";
+  t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 302, headers: { location: "/authwall" } }));
+  const work: Step = (req) => {
+    assert.match(req.prompt, /Reviewed notes returned by the interactive browser/);
+    fix(req);
+  };
+  const claude = new FakeRunner([work]);
+  const codex = new FakeRunner([work]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const runHelper = promisify(execFile);
+  const notes = join(tempDir(), "notes.json");
+  writeFileSync(notes, JSON.stringify({ status: "ready", text, coverage: ["Experience"] }));
+  try {
+    for (const [provider, runner] of [["claude", claude], ["codex", codex]] as const) {
+      const id = manager.start({ target: "t0", kind: "feature", request: "Research the attached profile", provider,
+        referenceUrls: [source], browserReferenceHelp: true, crew: [], checkpoints: [] });
+      const item = await nextItem(manager);
+      const route = `/api/runs/${id}/references/handoff`;
+      const body = { url: source, itemId: item.id };
+      const issue = (input = body) => request(server.port, route, { method: "POST", headers, body: input });
+      assert.equal((await issue({ ...body, itemId: "other" })).status, 400);
+      assert.equal((await issue({ ...body, url: "https://www.linkedin.com/in/unapproved" })).status, 400);
+
+      const response = await issue();
+      assert.equal(response.status, 200);
+      const handoff = JSON.parse(response.body);
+      const link = new URL(handoff.href);
+      const draftPrompt = link.searchParams.get(provider === "codex" ? "prompt" : "q");
+      assert.equal(link.protocol, `${provider}:`);
+      assert.equal(draftPrompt, handoff.prompt);
+      assert.equal(handoff.provider, provider);
+      assert.ok(!handoff.prompt.includes(server.token));
+      const ticket = handoff.prompt.match(/\b[0-9a-f]{48}\b/)?.[0];
+      assert.ok(ticket);
+      const scopedHeaders = { authorization: `Bearer ${ticket}` };
+      assert.equal((await request(server.port, "/api/state", { headers: scopedHeaders })).status, 401);
+      assert.equal((await request(server.port, "/api/reference-handoff", { headers: { ...scopedHeaders, origin: "https://other.example" } })).status, 403);
+
+      const context = await runHelper(process.execPath, ["bin/shipyard-reference.mjs", "context", String(server.port), ticket]);
+      assert.deepEqual(JSON.parse(context.stdout), { url: source, provider, brief: "Research the attached profile", submitted: false });
+      await runHelper(process.execPath, ["bin/shipyard-reference.mjs", "submit", String(server.port), ticket, notes]);
+      assert.equal(runner.calls.length, 0);
+      assert.equal(manager.store.get(id)?.references?.[0]?.content, undefined);
+      const returned = JSON.parse((await issue()).body);
+      assert.deepEqual(returned.draft, { status: "ready", text, coverage: ["Experience"] });
+      assert.ok(!JSON.stringify(manager.store.events(id)).includes(ticket));
+
+      manager.answer(item.id, { kind: "reference", action: "share", text });
+      assert.equal((await manager.whenDone(id))?.status, "passed");
+      assert.equal((await request(server.port, "/api/reference-handoff", { headers: scopedHeaders })).status, 400);
+      assert.equal(runner.calls.length, 1);
+      assert.equal(manager.store.get(id)?.references?.[0]?.content, text);
+    }
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("canceling or switching providers revokes the pending native handoff", { timeout: 15_000 }, async (t) => {
+  const { config } = await makeManager([]);
+  t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 302, headers: { location: "/authwall" } }));
+  const url = "https://www.linkedin.com/in/example";
+  const manager = new RunManager({ config, roles: loadRoles(), runner: new FakeRunner([]), codexRunner: new FakeRunner([]) });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  try {
+    const id = manager.start({ target: "t0", kind: "feature", request: "Research", referenceUrls: [url], browserReferenceHelp: true, crew: [], checkpoints: [] });
+    const item = await nextItem(manager);
+    const route = `/api/runs/${id}/references/handoff`;
+    const body = { itemId: item.id, url };
+    const issue = async () => JSON.parse((await request(server.port, route, { method: "POST", headers, body })).body);
+    const first = await issue();
+    const old = first.prompt.match(/\b[0-9a-f]{48}\b/)[0];
+    manager.controlRun(id, { action: "switch-provider", provider: "codex" });
+    const latest = await issue();
+    const current = latest.prompt.match(/\b[0-9a-f]{48}\b/)[0];
+    assert.equal(latest.provider, "codex");
+    assert.notEqual(old, current);
+    const context = (ticket: string) => request(server.port, "/api/reference-handoff", { headers: { authorization: `Bearer ${ticket}` } });
+    assert.equal((await context(old)).status, 400);
+    assert.equal((await context(current)).status, 200);
+    assert.equal((await request(server.port, route, { method: "DELETE", headers, body })).status, 200);
+    assert.equal((await context(current)).status, 400);
+    assert.equal(manager.inbox()[0]?.id, item.id);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("the handoff pushes only the confirmed completed branch to the selected remote", async () => {
+  const { git } = await import("../src/exec.ts");
+  const { manager, config } = await makeManager([fix]);
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const id = manager.start({ target: "t0", kind: "feature", request: "Publish the completed run", crew: [], checkpoints: [] });
+  const path = `/api/runs/${id}`;
+  const remote = tempDir("sy-publish-");
+  const push = (body: Record<string, string>, authenticated = true) =>
+    request(server.port, `${path}/publish`, { method: "POST", headers: authenticated ? headers : undefined, body });
+  try {
+    const run = await manager.whenDone(id);
+    assert.ok(run && run.status === "passed");
+    await git(["init", "--bare"], remote);
+    await git(["remote", "add", "origin", remote], run.repo);
+    await git(["config", "remote.origin.mirror", "true"], run.repo);
+    await git(["config", "push.followTags", "true"], run.repo);
+    await git(["-c", "user.name=test", "-c", "user.email=test@example.com", "tag", "-am", "do not push", "local-only", run.baseSha], run.repo);
+    const readResult = async () => JSON.parse((await request(server.port, `${path}/result`, { headers })).body);
+    const ready = (await readResult()).publish;
+    assert.equal(ready.remote, "origin");
+    assert.equal(ready.pushed, false);
+    const confirmation = { head: ready.head, destination: ready.destination };
+    assert.equal((await push(confirmation, false)).status, 401);
+    assert.equal((await push({ ...confirmation, head: run.baseSha })).status, 400);
+    assert.equal((await push({ ...confirmation, destination: "outdated" })).status, 400);
+    assert.equal(await git(["for-each-ref"], remote), "");
+    assert.equal((await push(confirmation)).status, 200);
+    assert.equal(await git(["for-each-ref", "--format=%(refname)"], remote), `refs/heads/${run.branch}`);
+    assert.equal(await git(["rev-parse", `refs/heads/${run.branch}`], remote), ready.head);
+    assert.equal((await readResult()).publish.pushed, true);
+    assert.equal((await push(confirmation)).status, 200);
+    assert.equal(manager.store.events(id).filter(({ type }) => type === "branch-pushed").length, 1);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("the handoff creates a GitHub pull request and recovers its link on retry", async () => {
+  const { git } = await import("../src/exec.ts");
+  const { manager, config } = await makeManager([fix]);
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const id = manager.start({ target: "t0", kind: "feature", request: "Create the pull request", crew: [], checkpoints: [] });
+  const path = `/api/runs/${id}`;
+  const create = (body: Record<string, string>, authenticated = true) => request(server.port, `${path}/pull-request`, {
+    method: "POST", headers: authenticated ? headers : undefined, body,
+  });
+  try {
+    const run = await manager.whenDone(id);
+    assert.ok(run && run.status === "passed");
+    await git(["remote", "add", "origin", "git@github.com:example/fixture.git"], run.repo);
+    const ready = (await manager.result(id)).publish!;
+    const confirmation = { head: ready.head!, destination: ready.destination };
+    assert.equal((await create(confirmation, false)).status, 401);
+    assert.equal((await create(confirmation)).status, 400);
+
+    // Simulate a successful GitHub push, then exercise the real authenticated HTTP route with a fake CLI.
+    const saved = manager.store.get(id)!;
+    saved.publication = { ...confirmation, pushedAt: new Date().toISOString() };
+    manager.store.save(saved);
+    const fake = tempDir("sy-gh-");
+    const log = join(fake, "calls");
+    const pr = "https://github.com/example/fixture/pull/42";
+    const script = `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+const endpoint = args[3];
+if (endpoint.includes("/git/ref/heads/")) console.log(process.env.SHIPYARD_TEST_GITHUB_HEAD);
+else if (endpoint === "repos/example/fixture") console.log("trunk");
+else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
+  fs.writeFileSync(${JSON.stringify(join(fake, "created"))}, ${JSON.stringify(pr)});
+  console.log(${JSON.stringify(pr)});
+} else if (endpoint === "repos/example/fixture/pulls" && fs.existsSync(${JSON.stringify(join(fake, "created"))})) {
+  console.log(${JSON.stringify(pr)});
+}
+`;
+    writeFileSync(join(fake, "gh"), script, { mode: 0o755 });
+    const originalPath = process.env.PATH;
+    const originalHead = process.env.SHIPYARD_TEST_GITHUB_HEAD;
+    process.env.PATH = `${fake}:${originalPath}`;
+    try {
+      process.env.SHIPYARD_TEST_GITHUB_HEAD = run.baseSha;
+      assert.match((await create(confirmation)).body, /no longer matches the pushed commit/);
+      process.env.SHIPYARD_TEST_GITHUB_HEAD = confirmation.head;
+      assert.equal((await create({ ...confirmation, destination: "stale" })).status, 400);
+      const response = await create(confirmation);
+      assert.equal(response.status, 200, response.body);
+      assert.equal(JSON.parse(response.body).publish.pullRequestUrl, pr);
+      assert.equal((await manager.result(id)).publish?.pullRequestUrl, pr);
+      assert.equal((await create(confirmation)).status, 200);
+
+      manager.store.save(saved); // GitHub accepted the PR, but the local result was not saved.
+      assert.equal(JSON.parse((await create(confirmation)).body).publish.pullRequestUrl, pr);
+      const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+      const posts = calls.filter((args) => args.includes("POST"));
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0]?.slice(0, 10), ["api", "--hostname", "github.com", "repos/example/fixture/pulls",
+        "--method", "POST", "-f", `head=${run.branch}`, "-f", "base=trunk"]);
+      assert.ok(calls.some((args) => args.includes(`head=example:${run.branch}`) && args.includes("state=open")));
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalHead === undefined) delete process.env.SHIPYARD_TEST_GITHUB_HEAD;
+      else process.env.SHIPYARD_TEST_GITHUB_HEAD = originalHead;
+    }
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("adding a repository URL clones and inspects once, then registers its local checkout", async (t) => {
+  const { git } = await import("../src/exec.ts");
+  const { config } = await makeManager([]);
+  const remote = await makeTargetRepo();
+  const folder = tempDir("sy-clone-");
+  const configFile = join(folder, "shipyard.config.yaml");
+  const ssh = join(folder, "fixture-ssh");
+  writeFileSync(configFile, "targets: {}\n");
+  writeFileSync(ssh, `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+if (!process.argv.at(-1).includes("example/fixture-app.git")) {
+  console.error("Repository not found");
+  process.exit(1);
+}
+process.exit(spawnSync("git", ["upload-pack", ${JSON.stringify(remote)}], { stdio: "inherit" }).status ?? 1);
+`, { mode: 0o700 });
+  for (const [key, value] of Object.entries({ GIT_SSH_COMMAND: ssh, GIT_SSH_VARIANT: "simple" })) {
+    const previous = process.env[key];
+    process.env[key] = value;
+    t.after(() => {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    });
+  }
+  const manager = new RunManager({ config, roles: loadRoles(), runner: new FakeRunner([fix]), configFile });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const clone = (url: string, auth = headers) => request(server.port, "/api/targets/clone", { method: "POST", headers: auth, body: { url } });
+  try {
+    const url = "git@fixture.invalid:example/fixture-app.git";
+    assert.equal((await clone(url, {} as typeof headers)).status, 401);
+    for (const invalid of ["file:///tmp/repo", "https://token@host.example/owner/repo", "ext::example"]) {
+      assert.equal((await clone(invalid)).status, 400);
+    }
+    const [first, concurrent] = await Promise.all([clone(url), clone(url)]);
+    assert.equal(first.status, 200, first.body);
+    assert.equal(concurrent.status, 200, concurrent.body);
+    const repo = JSON.parse(first.body);
+    assert.equal(repo.ok, true);
+    assert.equal(repo.path, JSON.parse(concurrent.body).path);
+    assert.equal(repo.suggestedName, "fixture-app");
+    assert.equal(repo.test[0].command, "npm test");
+    assert.equal(repo.e2e[0].command, "npm run e2e");
+    assert.equal(await git(["remote", "get-url", "origin"], repo.path), url);
+    assert.equal(await git(["rev-parse", "HEAD"], repo.path), await git(["rev-parse", "HEAD"], remote));
+    assert.equal(readFileSync(configFile, "utf8"), "targets: {}\n");
+    assert.equal(JSON.parse((await clone(url)).body).path, repo.path);
+    assert.match((await clone("git@fixture.invalid:example/missing.git")).body, /could not access/);
+    assert.equal(readdirSync(join(folder, ".shipyard", "repos")).length, 1);
+    const added = await request(server.port, "/api/targets", {
+      method: "POST", headers, body: { name: repo.suggestedName, path: repo.path, test: repo.test[0].command },
+    });
+    assert.equal(added.status, 201, added.body);
+    assert.equal(JSON.parse((await clone(url)).body).existingName, "fixture-app");
+    const id = manager.start({ target: repo.suggestedName, kind: "feature", request: "Fix addition", crew: [], checkpoints: [] });
+    assert.equal((await manager.whenDone(id))?.status, "passed");
+  } finally {
+    await manager.shutdown();
+    await server.close();
+  }
+});
+
+test("the result can save a Git remote locally while preserving an existing origin", async () => {
+  const { git } = await import("../src/exec.ts");
+  const { manager, config, messages } = await makeManager([fix]);
+  const server = await startUiServer({ manager, config, token: "r".repeat(48) });
+  const headers = { "x-shipyard-token": server.token };
+  const id = manager.start({ target: "t0", kind: "feature", request: "Connect the run repository", crew: [], checkpoints: [] });
+  const path = `/api/runs/${id}`;
+  const connect = (url: string) => request(server.port, `${path}/remote`, { method: "POST", headers, body: { url } });
+  try {
+    const run = await manager.whenDone(id);
+    assert.ok(run && run.status === "passed");
+    assert.equal(JSON.parse((await request(server.port, `${path}/result`, { headers })).body).hasRemote, false);
+    for (const url of ["file:///tmp/repo.git", "ext::example", "https://secret@github.com/user/repo.git", "https://github.com/user/repo?token=secret"]) {
+      assert.equal((await connect(url)).status, 400);
+    }
+    const url = "git@github.com:example/private.git";
+    const unauthenticated = await request(server.port, `${path}/remote`, { method: "POST", body: { url } });
+    assert.equal(unauthenticated.status, 401);
+    assert.equal(await git(["remote"], run.repo), "");
+
+    assert.equal((await connect(url)).status, 200);
+    assert.equal((await connect(url)).status, 200);
+    assert.equal((await connect("https://github.com/example/other.git")).status, 400);
+    assert.equal(await git(["config", "--local", "--get", "remote.origin.url"], run.repo), url);
+    assert.equal(await git(["for-each-ref", "refs/remotes"], run.repo), "");
+    assert.equal(JSON.parse((await request(server.port, `${path}/result`, { headers })).body).hasRemote, true);
+    assert.ok(messages.some((m) => m.type === "git-remote" && m.repo === run.repo));
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("the handoff can verify a finished worktree and approve references without starting a new run", async (t) => {
+  const { manager, config, runner } = await makeManager([fix]);
+  config.targets.t0!.e2e = "printf 'host E2E passed'";
+  const server = await startUiServer({ manager, config, token: "q".repeat(48) });
+  const auth = { "x-shipyard-token": server.token };
+  const requested = "Use https://github.com/example";
+  const id = manager.start({ target: "t0", kind: "feature", request: requested, crew: [], checkpoints: [] });
+  const send = (path: string, body?: object) => request(server.port, `/api/runs/${id}/${path}`, { method: "POST", headers: auth, body });
+  try {
+    const run = await manager.whenDone(id);
+    assert.equal(run?.status, "passed");
+    assert.equal(run?.references?.[0]?.status, "permission-required");
+    const checked = await send("verify");
+    assert.equal(checked.status, 200);
+    const saved = manager.store.get(id)!;
+    assert.equal(saved.verification?.head, saved.stages[0]?.commit);
+    assert.deepEqual(saved.verification?.checks.map((check) => check.code), [0, 0]);
+    assert.match(saved.verification!.checks[1]!.outputTail, /host E2E passed/);
+    assert.equal(saved.stages[0]?.attempts[0]?.gates.length, 1);
+    writeFiles(saved.worktree, { "later.txt": "Unsaved work" });
+    assert.equal((await send("verify")).status, 400);
+    assert.equal((await send("references", { referenceUrls: ["https://127.0.0.1/secret"] })).status, 400);
+    t.mock.method(globalThis, "fetch", async (input: string) => {
+      assert.match(input, /^https:\/\/api.github.com\//);
+      return input.includes("/repos?") ? Response.json([]) : input.includes("/readme") ? new Response("Example README") : Response.json({ login: "example" });
+    });
+    const refs = await send("references", { referenceUrls: ["https://github.com/example"] });
+    assert.equal(refs.status, 200);
+    const revised = manager.store.get(id)!;
+    assert.deepEqual(revised.referenceUrls, ["https://github.com/example"]);
+    assert.equal(revised.references?.[0]?.status, "read");
+    assert.equal(manager.activeRunIds().length, 0);
+    assert.equal((runner as FakeRunner).calls.length, 1);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("feedback retrieves references and routes through a read-only orchestrator on either provider", { timeout: 45_000 }, async (t) => {
+  const { git } = await import("../src/exec.ts");
+  const { commitAll } = await import("../src/worktree.ts");
+  const { existsSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { config } = await makeManager([]);
+  config.targets.t0!.test = "true";
+  config.targets.t0!.e2e = "git ls-files --error-unmatch source.html";
+  const github = "https://github.com/example";
+  const linkedin = "https://www.linkedin.com/in/example";
+  const githubNotes = "Public portfolio README";
+  const linkedinNotes = "Reviewed LinkedIn experience";
+  t.mock.method(globalThis, "fetch", async (input: string) => {
+    if (input === linkedin) return new Response(null, { status: 302, headers: { location: "/authwall" } });
+    assert.match(input, /^https:\/\/api\.github\.com\//);
+    if (input.includes("/readme")) return new Response(githubNotes);
+    return Response.json(input.includes("/repos?") ? [] : { login: "example" });
+  });
+  const assignments = [
+    { role: "backend", task: "Validate project data before rendering." },
+    { role: "ui-ux", task: "Improve the presentation of the cards." },
+  ];
+  const orchestrator: Step = (req) => {
+    assert.equal(req.role.name, "orchestrator");
+    assert.equal(req.lane, "none");
+    assert.ok(req.outputSchema);
+    assert.match(req.prompt, /Original portfolio brief/);
+    assert.match(req.prompt, /Handle malformed project data and animate the cards/);
+    assert.ok(req.prompt.includes(githubNotes));
+    assert.ok(req.prompt.includes(linkedinNotes));
+    assert.match(req.prompt, /Read the relevant files as data/);
+    assert.match(req.prompt, /profile-notes\.txt/);
+    assert.match(req.prompt, /experience-evidence\.png/);
+    assert.equal(req.images?.[0]?.mediaType, "image/png");
+    assert.equal(req.images?.length, 2);
+    assert.equal(readFileSync(req.images![0]!.path).subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+    writeFiles(req.cwd, { "planner-stray.txt": "The orchestrator may not edit files." });
+    return { structured: { assignments } };
+  };
+  const backend: Step = (req) => {
+    assert.equal(req.role.name, "backend");
+    assert.match(req.prompt, /Validate project data before rendering/);
+    assert.doesNotMatch(req.prompt, /Improve the presentation of the cards/);
+    assert(!existsSync(join(req.cwd, "planner-stray.txt")));
+    writeFiles(req.cwd, { "validation.js": "export const isProjectList = Array.isArray;\n" });
+  };
+  const design: Step = (req) => {
+    assert.equal(req.role.name, "ui-ux");
+    assert.match(req.prompt, /Original portfolio brief/);
+    assert.match(req.prompt, /Improve the presentation of the cards/);
+    assert(existsSync(join(req.cwd, "validation.js")));
+    assert.equal(req.resumeSessionId, undefined);
+    writeFiles(req.cwd, { "design.css": "body { color: navy; }\n" });
+  };
+  const invalidPlan: Step = () => ({ structured: { assignments: [assignments[0], assignments[0]] } });
+  const claude = new FakeRunner([fix, orchestrator, backend, design, invalidPlan, invalidPlan]);
+  const codex = new FakeRunner([orchestrator, backend, design]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const token = "q".repeat(48);
+  const server = await startUiServer({ manager, config, token });
+  const id = manager.start({ target: "t0", kind: "feature", request: "Original portfolio brief", referenceUrls: [linkedin], crew: [], checkpoints: [] });
+  const headers = { "x-shipyard-token": token };
+  const send = (body: object) => request(server.port, `/api/runs/${id}/feedback`, { method: "POST", headers, body });
+  try {
+    const parent = await manager.whenDone(id);
+    assert.ok(parent?.status === "passed");
+    const previousHandoff = manager.openReferenceHandoff(id, { url: linkedin }, server.port);
+    const ticket = previousHandoff.prompt.match(/\b[0-9a-f]{48}\b/)?.[0];
+    assert.ok(ticket);
+    manager.returnReferenceHandoff(ticket, { status: "ready", text: linkedinNotes, coverage: ["Experience"], missing: [] });
+    const savedReference = await request(server.port, `/api/runs/${id}/references/shared`, {
+      method: "POST", headers, body: { url: linkedin, text: linkedinNotes, attachments: [imageAttachment("experience-evidence.png")] },
+    });
+    assert.equal(savedReference.status, 200);
+    assert.equal(manager.store.get(id)?.references?.[0]?.status, "read");
+    writeFiles(parent.worktree, { "source.html": "<h1>Portfolio</h1>" });
+    const parentTip = await commitAll(parent.worktree, "Refine the source locally");
+    assert.ok(parentTip);
+    assert.equal((await send({ message: "   " })).status, 400);
+    assert.equal((await send({ message: "Change it", provider: "unknown" })).status, 400);
+    assert.equal((await send({ message: "Change it", attachments: [{ name: "../outside.txt", data: "eA==" }] })).status, 400);
+    for (const provider of ["claude", "codex"] as const) {
+      const attachments = [
+        { name: "profile-notes.txt", data: Buffer.from("Notes from the user").toString("base64") },
+        imageAttachment("design.png"),
+      ];
+      const response = await send({ message: `Handle malformed project data and animate the cards using [GitHub](${github}) and ${linkedin}/.`, provider, implementer: "frontend", attachments });
+      assert.equal(response.status, 201);
+      const { id: childId } = JSON.parse(response.body) as { id: string };
+      const item = await nextItem(manager, (item) => item.runId === childId);
+      assert.ok(item.kind === "reference" && item.url === linkedin && !item.needsApproval);
+      assert.match(item.detail, /Check LinkedIn coverage again/);
+      assert.equal(manager.store.get(childId)?.stages.length, 0);
+      const handoff = manager.openReferenceHandoff(childId, { url: linkedin, itemId: item.id }, server.port);
+      assert.equal(new URL(handoff.href).protocol, `${provider}:`);
+      manager.answer(item.id, { kind: "reference", action: "share", text: linkedinNotes });
+      const revision = await manager.whenDone(childId);
+      assert.equal(revision?.status, "passed");
+      assert.equal(revision?.provider, provider);
+      assert.notEqual(revision?.branch, parent.branch);
+      assert.notEqual(revision?.worktree, parent.worktree);
+      assert.equal(revision?.baseSha, parentTip);
+      assert.equal(revision?.followUp?.runId, parent.id);
+      assert.equal(revision?.followUp?.orchestrated, true);
+      const savedFile = revision?.followUp?.attachments?.find(({ name }) => name === "profile-notes.txt");
+      assert.ok(savedFile);
+      assert.equal(readFileSync(join(manager.store.dir(childId), "attachments", savedFile.file), "utf8"), "Notes from the user");
+      assert.equal(await git(["ls-files", "--", "attachments", "profile-notes.txt", "design.png"], revision.worktree), "");
+      assert.deepEqual(revision?.referenceUrls, [github, linkedin]);
+      assert.deepEqual(revision?.stages.map((stage) => stage.role), ["orchestrator", "backend", "ui-ux"]);
+      assert.deepEqual(revision?.stages[0]?.attempts[0]?.output, { assignments });
+      assert.deepEqual(revision?.stages[0]?.attempts[0]?.revertedFiles, ["planner-stray.txt"]);
+      assert.deepEqual(revision?.stages.slice(1).map((stage) => stage.attempts[0]?.gates.map((gate) => gate.code)), [[0, 0], [0, 0]]);
+      assert.ok(revision?.stages.slice(1).every((stage) => stage.commit));
+    }
+    const invalid = await send({ message: "Improve the result" });
+    const failed = await manager.whenDone(JSON.parse(invalid.body).id);
+    assert.equal(failed?.status, "failed");
+    assert.match(failed?.error ?? "", /valid revision plan/);
+    assert.deepEqual(failed?.stages.map((stage) => stage.role), ["orchestrator"]);
+    assert.equal(await git(["rev-parse", "HEAD"], parent.worktree), parentTip);
+    assert.equal(await git(["status", "--porcelain"], parent.worktree), "");
+    assert.equal(claude.calls.length, 6);
+    assert.equal(codex.calls.length, 3);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("Run locally calls the run’s provider once and supervises the app in its worktree", { timeout: 25_000 }, async () => {
+  const { config } = await makeManager([]);
+  const identify: Step = (req) => {
+    assert.equal(req.role.name, "local-app");
+    assert.equal(req.lane, "none");
+    assert.ok(req.outputSchema);
+    assert.ok(readFileSync(join(req.cwd, "src/add.js"), "utf8").includes("Number(a)"));
+    return { structured: { framework: "vite", directory: ".", entry: "", detail: "" } };
+  };
+  const claude = new FakeRunner([fix, identify]);
+  const codex = new FakeRunner([fix, identify]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  try {
+    for (const [provider, runner] of [["claude", claude], ["codex", codex]] as const) {
+      const id = manager.start({ target: "t0", kind: "feature", request: "Make the local app runnable", provider, crew: [], checkpoints: [] });
+      const run = await manager.whenDone(id);
+      assert.ok(run?.status === "passed");
+      assert.equal(runner.calls.length, 1);
+      const cli = `
+import { createServer } from "node:http";
+const host = process.argv[process.argv.indexOf("--host") + 1];
+const port = Number(process.argv[process.argv.indexOf("--port") + 1]);
+createServer((req, res) => res.end(process.cwd())).listen(port, host);
+`;
+      writeFiles(run.worktree, { "node_modules/vite/bin/vite.js": cli });
+      const path = `/api/runs/${id}/local-app`;
+      assert.equal((await request(server.port, path, { method: "POST" })).status, 401);
+      assert.equal((await manager.result(id)).canRunLocally, true);
+      const launches = await Promise.all(Array.from({ length: 2 }, () => request(server.port, path, { method: "POST", headers })));
+      for (const launch of launches) assert.equal(launch.status, 200, launch.body);
+      const { url } = JSON.parse(launches[0]!.body);
+      assert.equal(JSON.parse(launches[1]!.body).url, url);
+      assert.equal(new URL(url).hostname, "[::1]");
+      const { realpath } = await import("node:fs/promises");
+      assert.equal(await (await fetch(url)).text(), await realpath(run.worktree));
+      assert.equal(runner.calls.length, 2);
+      assert.equal((await manager.result(id)).localApp?.url, url);
+      assert.equal((await request(server.port, path, { method: "DELETE", headers })).status, 200);
+      await assert.rejects(fetch(url));
+      assert.equal((await manager.result(id)).localApp, undefined);
+    }
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("the result endpoint serves a private static preview on a separate loopback origin", { timeout: 20_000 }, async () => {
+  const { symlinkSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { manager, config } = await makeManager([
+    (req) => {
+      writeFiles(req.cwd, {
+        "index.html": '<link rel="stylesheet" href="/style.css"><main>Fixture preview</main>',
+        "style.css": "main { color: black; }",
+        ".private.json": '{"private":true}',
+      });
+      const outside = join(tempDir(), "outside.json");
+      writeFileSync(outside, '{"outside":true}');
+      symlinkSync(outside, join(req.cwd, "linked.json"));
+    },
+  ]);
+  config.targets.t0!.test = "true";
+  const token = "q".repeat(48);
+  const server = await startUiServer({ manager, config, token });
+  const origin = `http://127.0.0.1:${server.port}`;
+  const headers = { "x-shipyard-token": token };
+  const id = manager.start({ target: "t0", kind: "feature", request: "Provide a preview", crew: [], checkpoints: [] });
+  try {
+    const run = await manager.whenDone(id);
+    assert.equal(run?.status, "passed");
+    const resultPath = `${origin}/api/runs/${id}/result`;
+    const previewPath = `${origin}/api/runs/${id}/preview`;
+    const result = await fetch(resultPath, { headers }).then((res) => res.json());
+    assert.equal(result.hasRemote, false);
+    assert.equal(result.canPreview, true);
+    assert.equal(result.handoff.fileCount, 4);
+    assert.equal(result.handoff.uncommittedCount, 0);
+    assert.ok(result.handoff.files.some(({ path }: { path: string }) => path === "index.html"));
+    assert.equal((await fetch(previewPath, { method: "POST" })).status, 401);
+    const launches = await Promise.all(Array.from({ length: 2 }, () =>
+      fetch(previewPath, { method: "POST", headers }).then((res) => res.json())));
+    assert.ok(launches[0].url && launches[0].url === launches[1].url, "Concurrent requests must reuse one preview");
+    const preview = new URL(launches[0].url);
+    assert.equal(preview.hostname, "[::1]");
+    const unauthed = await fetch(new URL("/", preview));
+    assert.equal(unauthed.status, 401);
+    const signIn = await fetch(preview, { redirect: "manual" });
+    assert.equal(signIn.status, 302);
+    const cookie = signIn.headers.get("set-cookie")?.split(";")[0];
+    assert.ok(cookie);
+    const get = (path: string) => fetch(new URL(path, preview), { headers: { cookie } });
+    assert.match(await (await get("/")).text(), /Fixture preview/);
+    assert.equal((await get("/style.css")).status, 200);
+    assert.equal((await get("/.private.json")).status, 404);
+    assert.equal((await get("/linked.json")).status, 404);
+    const dismiss = await fetch(`${origin}/api/runs/${id}`, {
+      method: "PATCH", headers, body: JSON.stringify({ acknowledgeCompletion: run?.finishedAt }),
+    });
+    assert.equal(dismiss.status, 200);
+    assert.equal(manager.store.get(id)?.completionRead, true);
+    assert.equal((await fetch(previewPath, { method: "DELETE", headers })).status, 200);
+    await assert.rejects(fetch(new URL("/", preview)));
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
   }
 });

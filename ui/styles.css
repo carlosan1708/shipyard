@@ -548,6 +548,159 @@ code,
   gap: 10px;
 }
 
+.run-result {
+  display: grid;
+  gap: 9px;
+  margin: 12px 0 18px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 13px;
+}
+
+.run-result-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.run-result-heading h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.run-result time,
+.run-result p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.run-result .run-result-error {
+  color: var(--bad);
+}
+
+.run-result-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.run-result-facts dt {
+  color: var(--muted);
+}
+
+.run-result-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.git-remote-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.run-result-actions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.run-result-actions:empty {
+  display: none;
+}
+
+.run-result-actions a {
+  text-decoration: none;
+}
+
+#run-handoff { scroll-margin-block-start: 12px; }
+.run-result .browser-run-status { font-size: 12px; }
+.browser-checked-at { margin-inline-start: 8px; font-size: 12px; font-weight: 400; }
+.handoff-action { margin-block-start: 6px; }
+.reference-handoff-actions { flex-wrap: wrap; }
+#reference-handoff-link { overflow-wrap: anywhere; }
+.kind-reference { color: var(--warn); }
+
+.feedback-brief {
+  border-inline-start: 2px solid var(--run);
+  padding-inline-start: 12px;
+  color: var(--muted);
+}
+
+.feedback-brief p {
+  margin: 5px 0 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.feedback-child {
+  justify-self: start;
+  max-width: 100%;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.revision-assignments {
+  margin: 0;
+  padding: 4px 28px 12px;
+  overflow-wrap: anywhere;
+}
+
+.revision-assignments li + li { margin-block-start: 8px; }
+.revision-assignments p { margin: 2px 0 0; color: var(--muted); white-space: pre-wrap; }
+
+.browser-check-output {
+  margin: 0;
+  padding: 6px 14px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.browser-permission {
+  display: flex;
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.browser-permission input { margin-block: 3px 0; }
+.browser-permission small { display: block; color: var(--muted); font-size: 12px; }
+
+.handoff-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 245px), 1fr));
+  gap: 8px;
+  margin-block-start: 4px;
+}
+
+.handoff-panel {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+
+.handoff-panel h3 { margin: 0 0 6px; font-size: 13px; }
+.handoff-panel ul { margin: 5px 0; padding-inline-start: 18px; }
+.handoff-panel li + li, .handoff-panel p + p { margin-block-start: 4px; }
+.handoff-panel details { margin-block-start: 6px; }
+.handoff-report { padding: 4px 10px 10px; }
+.handoff-report-line { display: inline-grid; gap: 2px; max-width: 94%; vertical-align: top; }
+.handoff-check { margin-inline-end: 6px; font-weight: 650; }
+.handoff-check.is-pass { color: var(--ok); }
+.handoff-check.is-fail, .reference-warning { color: var(--warn); }
+
 .run-head-top {
   display: flex;
   align-items: flex-start;
@@ -732,6 +885,11 @@ code,
   color: var(--ok);
 }
 
+.avatar.role-ui-ux {
+  color: var(--violet);
+  background: var(--violet-weak);
+}
+
 .avatar.role-planner {
   background: var(--warn-weak);
   color: var(--warn);
@@ -759,11 +917,6 @@ code,
 .avatar.sm.role-security-auditor,
 .avatar.sm.role-dependency-updater {
   font-size: 8.5px;
-}
-
-.crew-fixed-implementer {
-  display: block;
-  font-size: 13px;
 }
 
 .avatar.role-docs-writer,
@@ -811,25 +964,70 @@ code,
   justify-content: flex-end;
 }
 
-.attempt {
-  padding: 4px 0 8px;
+.attempt + .attempt {
   border-top: 1px solid var(--border);
 }
 
-.attempt:first-child {
-  border-top: 0;
+.attempt > summary {
+  cursor: pointer;
+  padding: 8px 14px;
+  font-size: 13px;
 }
 
-.attempt-label {
-  padding: 8px 14px 4px;
-  font-size: 11.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--faint);
-  font-weight: 650;
-  display: flex;
-  gap: 8px;
+.attempt > summary:hover,
+.attempt[open] > summary {
+  background: var(--panel-2);
+}
+
+.attempt > summary::marker,
+.attempt-part > summary::marker {
+  color: var(--accent);
+}
+
+.attempt-line {
+  display: inline-flex;
+  vertical-align: middle;
+  width: calc(100% - 18px);
+  flex-wrap: wrap;
   align-items: center;
+  gap: 4px 10px;
+}
+
+.attempt-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.attempt-outcome {
+  margin-inline-start: auto;
+}
+
+.s-redirected {
+  color: var(--warn);
+  background: var(--warn-weak);
+}
+
+.attempt-body {
+  display: grid;
+  gap: 6px;
+  padding: 8px 14px 12px;
+}
+
+.attempt-body > p,
+.attempt-part > .attempt-meta {
+  margin: 0;
+}
+
+.attempt-part > summary {
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.attempt-part > .prose,
+.attempt-part > .feed {
+  margin-top: 4px;
 }
 
 .feed {
@@ -1193,6 +1391,26 @@ code,
   white-space: nowrap;
 }
 
+.inbox-alerts {
+  margin: 0 12px 8px;
+  align-self: flex-start;
+}
+
+.inbox-results {
+  display: grid;
+  gap: 8px;
+}
+
+.inbox-results > .section-label {
+  margin: 2px 0 0;
+}
+
+.completion-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .card-body {
   padding: 0 12px 12px;
   display: flex;
@@ -1205,26 +1423,77 @@ code,
   font-size: 14px;
 }
 
+.checkpoint-summary {
+  display: grid;
+  gap: 6px;
+}
+
+.checkpoint-summary > .link {
+  justify-self: end;
+}
+
+.checkpoint-section {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.checkpoint-section > summary,
+.checkpoint-section-heading {
+  padding: 8px 10px;
+  font-size: 12.5px;
+  font-weight: 620;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.checkpoint-section > summary {
+  cursor: pointer;
+}
+
+.checkpoint-section > summary:hover {
+  background: var(--panel-2);
+}
+
+.checkpoint-section > summary::marker {
+  color: var(--accent);
+}
+
+.checkpoint-section-heading {
+  color: var(--muted);
+  padding-block: 3px;
+}
+
+.checkpoint-section-body {
+  min-width: 0;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.checkpoint-section-body > pre:not(:first-child) {
+  margin-top: 8px;
+}
+
 .summary {
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-size: 13px;
-  max-height: 260px;
-  overflow: hidden;
-  position: relative;
   color: var(--text);
 }
 
-.summary.clamped::after {
-  content: "";
-  position: absolute;
-  inset: auto 0 0 0;
-  height: 40px;
-  background: linear-gradient(transparent, var(--panel));
+.summary.md :is(p, ul, ol, blockquote, pre, .md-table) {
+  margin-block-end: 10px;
 }
 
-.summary.open {
-  max-height: none;
+.summary.md > :last-child {
+  margin-block-end: 0;
+}
+
+.summary.md li + li {
+  margin-block-start: 5px;
+}
+
+.summary.md a {
+  text-underline-offset: 0.16em;
 }
 
 .link {
@@ -1624,14 +1893,6 @@ textarea {
   color: var(--faint);
 }
 
-.crew-implementer {
-  width: auto;
-  padding: 2px 6px;
-  font-weight: 600;
-  font-size: 13px;
-  margin-bottom: 2px;
-}
-
 .crew .always {
   font-size: 12px;
   color: var(--faint);
@@ -1745,6 +2006,10 @@ textarea {
 }
 
 .ar-details {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 14px;

@@ -1,9 +1,14 @@
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import YAML from "yaml";
 import { expandPath, type Target } from "./config.ts";
 import { git } from "./exec.ts";
+
+const exec = promisify(execFile);
 
 export interface CommandCandidate {
   command: string;
@@ -156,6 +161,54 @@ export async function inspectRepo(input: string, baseDir: string, targets: Recor
   const existing = Object.values(targets).find(sameRepo);
   if (existing) errors.push(`Already added as "${existing.name}"`);
   return result();
+}
+
+export async function cloneRepo(url: string, root: string, signal: AbortSignal): Promise<{ path: string; name: string }> {
+  const name = suggestName(url.replace(/\/+$/, "").split(/[/:]/).at(-1)?.replace(/\.git$/i, "") ?? "");
+  const key = createHash("sha256").update(url).digest("hex").slice(0, 12);
+  const path = join(root, `${name}-${key}`);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const reuse = async () => {
+    if (!lstatSync(path, { throwIfNoEntry: false })?.isDirectory()) return undefined;
+    const origin = await git(["config", "--local", "--get", "remote.origin.url"], path).catch(() => "");
+    if (origin !== url || await git(["rev-parse", "--show-toplevel"], path).catch(() => "") !== realpathSync(path)) {
+      throw new Error("The clone destination is occupied by a different checkout");
+    }
+    return { path, name };
+  };
+  const existing = await reuse();
+  if (existing) return existing;
+  if (lstatSync(path, { throwIfNoEntry: false })) throw new Error("The clone destination already exists");
+
+  const staging = mkdtempSync(join(root, ".clone-"));
+  const checkout = join(staging, name);
+  try {
+    try {
+      await exec("git", [
+        "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
+        "clone", "--no-recurse-submodules", "--", url, checkout,
+      ], { signal, timeout: 120_000, maxBuffer: 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" } });
+    } catch (error) {
+      const failure = error as { killed?: boolean; stderr?: string };
+      if (signal.aborted) throw new Error("Clone stopped because Shipyard is shutting down");
+      if (failure.killed) throw new Error("Git did not finish cloning within two minutes. Check the connection and try again.");
+      if (/authentication|could not read username|permission denied|repository not found|not found|publickey|403|401|host key verification/i.test(failure.stderr ?? "")) {
+        throw new Error("Git could not access the repository. Check the URL and your Git credentials or SSH setup.");
+      }
+      throw new Error("Git could not clone the repository. Check the clone URL and your connection.");
+    }
+    signal.throwIfAborted();
+    if (!await git(["rev-parse", "--verify", "HEAD"], checkout).catch(() => "")) {
+      throw new Error("The remote has no checked-out commit. Push a first commit and set its default branch before adding it.");
+    }
+    const concurrent = await reuse();
+    if (concurrent) return concurrent;
+    if (lstatSync(path, { throwIfNoEntry: false })) throw new Error("The clone destination already exists");
+    renameSync(checkout, path);
+    return { path, name };
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
 }
 
 function realPath(p: string): string {

@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { BROWSER_SERVER, BROWSER_TOKEN_ENV, BROWSER_TOOL, startBrowserTool } from "./browser-tool.ts";
 import type { AgentRequest, AgentResult, AgentRunner, TokenUsage } from "./agent.ts";
 import { CODEX_TIMEOUT_MS } from "./config.ts";
 import { git, tail } from "./exec.ts";
@@ -102,6 +103,7 @@ export class CodexAgentRunner implements AgentRunner {
     const result = () => ({ sessionId, summary, usage, costUsd: null, turns: completed ? 1 : 0, durationMs: Date.now() - started });
 
     let scratch: string | undefined;
+    let browser: Awaited<ReturnType<typeof startBrowserTool>> | undefined;
     try {
       const cwd = realpathSync(req.cwd);
       const head = await git(["rev-parse", "HEAD"], cwd);
@@ -109,6 +111,8 @@ export class CodexAgentRunner implements AgentRunner {
       scratch = mkdtempSync(join(tmpdir(), "shipyard-codex-"));
       const output = join(scratch, "final.txt");
       const config = (name: string, value: unknown) => ["-c", `${name}=${JSON.stringify(value)}`];
+      if (req.browserAccess) browser = await startBrowserTool(cwd, req.signal,
+        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }));
       const args = [
         "exec",
         ...config("approval_policy", "never"),
@@ -123,10 +127,18 @@ export class CodexAgentRunner implements AgentRunner {
         ...config("features.plugins", false),
         ...config("features.multi_agent", false),
         ...config(`projects.${JSON.stringify(cwd)}.trust_level`, "untrusted"),
+        ...(browser ? [
+          ...config(`mcp_servers.${BROWSER_SERVER}.url`, browser.url),
+          ...config(`mcp_servers.${BROWSER_SERVER}.bearer_token_env_var`, BROWSER_TOKEN_ENV),
+          ...config(`mcp_servers.${BROWSER_SERVER}.enabled_tools`, [BROWSER_TOOL]),
+          ...config(`mcp_servers.${BROWSER_SERVER}.default_tools_approval_mode`, "approve"),
+          ...config("shell_environment_policy.exclude", [BROWSER_TOKEN_ENV]),
+        ] : []),
         ...(req.model ? ["--model", req.model] : []),
         ...(req.effort ? config("model_reasoning_effort", req.effort) : []),
       ];
       if (req.resumeSessionId) args.push("resume", req.resumeSessionId);
+      for (const image of req.images ?? []) args.push("--image", image.path);
       args.push("--json", "--ignore-user-config", "--output-last-message", output);
       if (req.outputSchema) {
         const schema = join(scratch, "schema.json");
@@ -142,6 +154,8 @@ export class CodexAgentRunner implements AgentRunner {
       delete env.CODEX_API_KEY; // Use credentials already saved by the CLI.
       delete env.OPENAI_API_KEY;
       delete env.SHIPYARD_ALLOW_PUBLISH;
+      delete env[BROWSER_TOKEN_ENV];
+      if (browser) env[BROWSER_TOKEN_ENV] = browser.token;
       req.signal?.throwIfAborted();
       if (this.stopped) throw new Error("Shipyard stopped the Codex runner");
       const child = spawn(this.executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -169,7 +183,10 @@ export class CodexAgentRunner implements AgentRunner {
         } catch {
           return;
         }
-        if (event?.type === "thread.started" && typeof event.thread_id === "string") sessionId = event.thread_id;
+        if (event?.type === "thread.started" && typeof event.thread_id === "string") {
+          sessionId = event.thread_id;
+          req.onEvent?.({ type: "session", sessionId });
+        }
         if (event?.type === "turn.completed") {
           completed = true;
           usage = readUsage(event.usage);
@@ -237,6 +254,7 @@ export class CodexAgentRunner implements AgentRunner {
     } catch (error) {
       return { ...result(), ok: false, error: error instanceof Error ? error.message : String(error) };
     } finally {
+      await browser?.close();
       if (scratch) rmSync(scratch, { recursive: true, force: true });
     }
   }

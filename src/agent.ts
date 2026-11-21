@@ -1,10 +1,14 @@
-import { query, type CanUseTool, type HookCallback, type PermissionResult, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { readFile } from "node:fs/promises";
+import { query, type CanUseTool, type HookCallback, type PermissionResult, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import type { ImageMediaType } from "./attachments.ts";
 import { agentEnv, type AuthMode } from "./auth.ts";
 import { checkToolUse, type Lane } from "./guards.ts";
 import { EFFORTS, type RunEffort } from "./config.ts";
 import type { Role } from "./roles.ts";
+import { BROWSER_SERVER, BROWSER_TOOL, startBrowserTool } from "./browser-tool.ts";
 
 export type AgentEvent =
+  | { type: "session"; sessionId: string }
   | { type: "text"; text: string }
   | { type: "tool"; tool: string; detail: string }
   | { type: "denied"; tool: string; reason: string };
@@ -22,17 +26,21 @@ export type AgentAsk =
   | { kind: "question"; questions: AgentQuestion[] }
   | { kind: "permission"; tool: string; input: Record<string, unknown>; title?: string; reason?: string };
 
-export type AgentAnswer =
+export type AgentAnswer = (
   /** Question text -> answer (multi-select answers comma-separated, free text allowed). */
   | { kind: "question"; answers: Record<string, string> }
-  | { kind: "permission"; allow: boolean; message?: string };
+  | { kind: "permission"; allow: boolean; message?: string }
+) & { attachmentContext?: string };
 
 export interface AgentRequest {
   role: Role;
   prompt: string;
+  images?: Array<{ path: string; mediaType: ImageMediaType }>;
   cwd: string;
   lane: Lane;
   signal?: AbortSignal;
+  /** The user grants read-only inspection of this worktree’s static preview. */
+  browserAccess?: boolean;
   /** Continue an earlier session of the same role (keeps its context, avoids re-reading the repo). */
   resumeSessionId?: string;
   onEvent?: (event: AgentEvent) => void;
@@ -72,7 +80,7 @@ export async function decidePermission(
   const answer = await ask({ kind: "permission", tool: toolName, input, title: details.title, reason: details.reason });
   if (answer.kind === "permission" && answer.allow) return { behavior: "allow", updatedInput: input };
   const why = answer.kind === "permission" && answer.message?.trim() ? ` Their note: ${answer.message.trim()}` : "";
-  return { behavior: "deny", message: `The human reviewer denied ${toolName}.${why}` };
+  return { behavior: "deny", message: [`The human reviewer denied ${toolName}.${why}`, answer.attachmentContext].filter(Boolean).join("\n\n") };
 }
 
 export interface AgentResult {
@@ -106,6 +114,14 @@ export function addTokenUsage(total: TokenUsage | undefined, usage: TokenUsage):
 /** The seam between the pipeline and the provider. Tests swap in a scripted fake. */
 export interface AgentRunner {
   run(req: AgentRequest): Promise<AgentResult>;
+}
+
+async function* imagePrompt(req: AgentRequest): AsyncGenerator<SDKUserMessage> {
+  const images = await Promise.all((req.images ?? []).map(async ({ path, mediaType }) => ({
+    type: "image" as const,
+    source: { type: "base64" as const, media_type: mediaType, data: await readFile(path, "base64") },
+  })));
+  yield { type: "user", message: { role: "user", content: [{ type: "text", text: req.prompt }, ...images] }, parent_tool_use_id: null };
 }
 
 export interface ClaudeRunnerOptions {
@@ -146,17 +162,38 @@ export class ClaudeAgentRunner implements AgentRunner {
     // call outside the role's allowlist goes to the human. Headless, the role's tools are all it has.
     const ask = req.ask;
     const tools = ask ? [...new Set([...req.role.tools, "AskUserQuestion", ...(this.opts.askTools ?? [])])] : req.role.tools;
+    const toolNotes = new Map<string, string>();
     const canUseTool: CanUseTool | undefined = ask
-      ? (toolName, input, options) => decidePermission(toolName, input, ask, { title: options.title, reason: options.decisionReason })
+      ? async (toolName, input, options) => {
+          let context: string | undefined;
+          const result = await decidePermission(toolName, input, async (question) => {
+            const answer = await ask(question);
+            const note = answer.kind === "permission" && answer.allow ? answer.message?.trim() : undefined;
+            context = [note ? `User note: ${note}` : undefined, answer.attachmentContext].filter(Boolean).join("\n\n");
+            return answer;
+          }, { title: options.title, reason: options.decisionReason });
+          if (result.behavior === "allow" && context) toolNotes.set(options.toolUseID, context);
+          return result;
+        }
       : undefined;
+    const shareToolNotes: HookCallback = async (input) => {
+      if (input.hook_event_name !== "PostToolUse" && input.hook_event_name !== "PostToolUseFailure") return {};
+      const context = toolNotes.get(input.tool_use_id);
+      if (!context) return {};
+      toolNotes.delete(input.tool_use_id);
+      return { hookSpecificOutput: { hookEventName: input.hook_event_name, additionalContext: context } };
+    };
 
     const controller = new AbortController();
     const abort = () => controller.abort();
     req.signal?.addEventListener("abort", abort, { once: true });
+    let browser: Awaited<ReturnType<typeof startBrowserTool>> | undefined;
     try {
       req.signal?.throwIfAborted();
+      if (req.browserAccess) browser = await startBrowserTool(req.cwd, controller.signal,
+        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }));
       const session = query({
-        prompt: req.prompt,
+        prompt: req.images?.length ? imagePrompt(req) : req.prompt,
         options: {
           cwd: req.cwd,
           abortController: controller,
@@ -167,7 +204,11 @@ export class ClaudeAgentRunner implements AgentRunner {
           systemPrompt: { type: "preset", preset: "claude_code", append: req.role.prompt },
           // The role's tools run without prompting. Anything else is denied headless, or asked of the human.
           tools,
-          allowedTools: req.role.tools,
+          allowedTools: browser ? [...req.role.tools, `mcp__${BROWSER_SERVER}__${BROWSER_TOOL}`] : req.role.tools,
+          ...(browser ? {
+            mcpServersDelivery: "initialize",
+            mcpServers: { [BROWSER_SERVER]: { type: "http", url: browser.url, headers: { Authorization: `Bearer ${browser.token}` }, alwaysLoad: true } },
+          } : {}),
           permissionMode: ask ? "default" : "dontAsk",
           canUseTool,
           // Load only the target repo's CLAUDE.md and project settings, not this machine's user settings,
@@ -176,7 +217,10 @@ export class ClaudeAgentRunner implements AgentRunner {
           maxBudgetUsd: Math.min(this.opts.maxBudgetUsd, req.maxBudgetUsd ?? Infinity),
           maxTurns: this.opts.maxTurns,
           resume: req.resumeSessionId,
-          hooks: { PreToolUse: [{ hooks: [guard] }] },
+          hooks: {
+            PreToolUse: [{ hooks: [guard] }],
+            ...(ask ? { PostToolUse: [{ hooks: [shareToolNotes] }], PostToolUseFailure: [{ hooks: [shareToolNotes] }] } : {}),
+          },
           // In subscription mode, strip API keys so a stray export can't switch runs to per-token billing.
           env: agentEnv(process.env, this.opts.auth),
           outputFormat: req.outputSchema ? { type: "json_schema", schema: req.outputSchema } : undefined,
@@ -184,7 +228,10 @@ export class ClaudeAgentRunner implements AgentRunner {
       });
 
       for await (const message of session) {
-        sessionId ??= message.session_id;
+        if (!sessionId && message.session_id) {
+          sessionId = message.session_id;
+          req.onEvent?.({ type: "session", sessionId });
+        }
         if (message.type === "assistant") this.emitAssistant(message, req);
         if (message.type === "result") {
           const success = message.subtype === "success";
@@ -213,6 +260,7 @@ export class ClaudeAgentRunner implements AgentRunner {
       };
     } finally {
       req.signal?.removeEventListener("abort", abort);
+      await browser?.close();
     }
   }
 

@@ -90,7 +90,7 @@ test("Codex reads JSONL events and final structured output, and resumes with the
   assert.deepEqual(review.structured, {
     verdict: "approve", summary: "Looks good", findings: [{ severity: "minor", issue: "An optional detail" }],
   });
-  assert.deepEqual(events, [{ type: "tool", tool: "Bash", detail: "ls" }, { type: "text", text: "Working" }]);
+  assert.deepEqual(events, [{ type: "session", sessionId: "thread-abc" }, { type: "tool", tool: "Bash", detail: "ls" }, { type: "text", text: "Working" }]);
   const retry = await runner.run({ role, lane: "no-e2e", cwd: repo, prompt: "Address feedback", model: "codex-test", effort: "xhigh", resumeSessionId: review.sessionId });
   assert.ok(retry.ok, retry.error ?? "Retry failed");
   const { args, prompt } = JSON.parse(retry.summary) as { args: string[]; prompt: string };
@@ -104,12 +104,14 @@ test("Codex reads JSONL events and final structured output, and resumes with the
   assert.ok(args.includes("--ignore-user-config"));
   assert.ok(prompt.startsWith(role.prompt));
   assert.match(prompt, /Address feedback/);
-  const plan = await runner.run({ role, lane: "none", cwd: repo, prompt: "Plan it" });
+  const image = join(root, "feedback image.png");
+  const plan = await runner.run({ role, lane: "none", cwd: repo, prompt: "Plan it", images: [{ path: image, mediaType: "image/png" }] });
   assert.ok(plan.ok, plan.error ?? "Plan failed");
   const planArgs = JSON.parse(plan.summary).args;
   assert.ok(planArgs.includes('sandbox_mode="read-only"'));
   assert.ok(!planArgs.includes("--model"));
   assert.ok(!planArgs.some((arg: string) => arg.startsWith("model_reasoning_effort=")));
+  assert.equal(planArgs[planArgs.indexOf("--image") + 1], image);
 });
 
 test("Codex reports a missing CLI, authentication error, timeout, and schema mismatch", async (t) => {
