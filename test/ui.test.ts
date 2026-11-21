@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { decidePermission, type AgentAnswer, type AgentAsk } from "../src/agent.ts";
@@ -275,12 +275,12 @@ test("the server needs its token, checks Host and Origin, and serves the API", a
     const state = JSON.parse((await request(server.port, "/api/state", { headers: auth })).body);
     assert.equal(state.acceptsAttachments, true);
     assert.deepEqual(state.targets.map((t: { name: string }) => t.name), ["t0"]);
-    assert.deepEqual(state.stages, ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"]);
-    assert.deepEqual(state.optionalStages, ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release"]);
+    assert.deepEqual(state.stages, ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release", "cloud-release"]);
+    assert.deepEqual(state.optionalStages, ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release", "cloud-release"]);
     assert.deepEqual(state.implementers, ["backend", "frontend", "ui-ux"]);
     assert.deepEqual(state.config.models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
     assert.deepEqual(state.efforts, ["low", "medium", "high", "xhigh", "max"]);
-    assert.equal(state.roles.length, 13);
+    assert.ok(state.roles.some((role: { name: string }) => role.name === "google-cloud-releaser"));
 
     const cross = await request(server.port, "/api/runs", { method: "POST", headers: { ...auth, origin: "http://evil.example" }, body: {} });
     assert.equal(cross.status, 403);
@@ -884,14 +884,14 @@ test("the handoff pushes only the confirmed completed branch to the selected rem
   }
 });
 
-test("the handoff creates a GitHub pull request and recovers its link on retry", async () => {
+test("the handoff creates a draft or regular GitHub pull request and recovers its link on retry", async () => {
   const { git } = await import("../src/exec.ts");
   const { manager, config } = await makeManager([fix]);
   const server = await startUiServer({ manager, config });
   const headers = { "x-shipyard-token": server.token };
   const id = manager.start({ target: "t0", kind: "feature", request: "Create the pull request", crew: [], checkpoints: [] });
   const path = `/api/runs/${id}`;
-  const create = (body: Record<string, string>, authenticated = true) => request(server.port, `${path}/pull-request`, {
+  const create = (body: Record<string, unknown>, authenticated = true) => request(server.port, `${path}/pull-request`, {
     method: "POST", headers: authenticated ? headers : undefined, body,
   });
   try {
@@ -941,31 +941,35 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
       assert.match((await create(confirmation)).body, /no longer matches the pushed commit/);
       process.env.SHIPYARD_TEST_GITHUB_HEAD = confirmation.head;
       assert.equal((await create({ ...confirmation, destination: "stale" })).status, 400);
+      assert.equal((await create({ ...confirmation, draft: "true" })).status, 400);
       for (const [scenario, message] of [["unrelated", /unrelated histories/], ["merged", /no commits to merge/]] as const) {
         process.env.SHIPYARD_TEST_GITHUB_COMPARISON = scenario;
         const blocked = (await manager.result(id)).publish!;
-        assert.equal(blocked.compareUrl, undefined);
+        assert.equal(blocked.canCreatePullRequest, undefined);
         assert.match(blocked.pullRequestUnavailable ?? "", message);
         const rejected = await create(confirmation);
         assert.equal(rejected.status, 400);
         assert.match(rejected.body, message);
       }
       delete process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
-      assert.equal((await manager.result(id)).publish?.compareUrl,
-        `https://github.com/example/fixture/compare/trunk...${encodeURIComponent(run.branch)}?quick_pull=1`);
-      const response = await create(confirmation);
+      assert.equal((await manager.result(id)).publish?.canCreatePullRequest, true);
+      const response = await create({ ...confirmation, draft: true });
       assert.equal(response.status, 200, response.body);
       assert.equal(JSON.parse(response.body).publish.pullRequestUrl, pr);
       assert.equal((await manager.result(id)).publish?.pullRequestUrl, pr);
       assert.equal((await create(confirmation)).status, 200);
 
       manager.store.save(saved); // GitHub accepted the PR, but the local result was not saved.
-      assert.equal(JSON.parse((await create(confirmation)).body).publish.pullRequestUrl, pr);
+      assert.equal(JSON.parse((await create({ ...confirmation, draft: true })).body).publish.pullRequestUrl, pr);
+      unlinkSync(join(fake, "created")); // Simulate the original PR closing before testing the legacy request.
+      manager.store.save(saved);
+      assert.equal((await create(confirmation)).status, 200);
       const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
       const posts = calls.filter((args) => args.includes("POST"));
-      assert.equal(posts.length, 1);
+      assert.equal(posts.length, 2);
       assert.deepEqual(posts[0]?.slice(0, 10), ["api", "--hostname", "github.com", "repos/example/fixture/pulls",
         "--method", "POST", "-f", `head=${run.branch}`, "-f", "base=trunk"]);
+      assert.deepEqual(posts.map((args) => args[args.indexOf("-F") + 1]), ["draft=true", "draft=false"]);
       assert.ok(calls.some((args) => args.includes(`head=example:${run.branch}`) && args.includes("state=open")));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
@@ -976,6 +980,83 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
       else process.env.SHIPYARD_TEST_GITHUB_COMPARISON = originalComparison;
     }
   } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("a Cloud Run release requires approval of the exact service and image before updating it", async () => {
+  const { manager, config, runner } = await makeManager([fix, () => ({ summary: "Review the Cloud Run service and verify the image digest." })]);
+  const server = await startUiServer({ manager, config });
+  const id = manager.start({ target: "t0", kind: "feature", request: "Prepare a cloud release", crew: ["cloud-release"], checkpoints: [] });
+  const path = `/api/runs/${id}/cloud-release`;
+  const post = (body: Record<string, unknown>, authenticated = true) => request(server.port, path, {
+    method: "POST", headers: authenticated ? { "x-shipyard-token": server.token } : undefined, body,
+  });
+  const fake = tempDir("sy-gcloud-");
+  const log = join(fake, "calls");
+  const deployed = join(fake, "deployed");
+  const originalPath = process.env.PATH;
+  try {
+    const run = await manager.whenDone(id);
+    assert.equal(run?.status, "passed");
+    assert.equal(run?.stages.at(-1)?.name, "cloud-release");
+    assert.equal(run?.stages.at(-1)?.commit, undefined);
+    assert.ok(runner instanceof FakeRunner);
+    assert.equal(runner.calls.at(-1)?.role.name, "google-cloud-releaser");
+    assert.equal(runner.calls.at(-1)?.lane, "none");
+    assert.equal((await manager.result(id)).canReleaseToCloudRun, true);
+    writeFileSync(join(fake, "gcloud"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+const command = args.slice(0, 3).join(" ");
+const deployed = ${JSON.stringify(deployed)};
+const json = (value) => console.log(JSON.stringify(value));
+if (args[0] === "auth") console.log("operator@example.test");
+else if (args[0] === "config") console.log("(unset)");
+else if (command === "run services describe" && args.some((arg) => arg.includes("status.traffic"))) {
+  json({ status: { traffic: [{ revisionName: "portfolio-previous", percent: 100 }] } });
+} else if (command === "run services describe") {
+  json({ metadata: { uid: "service-id" }, spec: { template: { spec: { containers: [{}], serviceAccountName: "runtime@example.test" } } } });
+} else if (command === "run revisions list") {
+  json(fs.existsSync(deployed) ? [{ spec: { containers: [{ image: fs.readFileSync(deployed, "utf8") }] },
+    status: { conditions: [{ type: "Ready", status: "True" }] } }] : []);
+} else if (command === "run services update") fs.writeFileSync(deployed, args.find((arg) => arg.startsWith("--image=")).slice(8));
+else process.exitCode = 1;
+`, { mode: 0o755 });
+    process.env.PATH = `${fake}:${originalPath}`;
+    const image = `us-central1-docker.pkg.dev/example-project/app/portfolio@sha256:${"a".repeat(64)}`;
+    const target = { action: "prepare", project: "example-project", region: "us-central1", service: "portfolio", image };
+    assert.equal((await post(target, false)).status, 401);
+    assert.equal((await post({ ...target, image: "portfolio:latest" })).status, 400);
+    assert.equal(existsSync(log), false);
+    const prepared = await post(target);
+    assert.equal(prepared.status, 200, prepared.body);
+    const { review } = JSON.parse(prepared.body);
+    assert.equal(review.account, "operator@example.test");
+    assert.equal(review.runtimeIdentity, "runtime@example.test");
+    assert.equal(review.image, image);
+    const approval = { action: "deploy", token: review.token, confirm: true };
+    assert.equal((await post({ ...approval, confirm: false })).status, 400);
+    assert.equal((await post({ ...approval, token: "other" })).status, 400);
+    assert.equal(existsSync(deployed), false);
+    const outcome = await post({ ...approval, project: "wrong-project", image: "unreviewed-image" });
+    assert.equal(outcome.status, 200, outcome.body);
+    assert.equal(JSON.parse(outcome.body).release.revision, review.revision);
+    assert.equal((await manager.result(id)).cloudRelease?.revision, review.revision);
+    assert.equal((await post(approval)).status, 400);
+    const reviewedAgain = JSON.parse((await post(target)).body).review;
+    assert.equal((await post({ ...approval, token: reviewedAgain.token })).status, 200);
+    const updates = readFileSync(log, "utf8").split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]).filter((args) => args[2] === "update");
+    assert.equal(updates.length, 1);
+    assert.ok(updates[0]?.includes("--no-traffic"));
+    assert.ok(updates[0]?.includes("--project=example-project"));
+    assert.ok(updates[0]?.includes("--account=operator@example.test"));
+    assert.ok(updates[0]?.includes(`--image=${image}`));
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
     await Promise.all([manager.shutdown(), server.close()]);
   }
 });

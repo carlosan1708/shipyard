@@ -11,10 +11,11 @@ const STAGE_ROLE = {
   e2e: "e2e-tester",
   docs: "docs-writer",
   release: "release-manager",
+  "cloud-release": "google-cloud-releaser",
 };
 /** implement, revise, harden and repair belong to the run's implementer. */
 const stageRole = (name, run) => STAGE_ROLE[name] ?? run?.implementer ?? "backend";
-const PIPELINE_ORDER = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"];
+const PIPELINE_ORDER = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release", "cloud-release"];
 const roleLabel = (role) => ({ orchestrator: "Orchestrator", "ui-ux": "UI/UX specialist", "dependency-updater": "Dependency updater", "docs-writer": "Docs writer", "e2e-tester": "E2E tester" })[role] ?? role;
 const KIND_LABEL = { feature: "Feature", bug: "Bug fix", deps: "Dependency update" };
 const KIND_SHORT = { feature: "ship", bug: "fix", deps: "deps" };
@@ -62,7 +63,7 @@ const state = {
   localAppPending: new Set(),
   browserPending: new Set(),
   verificationPending: new Set(),
-  pullRequestPending: new Set(),
+  pullRequestPending: new Map(),
   wasDown: false,
 };
 
@@ -332,6 +333,7 @@ const INITIALS = {
   reviewer: "RV",
   "docs-writer": "DOC",
   "release-manager": "REL",
+  "google-cloud-releaser": "GCP",
   "bug-triager": "BUG",
   "security-auditor": "SEC",
   "dependency-updater": "DEP",
@@ -906,7 +908,7 @@ function runResult(run, result, recovery) {
   const previewBusy = state.previewPending.has(run.id);
   const localAppBusy = state.localAppPending.has(run.id) || result.localApp?.starting;
   const browserBusy = state.browserPending.has(run.id);
-  const pullRequestBusy = state.pullRequestPending.has(run.id);
+  const pendingPullRequest = state.pullRequestPending.get(run.id);
   const button = (label, onclick, disabled = false) =>
     h("button", { type: "button", class: "btn btn-sm", text: label, onclick, disabled });
   return h("section", { class: "run-result", "aria-label": "Run result" },
@@ -929,15 +931,18 @@ function runResult(run, result, recovery) {
         publication && !publication.pushed ? button("Push branch", () => openPublish(run, publication)) : null,
         publication?.pullRequestUrl ? h("a", {
           class: "btn btn-primary btn-sm", href: publication.pullRequestUrl, target: "_blank", rel: "noopener noreferrer", text: "Open PR on GitHub",
-        }) : publication?.compareUrl ? [
-          h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pullRequestBusy,
-            text: pullRequestBusy ? "Creating PR…" : "Create PR on GitHub", onclick: () => createPullRequest(run.id, publication) }),
-          h("a", { class: "btn btn-sm", href: publication.compareUrl, target: "_blank", rel: "noopener noreferrer", text: "Compare on GitHub" }),
+        }) : publication?.canCreatePullRequest ? [
+          h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pendingPullRequest !== undefined,
+            text: pendingPullRequest === true ? "Creating draft PR…" : "Create draft PR", onclick: () => createPullRequest(run.id, publication, true) }),
+          button(pendingPullRequest === false ? "Creating PR…" : "Create PR on GitHub",
+            () => createPullRequest(run.id, publication, false), pendingPullRequest !== undefined),
         ] : publication?.pullRequestUnavailable ? h("span", { text: publication.pullRequestUnavailable }) : null,
       )] : null,
     ) : null,
     result.error ? h("p", { class: "run-result-error", text: result.error }) : null,
+    result.cloudRelease ? h("p", { class: "field-help", text: `Cloud Run recorded revision ${result.cloudRelease.revision} for run commit ${result.cloudRelease.head.slice(0, 12)}. It had no traffic when verified.` }) : null,
     h("div", { class: "run-result-actions" },
+      result.canReleaseToCloudRun && !state.config?.demo ? button("Review Cloud Run release", () => openCloudRelease(run.id)) : null,
       run.status === "passed" && !run.cleanedUp ? button("Give feedback", () => openFeedback(run)) : null,
       !recovery && !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
       result.localApp?.url ? [
@@ -1536,12 +1541,14 @@ function checkpointSummary(text, key) {
 
 function checkpointBody(item, send) {
   const c = item.checkpoint;
-  const readOnly = c.stage === "plan" || c.stage === "review" || c.stage === "security";
+  const readOnly = ["plan", "review", "security", "cloud-release"].includes(c.stage);
   const title =
     c.stage === "plan"
       ? c.outcome === "passed" ? "The plan is ready" : "The planner hasn't produced a plan yet"
       : c.stage === "review"
         ? c.outcome === "passed" ? "The reviewer approved the change" : "The reviewer requested changes"
+        : c.stage === "cloud-release"
+          ? c.outcome === "passed" ? "The Cloud Run release plan is ready" : "The Cloud Run release plan needs attention"
         : c.stage === "security"
           ? c.outcome === "passed" ? "The security audit passed" : "The security audit requires fixes"
           : c.stage === "triage"
@@ -1754,6 +1761,7 @@ const CREW = [
   { stage: "repair", role: "implementer", title: "repair", what: "Fixes the code if E2E finds a problem", on: true },
   { stage: "docs", role: "docs-writer", title: "docs-writer", what: "Updates the README, changelog and docs", on: false },
   { stage: "release", role: "release-manager", title: "release-manager", what: "Bumps the version and writes release notes; never publishes", on: false },
+  { stage: "cloud-release", role: "google-cloud-releaser", title: "Google Cloud release", what: "Plans a Cloud Run release and its permissions", on: false },
 ];
 
 // Your last choices, remembered in this browser only. Everything works without them.
@@ -2547,12 +2555,12 @@ function openPublish(run, publication) {
   $("publish-submit").focus();
 }
 
-async function createPullRequest(runId, { destination, head }) {
+async function createPullRequest(runId, { destination, head }, draft) {
   if (state.pullRequestPending.has(runId)) return;
-  state.pullRequestPending.add(runId);
+  state.pullRequestPending.set(runId, draft);
   schedule("detail");
   try {
-    const result = await api(`/api/runs/${runId}/pull-request`, { method: "POST", body: { destination, head } });
+    const result = await api(`/api/runs/${runId}/pull-request`, { method: "POST", body: { destination, head, draft } });
     state.results.set(runId, result);
     toast("Pull request ready");
   } catch (error) {
@@ -2593,6 +2601,91 @@ function wirePublish() {
       status.textContent = "";
       submit.disabled = cancel.disabled = false;
       schedule("detail");
+    }
+  });
+}
+
+function openCloudRelease(runId) {
+  const form = $("cloud-release-form");
+  form.reset();
+  form.dataset.runId = runId;
+  $("cloud-release-cancel").textContent = "Cancel";
+  $("cloud-release-submit").hidden = false;
+  $("cloud-release-status").textContent = "";
+  setCloudReleaseReview(null);
+  $("cloud-release-dialog").showModal();
+  form.elements.project.focus();
+}
+
+function setCloudReleaseReview(review) {
+  const form = $("cloud-release-form");
+  form.dataset.reviewToken = review?.token ?? "";
+  $("cloud-release-target").disabled = Boolean(review);
+  $("cloud-release-review").hidden = !review;
+  $("cloud-release-edit").hidden = !review;
+  $("cloud-release-error").hidden = true;
+  $("cloud-release-submit").textContent = review ? "Approve and create revision" : "Review release";
+  const facts = review ? [
+    ["Google Cloud account", review.account],
+    ["Runtime identity", review.runtimeIdentity ?? "Service default"],
+    ["Target", `${review.project} / ${review.region} / ${review.service}`],
+    ["Image", review.image],
+    ["Run commit", review.head.slice(0, 12)],
+    ["Revision", review.revision],
+  ] : [];
+  $("cloud-release-details").replaceChildren(...facts.flatMap(([label, value]) => [
+    h("dt", { text: label }), h("dd", { class: "mono cloud-release-value", text: value }),
+  ]));
+}
+
+function wireCloudRelease() {
+  const dialog = $("cloud-release-dialog");
+  const form = $("cloud-release-form");
+  const submit = $("cloud-release-submit");
+  const cancel = $("cloud-release-cancel");
+  const edit = $("cloud-release-edit");
+  const status = $("cloud-release-status");
+  const error = $("cloud-release-error");
+  cancel.addEventListener("click", () => dialog.close());
+  edit.addEventListener("click", () => {
+    setCloudReleaseReview(null);
+    status.textContent = "";
+    form.elements.project.focus();
+  });
+  dialog.addEventListener("cancel", (event) => {
+    if (submit.disabled) event.preventDefault();
+  });
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (submit.disabled || submit.hidden) return;
+    const { runId, reviewToken } = form.dataset;
+    const body = reviewToken ? { action: "deploy", token: reviewToken, confirm: true }
+      : { action: "prepare", ...Object.fromEntries(new FormData(form)) };
+    submit.disabled = cancel.disabled = edit.disabled = true;
+    $("cloud-release-target").disabled = true;
+    error.hidden = true;
+    status.textContent = reviewToken ? "Waiting for Cloud Run to confirm the revision…" : "Checking the Google Cloud account and service…";
+    try {
+      const result = await api(`/api/runs/${runId}/cloud-release`, { method: "POST", body });
+      if (result.review) {
+        setCloudReleaseReview(result.review);
+        status.textContent = "Confirm the deployment details above.";
+      } else {
+        setCloudReleaseReview(null);
+        $("cloud-release-target").disabled = true;
+        submit.hidden = true;
+        cancel.textContent = "Close";
+        status.textContent = `Revision ${result.release.revision} is ready with no traffic.`;
+        loadResult(runId);
+      }
+    } catch (failure) {
+      setCloudReleaseReview(null);
+      status.textContent = "";
+      error.textContent = failure.message;
+      error.hidden = false;
+    } finally {
+      submit.disabled = cancel.disabled = edit.disabled = false;
+      (submit.hidden ? cancel : submit).focus();
     }
   });
 }
@@ -2721,6 +2814,7 @@ async function main() {
   wireFeedback();
   wireGitRemote();
   wirePublish();
+  wireCloudRelease();
   wireReferenceHandoff();
   try {
     await loadState();

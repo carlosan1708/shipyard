@@ -71,6 +71,38 @@
       </form>
     </dialog>
 
+    <dialog class="dialog" id="cloud-release-dialog" aria-labelledby="cloud-release-title">
+      <form method="dialog" class="dialog-body" id="cloud-release-form">
+        <h2 id="cloud-release-title">Release to Cloud Run</h2>
+        <p class="field-help">Prepare a revision for an existing service with an image built for this release. The new revision receives no traffic.</p>
+        <p class="field-help">Sign in with <code>gcloud auth login</code>. The deploying account typically needs Cloud Run Developer, Service Account User on the runtime identity, and Artifact Registry Reader on the image repository. <a href="https://docs.cloud.google.com/run/docs/deploying#required-roles" target="_blank" rel="noopener noreferrer">Required permissions</a></p>
+        <fieldset class="field" id="cloud-release-target">
+          <legend class="field-label">Deployment target</legend>
+          <div class="field-grid field-grid-3">
+            <label class="field"><span class="field-label">Project ID</span><input name="project" required maxlength="30"></label>
+            <label class="field"><span class="field-label">Region</span><input name="region" required maxlength="30" placeholder="us-central1"></label>
+            <label class="field"><span class="field-label">Service</span><input name="service" required maxlength="49"></label>
+          </div>
+          <label class="field">
+            <span class="field-label">Artifact Registry image digest</span>
+            <input name="image" required maxlength="512" placeholder="REGION-docker.pkg.dev/PROJECT/REPOSITORY/IMAGE@sha256:…">
+          </label>
+        </fieldset>
+        <section id="cloud-release-review" hidden aria-label="Deployment approval">
+          <dl class="run-result-facts" id="cloud-release-details"></dl>
+          <p class="field-help">The service lookup checked read access. Google Cloud checks write permissions when you approve.</p>
+          <p class="field-help">Confirm the image digest belongs to the release you intend to deploy. Creating a revision may incur charges.</p>
+        </section>
+        <p id="cloud-release-status" class="field-help" role="status"></p>
+        <p id="cloud-release-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="cloud-release-cancel">Cancel</button>
+          <button type="button" class="btn btn-ghost" id="cloud-release-edit" hidden>Edit target</button>
+          <button type="submit" class="btn btn-primary" id="cloud-release-submit">Review release</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="dialog" id="git-remote-dialog" aria-labelledby="git-remote-title">
       <form method="dialog" class="dialog-body" id="git-remote-form">
         <h2 id="git-remote-title">Connect Git remote</h2>

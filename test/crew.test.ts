@@ -29,6 +29,20 @@ const e2e: Step = (req) =>
   writeFiles(req.cwd, { "e2e/add.e2e.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("e2e", () => assert.equal(add(2, 2), 4));\n' });
 const approve = { verdict: "approve", summary: "Small, correct change.", findings: [{ severity: "nit", file: "src/add.js", line: 1, issue: "Number() twice reads a bit noisy." }] };
 
+test("either provider can prepare a Google Cloud release without committing changes", async () => {
+  for (const provider of ["claude", "codex"] as const) {
+    const { deps, target, runner } = await setup([fix, () => ({ summary: "An image and an authorized target are needed." })]);
+    const run = await runPipeline({ target, provider, kind: "feature", request: "Add support for numeric strings", crew: ["cloud-release"] }, deps);
+    assert.equal(run.status, "passed");
+    const stage = run.stages.at(-1)!;
+    assert.equal(stage.name, "cloud-release");
+    assert.equal(stage.role, "google-cloud-releaser");
+    assert.equal(stage.commit, undefined);
+    assert.equal(runner.calls.at(-1)?.lane, "none");
+    assert.equal(stage.attempts[0]?.provider, provider);
+  }
+});
+
 test("the full crew: plan, implement, review, e2e, docs and release, each committed where it changes something", async () => {
   const { runner, deps, target } = await setup([
     (req) => {

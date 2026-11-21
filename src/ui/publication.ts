@@ -91,23 +91,20 @@ async function pullRequestBase(api: ReturnType<typeof githubApi>, apiPath: strin
   return base;
 }
 
-export async function pullRequestOptions(repo: string, destination: Destination, branch: string, head: string, signal: AbortSignal) {
-  if (!destination.repository) return {};
-  const apiPath = `repos/${new URL(destination.repository).pathname.slice(1)}`;
+export async function pullRequestOptions(repo: string, repository: string, head: string, signal: AbortSignal):
+  Promise<{ canCreatePullRequest?: true; pullRequestUnavailable?: string }> {
+  const apiPath = `repos/${new URL(repository).pathname.slice(1)}`;
   const api = githubApi(repo, signal, 3_000);
-  let base: string | undefined;
   try {
-    base = await pullRequestBase(api, apiPath, head);
+    await pullRequestBase(api, apiPath, head);
   } catch (error) {
     if (error instanceof PullRequestComparisonError) return { pullRequestUnavailable: error.message };
-    // Keep the manual GitHub option when gh or GitHub's API is unavailable.
+    // Let the explicit creation request report authentication or connection errors.
   }
-  const encodedBranch = encodeURIComponent(branch);
-  const selection = base ? `${encodeURIComponent(base)}...${encodedBranch}` : encodedBranch;
-  return { compareUrl: `${destination.repository}/compare/${selection}?quick_pull=1` };
+  return { canCreatePullRequest: true };
 }
 
-export async function createRunPullRequest(repo: string, repository: string, branch: string, head: string, signal: AbortSignal): Promise<string> {
+export async function createRunPullRequest(repo: string, repository: string, branch: string, head: string, signal: AbortSignal, draft = false): Promise<string> {
   const slug = new URL(repository).pathname.slice(1);
   const apiPath = `repos/${slug}`;
   const api = githubApi(repo, signal, 30_000);
@@ -130,7 +127,7 @@ export async function createRunPullRequest(repo: string, repository: string, bra
       const base = await pullRequestBase(api, apiPath, head);
       const title = await git(["show", "-s", "--format=%s", head], repo);
       const created = await api(`${apiPath}/pulls`, "--method", "POST", "-f", `head=${branch}`, "-f", `base=${base}`,
-        "-f", `title=${title || branch}`, "--jq", ".html_url");
+        "-f", `title=${title || branch}`, "-F", `draft=${draft}`, "--jq", ".html_url");
       pullRequestUrl = confirmedUrl(created);
     }
   } catch (error) {
@@ -145,7 +142,7 @@ export async function createRunPullRequest(repo: string, repository: string, bra
     if (/gh auth login|HTTP 401|bad credentials/i.test(message)) throw new Error("Sign in to GitHub CLI with gh auth login, then try again.");
     if (/HTTP 40[34]|resource not accessible/i.test(message)) throw new Error("GitHub denied access. Check that GitHub CLI has permission to read the repository and create pull requests.");
     if (/no commits between/i.test(message)) throw new Error("The branch has no commits to merge into the repository’s default branch.");
-    throw new Error("GitHub could not create the pull request. Retry or use Compare on GitHub.");
+    throw new Error("GitHub could not create the pull request. Check the repository’s pull request settings and try again.");
   }
   if (!pullRequestUrl) throw new Error("GitHub did not return a pull request link. Retry to find the pull request.");
   return pullRequestUrl;

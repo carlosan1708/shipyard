@@ -48,8 +48,8 @@ Options for fix, ship and deps:
   --checkpoints                 pause after every stage so you can approve, give feedback or stop
   --checkpoints=plan,implement  pause only after the named stages
                                 (triage, plan, implement, design, review, revise, security, harden,
-                                e2e, repair, docs, release)
-  --crew=triage,plan,design,review,security,e2e,repair,docs,release
+                                e2e, repair, docs, release, cloud-release)
+  --crew=triage,plan,design,review,security,e2e,repair,docs,release,cloud-release
                                 the optional agents that run (default: e2e,repair; implement always runs;
                                 triage applies to fix; plan and design don't apply to deps)
   --implementer=ui-ux           who implements: backend (default), frontend, or ui-ux

@@ -58,6 +58,10 @@ export class DemoRunner implements AgentRunner {
       case "release-manager":
         summary = await this.release(req, tool);
         break;
+      case "google-cloud-releaser":
+        await tool("Read", join(req.cwd, "package.json"));
+        summary = "The demo shop has no Cloud Run configuration. A new revision would require a configured Cloud Run service, a built image digest, and an authorized Google Cloud CLI account.";
+        break;
       case "bug-triager":
         ({ summary, structured } = await this.triager(req, tool));
         break;

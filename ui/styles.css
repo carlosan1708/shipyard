@@ -622,6 +622,10 @@ code,
   overflow-wrap: anywhere;
 }
 
+.cloud-release-value {
+  overflow-wrap: anywhere;
+}
+
 .git-remote-status {
   display: flex;
   flex-wrap: wrap;

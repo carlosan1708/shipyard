@@ -321,6 +321,13 @@ export function releasePrompt(kind: RunKind, request: string, baseSha: string): 
   ].join("\n\n");
 }
 
+export function cloudReleasePrompt(kind: RunKind, request: string, baseSha: string): string {
+  return [
+    `Plan the Google Cloud release for this ${kindNoun(kind)}. Review the change with \`git diff ${baseSha.slice(0, 12)}..HEAD\`.`,
+    taskBlock(kind, request),
+  ].join("\n\n");
+}
+
 export function e2ePrompt(kind: RunKind, request: string, implementSummary: string, target: Target, baseSha?: string): string {
   return [
     `The implementation engineer just finished this ${kindNoun(kind)}. The whole change is \`git diff ${baseSha ? baseSha.slice(0, 12) : "HEAD~1"}..HEAD\`.`,

@@ -46,6 +46,7 @@ Shipyard starts from the target's committed `HEAD`, so pending changes in the or
 | E2E → repair | E2E tester, then implementer if needed | Tests for E2E. Repair excludes E2E tests. | End-to-end checks pass. |
 | Docs | Docs writer | Documentation | Updates user-facing docs where needed. |
 | Release | Release manager | Version files, lockfiles, and release notes | Prepares the release files and runs the unit gate. |
+| Cloud release | Google Cloud release specialist | Read-only | Reviews the build, target, permissions, and verification plan for a Google Cloud release. |
 
 Implementation always runs. The CLI's default optional crew is E2E and repair, which need a configured E2E command. Triage applies to bug fixes. Dependency runs use the dependency updater and skip planning and triage. Choose optional stages with `--crew` or the dashboard's **Crew** table.
 
@@ -78,7 +79,15 @@ Use **Open local preview** to see the static site. **Run browser check** verifie
 
 The **Run handoff** lists changes, specialist reports, recorded verification and pending items. Choose **Allow local browser access** on a run or revision to let either provider inspect screenshots and activate local controls in an isolated browser. `browserAccess: true` sets the target default, and `--browser` or `--no-browser` overrides it in the CLI. Include GitHub or LinkedIn URLs in the run request or use `--reference=<url>` in the CLI to pass public source material to the crew. Shipyard logs permission gaps, public access failures, and sign-in requirements in the run. It uses a separate connection with no account cookies or tokens.
 
-In a finished result, **Run project checks** records the configured unit and end-to-end checks against the current run branch. Under **Pull request**, choose **Connect Git remote** to save the clone URL of an existing repository as `origin`. Choose **Push branch** and confirm the destination to publish the completed run’s branch using your Git credentials. After pushing to GitHub, choose **Create PR on GitHub** to create a pull request against the repository’s default branch or link an existing open PR for the run branch. This uses the local GitHub CLI account (`gh auth login`). **Open PR on GitHub** opens the saved pull request. **Compare on GitHub** lets you create a pull request manually in the browser.
+In a finished result, **Run project checks** records the configured unit and end-to-end checks against the current run branch. Under **Pull request**, choose **Connect Git remote** to save the clone URL of an existing repository as `origin`. Choose **Push branch** and confirm the destination to publish the completed run’s branch using your Git credentials. After pushing to GitHub, choose **Create draft PR** or **Create PR on GitHub**. Shipyard uses the local GitHub CLI account (`gh auth login`) to open the PR against the repository’s default branch. If the branch already has an open PR, Shipyard links it in its current state. **Open PR on GitHub** opens the saved URL.
+
+### Google Cloud releases
+
+Enable **Google Cloud release** in the dashboard crew or add `cloud-release` to `--crew`. The specialist prepares a read-only release plan for either provider. Review it in the handoff of a completed run.
+
+Choose **Review Cloud Run release** and supply the project ID, region, an existing single-container service, and an Artifact Registry image pinned by SHA-256 digest. Build the image separately and verify that its digest corresponds to the intended release. Shipyard checks service read access with the active Google Cloud CLI account, then shows the account, runtime identity, target, image, and revision for approval.
+
+The deploying account typically needs Cloud Run Developer, Service Account User on the service’s runtime identity, and Artifact Registry Reader on the image repository. Sign in with `gcloud auth login` and use a configuration with the intended account. After **Approve and create revision**, Shipyard updates the existing service with `--no-traffic` and records the ready revision after checking its traffic. Rollouts and rollbacks are managed separately in Cloud Run. [Cloud Run deployment permissions](https://docs.cloud.google.com/run/docs/deploying#required-roles) · [Cloud Run service update options](https://docs.cloud.google.com/sdk/gcloud/reference/run/services/update)
 
 **Needs you** shows a request for each explicit reference URL that needs approval or browser help. Approve or skip each link separately. When a public check returns blocked or partial access, choose **Continue in Codex** or **Continue in Claude**. Send the prefilled task in the desktop app and approve its browser prompts there. If you are already in an interactive session with the appropriate tools, use **Copy task** and send it in that session. Shipyard’s Codex skill and Claude plugin both describe the handoff.
 

@@ -11,13 +11,14 @@ A local crew of specialist Claude Code and Codex agents that builds features and
 
 ## Layout
 
-- `src/pipeline.ts`: stage order (triage, plan, implement, design, review, revise, security, harden, e2e, repair, docs, release), gates (including triage's must-fail gate), judges, retries, feedback loops (the core). Optional stages are chosen per run with `crew`; run kinds are feature, bug and deps. Feedback on a completed result starts a linked revision from the source branch’s latest commit, with the same provider controls and isolation as other runs.
+- `src/pipeline.ts`: stage order (triage, plan, implement, design, review, revise, security, harden, e2e, repair, docs, release, cloud-release), gates (including triage's must-fail gate), judges, retries, and feedback loops. Optional stages are chosen per run with `crew`. Run kinds are feature, bug and deps. Feedback on a completed result starts a linked revision from the source branch’s latest commit, with the same provider controls and isolation as other runs.
 - `src/prompts.ts`: stage prompts and structured outputs, including the orchestrator’s specialist assignments for revisions. The shared pipeline validates the assignments and runs each specialist and its checks in order.
 - `src/agent.ts` and `src/codex.ts`: shared `AgentRunner` interface and both provider adapters
 - `src/run-control.ts`: interruption and steering for active runs
 - `src/review.ts`: terminal checkpoint reviewer (`--checkpoints`); the pipeline only sees the `Checkpoints.review` callback, so other UIs can plug in
 - `src/ui/`: `shipyard ui`. `manager.ts` runs pipelines in parallel and owns the inbox (one pending promise per item); `server.ts` is the local HTTP + SSE server (token, Host and Origin checks, fixed static file list); `demo.ts` is the scripted crew for `--demo`
 - `src/ui/local-app.ts`: supervises opt-in local app processes from completed worktrees. The read-only `local-app` role runs on demand through the selected provider outside the delivery pipeline and returns a structured launch plan.
+- `src/ui/cloud-release.ts`: Cloud Run preflight and approved revision creation. The read-only Google Cloud release role plans the release. The dashboard separately binds approval to the selected service, image digest, Google Cloud CLI account, and run commit.
 - `ui/`: the browser app (plain HTML, CSS, JS; no build). All agent text must go through `textContent`, never `innerHTML`; the CSP forbids inline scripts and styles. Agent markdown is rendered by `md()` / `mdInline()` in `ui/app.js`, which build elements and text nodes (only http(s) links become links)
 - `src/guards.ts` + `plugins/shipyard/hooks/guard-publish.mjs`: tool-call guards (one implementation shared by both)
 - `src/eval.ts`, `evals/tasks/*.json`, `evals/hidden/*.test.js`: eval harness, tasks and hidden graders

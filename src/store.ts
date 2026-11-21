@@ -100,6 +100,7 @@ export interface RunRecord {
   finishedAt?: string;
   completionRead?: boolean;
   publication?: { head: string; destination: string; pushedAt: string; pullRequestUrl?: string };
+  cloudRelease?: import("./ui/cloud-release.ts").CloudRunRelease;
   archivedAt?: string;
   ownerPid?: number;
   checkpointStages?: string[];

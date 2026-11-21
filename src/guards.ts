@@ -9,7 +9,7 @@ export { checkCommand };
  * - any: anything inside the worktree (implementers)
  * - tests: only test files (the E2E tester)
  * - no-e2e: anything except E2E tests (UI/UX design and implementer repairs preserve existing E2E tests)
- * - none: nothing at all (planner, reviewer)
+ * - none: nothing at all (planner, reviewer, Google Cloud release specialist)
  * - docs: documentation only (docs writer)
  * - release: version fields, lockfiles, changelog and release notes (release manager)
  */

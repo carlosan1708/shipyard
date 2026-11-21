@@ -34,6 +34,7 @@ import {
   orchestrationSchema,
   specialistPrompt,
   releasePrompt,
+  cloudReleasePrompt,
   repairPrompt,
   REVIEW_SCHEMA,
   reviewerFeedbackPrompt,
@@ -62,7 +63,7 @@ class BudgetReachedError extends Error {}
 class RunStoppedError extends Error {}
 
 /** Every stage, in the order a run goes through them. */
-export const STAGES = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release"] as const;
+export const STAGES = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release", "cloud-release"] as const;
 export type StageName = (typeof STAGES)[number] | "reference" | "orchestrate" | RevisionSpecialist;
 
 const REVISION_SPECIALISTS = {
@@ -99,7 +100,7 @@ function readAssignments(value: unknown, available: readonly RevisionSpecialist[
  * changes, harden when the security audit requires fixes, and repair when the E2E tests fail.
  * triage only applies to bug runs. Plan and design don't apply to dependency runs.
  */
-export const OPTIONAL_STAGES = ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release"] as const;
+export const OPTIONAL_STAGES = ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release", "cloud-release"] as const;
 export type OptionalStage = (typeof OPTIONAL_STAGES)[number];
 /** Without a choice, runs keep the original crew. */
 export const DEFAULT_CREW: OptionalStage[] = ["e2e", "repair"];
@@ -280,6 +281,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
   const auditor = crew.has("security") ? requireRole(deps.roles, "security-auditor") : undefined;
   const docsWriter = crew.has("docs") ? requireRole(deps.roles, "docs-writer") : undefined;
   const releaser = crew.has("release") ? requireRole(deps.roles, "release-manager") : undefined;
+  const cloudReleaser = crew.has("cloud-release") ? requireRole(deps.roles, "google-cloud-releaser") : undefined;
 
   const provider = req.provider ?? deps.config.defaultProvider ?? "claude";
   if (!resume && provider === "codex" && req.budgetUsd !== undefined) throw new Error("Dollar budgets are only supported for Claude runs");
@@ -742,6 +744,14 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
       if (release.stopped) return finish("stopped");
       if (!release.passed) return finish("failed");
       await commit(release);
+    }
+    if (cloudReleaser) {
+      const cloudRelease = await runStage({
+        name: "cloud-release", role: cloudReleaser, lane: "none", readOnly: true,
+        prompt: cloudReleasePrompt(kind, request, baseSha), gates: [], maxAttempts,
+      }, run, deps);
+      if (cloudRelease.stopped) return finish("stopped");
+      if (!cloudRelease.passed) return finish("failed");
     }
     return finish("passed");
   } catch (err) {

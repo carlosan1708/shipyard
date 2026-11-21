@@ -29,6 +29,7 @@ import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermi
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
 import { createRunPullRequest, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
+import { CloudRunReleases } from "./cloud-release.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
 import { gateOk, recoverableStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
 import { changedFiles, diffSinceHead, repoRoot, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
@@ -156,6 +157,7 @@ export class RunManager {
   private readonly publications = new Map<string, Promise<void>>();
   private readonly clones = new Map<string, Promise<RepoInspection>>();
   private readonly stopResultChecks = new AbortController();
+  private readonly cloudReleases = new CloudRunReleases(this.stopResultChecks.signal);
 
   constructor(private readonly opts: ManagerOptions) {
     this.bus.setMaxListeners(100);
@@ -516,8 +518,8 @@ export class RunManager {
     const canPush = run.status === "passed" && Boolean(run.finishedAt) && Boolean(head && head !== run.baseSha) && run.branch.startsWith("shipyard/");
     const pushed = Boolean(destination && run.publication?.head === head && run.publication?.destination === destination.key);
     const pullRequestUrl = pushed ? run.publication?.pullRequestUrl : undefined;
-    const comparison = pushed && destination && head && !pullRequestUrl
-      ? await pullRequestOptions(run.repo, destination, run.branch, head, this.stopResultChecks.signal)
+    const pullRequest = pushed && destination?.repository && head && !pullRequestUrl
+      ? await pullRequestOptions(run.repo, destination.repository, head, this.stopResultChecks.signal)
       : {};
     const localApp = this.localApps.get(runId);
     const stage = target && uncommitted?.length ? recoverableStage(run) : undefined;
@@ -527,9 +529,12 @@ export class RunManager {
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,
         pushed,
-        pullRequestUrl, ...comparison,
+        pullRequestUrl, ...pullRequest,
       } : undefined,
       publishUnavailable: remotes && canPush && !destination ? "Choose one push destination by configuring origin with a single supported Git URL." : undefined,
+      canReleaseToCloudRun: Boolean(head && run.status === "passed" && run.finishedAt &&
+        run.stages.some((stage) => stage.name === "cloud-release" && stage.status === "passed")),
+      cloudRelease: run.cloudRelease,
       hasRemote: remotes === undefined ? undefined : Boolean(remotes),
       canPreview: Boolean(run.finishedAt) && ["passed", "failed"].includes(run.status) && !run.cleanedUp && canPreview(run.worktree),
       recheckStage: stage?.name,
@@ -545,6 +550,30 @@ export class RunManager {
         configuredChecks: [target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined].filter(Boolean),
       },
     };
+  }
+
+  async cloudRelease(runId: string, input: Record<string, unknown>) {
+    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    const run = this.inactiveRun(runId);
+    if (run.status !== "passed" || !run.finishedAt || !run.stages.some((stage) => stage.name === "cloud-release" && stage.status === "passed")) {
+      throw new UserError("Complete a run with the Google Cloud release specialist first");
+    }
+    const head = await git(["rev-parse", "--verify", `refs/heads/${run.branch}^{commit}`], run.repo).catch(() => undefined);
+    if (!head) throw new UserError("The run’s branch is unavailable");
+    try {
+      if (input.action === "prepare") return { review: await this.cloudReleases.prepare(runId, head, input) };
+      if (input.action !== "deploy" || input.confirm !== true) throw new Error("Review and approve the exact Cloud Run revision first.");
+      const release = await this.cloudReleases.deploy(runId, head, input.token);
+      const saved = this.store.get(runId);
+      if (saved) {
+        saved.cloudRelease = release;
+        this.store.save(saved);
+        this.store.event(runId, { type: "cloud-release-deployed", ...release });
+      }
+      return { release };
+    } catch (error) {
+      throw new UserError((error as Error).message);
+    }
   }
 
   async connectRemote(runId: string, input: unknown): Promise<void> {
@@ -569,8 +598,11 @@ export class RunManager {
     this.emit({ type: "git-remote", repo: run.repo });
   }
 
-  publish(runId: string, input: { destination?: unknown; head?: unknown }, action: "push" | "pull-request" = "push"): Promise<void> {
+  publish(runId: string, input: { destination?: unknown; head?: unknown; draft?: unknown }, action: "push" | "pull-request" = "push"): Promise<void> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    if (action === "pull-request" && input.draft !== undefined && typeof input.draft !== "boolean") {
+      throw new UserError("Draft must be true or false");
+    }
     const run = this.inactiveRun(runId);
     if (run.status !== "passed" || !run.finishedAt || !run.branch.startsWith("shipyard/")) {
       throw new UserError("Only a completed Shipyard run can publish its branch");
@@ -595,7 +627,7 @@ export class RunManager {
         if (publication.pullRequestUrl) return;
         let pullRequestUrl: string;
         try {
-          pullRequestUrl = await createRunPullRequest(run.repo, destination.repository, run.branch, head, this.stopResultChecks.signal);
+          pullRequestUrl = await createRunPullRequest(run.repo, destination.repository, run.branch, head, this.stopResultChecks.signal, input.draft === true);
         } catch (error) {
           throw new UserError((error as Error).message);
         }
@@ -903,6 +935,7 @@ export class RunManager {
     this.stopResultChecks.abort();
     for (const control of this.controls.values()) control.stop();
     await Promise.allSettled([...this.active.values(), ...this.browserChecks.values(), ...this.verifications.values(), ...this.referenceChecks.values(), ...this.publications.values(), ...this.clones.values(), ...[...this.previews.keys()].map((id) => this.stopLocalPreview(id)), ...[...this.localApps.keys()].map((id) => this.stopLocalApp(id))]);
+    await this.cloudReleases.shutdown();
   }
 
   /** Answer one inbox item. Other items, and other agents, are unaffected. */

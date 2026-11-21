@@ -14,6 +14,9 @@ test("publishing commands are blocked by default", () => {
     "gh pr create --fill",
     "gh release create v1.0.0",
     "npx vercel --prod",
+    "gcloud run services update portfolio --image example",
+    "gcloud builds submit --tag example",
+    "gcloud run services update-traffic portfolio --to-latest",
   ]) {
     assert.equal(checkCommand(cmd, {}).blocked, true, cmd);
   }

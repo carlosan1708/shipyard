@@ -160,9 +160,16 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
 
       const publishMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(publish|pull-request)$/);
       if (req.method === "POST" && publishMatch) {
-        const body = await readJson(req) as { head?: unknown; destination?: unknown };
+        const body = await readJson(req) as { head?: unknown; destination?: unknown; draft?: unknown };
         await opts.manager.publish(publishMatch[1]!, body ?? {}, publishMatch[2] === "pull-request" ? "pull-request" : "push");
         return json(res, 200, await opts.manager.result(publishMatch[1]!));
+      }
+
+      const cloudReleaseMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/cloud-release$/);
+      if (req.method === "POST" && cloudReleaseMatch) {
+        if (opts.demo) throw new UserError("Google Cloud deployment is unavailable in demo mode");
+        const body = await readJson(req) as Record<string, unknown> | null;
+        return json(res, 200, await opts.manager.cloudRelease(cloudReleaseMatch[1]!, body ?? {}));
       }
 
       const browserMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/browser-check$/);

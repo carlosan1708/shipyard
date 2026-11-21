@@ -18,6 +18,7 @@ export const PUBLISH_RULES = [
   { pattern: /\b(?:twine\s+upload|cargo\s+publish|gem\s+push)\b/, reason: "package publish" },
   { pattern: /\bgh\s+(?:pr\s+(?:create|merge)|release\s+create|repo\s+create)\b/, reason: "GitHub write" },
   { pattern: /\b(?:vercel|netlify|fly|firebase)\b.*\bdeploy\b|\bvercel\s+--prod\b/, reason: "deploy" },
+  { pattern: /\bgcloud\b[^\n;|&]*\b(?:deploy|submit|update-traffic|services\s+(?:update|replace|delete|add-iam-policy-binding|set-iam-policy))\b/, reason: "Google Cloud release" },
 ];
 
 /** Always blocked, even with SHIPYARD_ALLOW_PUBLISH=1. */
