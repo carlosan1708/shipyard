@@ -11,7 +11,7 @@ A local crew of specialist Claude Code and Codex agents that builds features and
 
 ## Layout
 
-- `src/pipeline.ts`: stage order (triage, plan, implement, design, review, revise, security, harden, e2e, repair, docs, release, cloud-release), gates (including triage's must-fail gate), judges, retries, and feedback loops. Optional stages are chosen per run with `crew`. Run kinds are feature, bug and deps. Feedback on a completed result starts a linked revision from the source branch’s latest commit, with the same provider controls and isolation as other runs.
+- `src/pipeline.ts`: stage order (triage, plan, implement, design, review, revise, security, harden, e2e, repair, docs, release, cloud-release), gates (including triage's must-fail gate), judges, retries, and feedback loops. Optional stages are chosen per run with `crew`. Run kinds are feature, bug and deps. Feedback creates a revision record and continues from the latest commit on the same branch and worktree.
 - `src/prompts.ts`: stage prompts and structured outputs, including the orchestrator’s specialist assignments for revisions. The shared pipeline validates the assignments and runs each specialist and its checks in order.
 - `src/agent.ts` and `src/codex.ts`: shared `AgentRunner` interface and both provider adapters
 - `src/run-control.ts`: interruption and steering for active runs

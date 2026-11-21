@@ -113,6 +113,7 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, {
           config: { ...opts.config, demo: Boolean(opts.demo), canAddTargets: opts.manager.canAddTargets, canCloneTargets: opts.manager.canAddTargets },
           acceptsAttachments: true,
+          feedbackReusesBranch: true,
           efforts: EFFORTS,
           codexEfforts: CODEX_EFFORTS,
           roles: opts.manager.roles(),
@@ -165,6 +166,12 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, await opts.manager.result(publishMatch[1]!));
       }
 
+      const draftMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/draft-pull-request$/);
+      if (req.method === "POST" && draftMatch) {
+        const body = (await readJson(req) ?? {}) as Parameters<RunManager["draftPullRequest"]>[1];
+        return json(res, 200, await opts.manager.draftPullRequest(draftMatch[1]!, body));
+      }
+
       const cloudReleaseMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/cloud-release$/);
       if (req.method === "POST" && cloudReleaseMatch) {
         if (opts.demo) throw new UserError("Google Cloud deployment is unavailable in demo mode");
@@ -208,6 +215,12 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 201, { id: await opts.manager.startFollowUp(feedbackMatch[1]!, body ?? {}) });
       }
 
+      const branchPreparation = url.pathname.match(/^\/api\/runs\/([\w-]+)\/prepare-branch$/);
+      if (branchPreparation && (req.method === "GET" || req.method === "POST")) {
+        const approval = req.method === "POST" ? (await readJson(req) ?? {}) as { name?: unknown; head?: unknown; base?: unknown; confirm?: unknown } : undefined;
+        return json(res, 200, await opts.manager.prepareBranch(branchPreparation[1]!, approval));
+      }
+
       const previewMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/preview$/);
       const localAppMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/local-app$/);
       if (req.method === "POST" && localAppMatch) {
@@ -225,9 +238,9 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, { stopped: true });
       }
 
-      const resumeMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(resume|recheck)$/);
+      const resumeMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(resume|recheck|fix)$/);
       if (req.method === "POST" && resumeMatch) {
-        opts.manager.resume(resumeMatch[1]!, resumeMatch[2] === "recheck");
+        opts.manager.resume(resumeMatch[1]!, resumeMatch[2] as "resume" | "recheck" | "fix");
         return json(res, 202, { accepted: true });
       }
 

@@ -848,7 +848,10 @@ test("canceling or switching providers revokes the pending native handoff", { ti
 
 test("the handoff pushes only the confirmed completed branch to the selected remote", async () => {
   const { git } = await import("../src/exec.ts");
-  const { manager, config } = await makeManager([fix]);
+  const { manager, config } = await makeManager([fix,
+    () => ({ structured: { assignments: [{ role: "backend", task: "Add a description" }] } }),
+    (req) => writeFiles(req.cwd, { "description.md": "A new description.\n" }),
+  ]);
   const server = await startUiServer({ manager, config });
   const headers = { "x-shipyard-token": server.token };
   const id = manager.start({ target: "t0", kind: "feature", request: "Publish the completed run", crew: [], checkpoints: [] });
@@ -879,6 +882,39 @@ test("the handoff pushes only the confirmed completed branch to the selected rem
     assert.equal((await readResult()).publish.pushed, true);
     assert.equal((await push(confirmation)).status, 200);
     assert.equal(manager.store.events(id).filter(({ type }) => type === "branch-pushed").length, 1);
+
+    const pullRequestUrl = "https://github.com/example/fixture/pull/42";
+    const published = manager.store.get(id)!;
+    published.publication = { ...published.publication!, pullRequestUrl };
+    manager.store.save(published);
+    writeFiles(run.worktree, { "saved-notes.txt": "Keep these edits." });
+    await assert.rejects(manager.startFollowUp(id, { message: "Add a description" }), /has saved edits/);
+    assert.equal(readFileSync(join(run.worktree, "saved-notes.txt"), "utf8"), "Keep these edits.");
+    unlinkSync(join(run.worktree, "saved-notes.txt"));
+    const submissions = await Promise.allSettled([
+      manager.startFollowUp(id, { message: "Add a description" }),
+      manager.startFollowUp(id, { message: "Add a description" }),
+    ]);
+    assert.equal(submissions.filter((submission) => submission.status === "rejected").length, 1);
+    const revisionId = submissions.find((submission) => submission.status === "fulfilled")!.value;
+    const revision = await manager.whenDone(revisionId);
+    assert.equal(revision?.status, "passed");
+    assert.equal(revision?.worktree, run.worktree);
+    assert.equal(revision?.branch, run.branch);
+    assert.equal(revision?.baseSha, ready.head);
+    const history = await readResult();
+    assert.equal(history.handoff.head, ready.head);
+    assert.equal(history.latestRevisionId, revisionId);
+    assert.equal(history.publish, undefined);
+    const update = (await manager.result(revisionId)).publish!;
+    assert.ok(update.head);
+    assert.equal(update.pullRequestUrl, pullRequestUrl);
+    assert.equal(update.pushed, false);
+    assert.equal((await push({ head: update.head, destination: update.destination })).status, 400);
+    await manager.publish(revisionId, { head: update.head, destination: update.destination });
+    assert.equal((await manager.result(revisionId)).publish?.pullRequestUrl, pullRequestUrl);
+    assert.equal(await git(["for-each-ref", "--format=%(refname)"], remote), `refs/heads/${run.branch}`);
+    assert.equal(await git(["rev-parse", `refs/heads/${run.branch}`], remote), update.head);
   } finally {
     await Promise.all([manager.shutdown(), server.close()]);
   }
@@ -913,7 +949,8 @@ test("the handoff creates a draft or regular GitHub pull request and recovers it
     const script = `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+const input = args.includes("--input") ? JSON.parse(fs.readFileSync(args[args.indexOf("--input") + 1], "utf8")) : undefined;
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(input ? [...args, input] : args) + "\\n");
 const endpoint = args[3];
 if (endpoint.includes("/git/ref/heads/")) console.log(process.env.SHIPYARD_TEST_GITHUB_HEAD);
 else if (endpoint === "repos/example/fixture") console.log("trunk");
@@ -964,12 +1001,13 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
       unlinkSync(join(fake, "created")); // Simulate the original PR closing before testing the legacy request.
       manager.store.save(saved);
       assert.equal((await create(confirmation)).status, 200);
-      const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+      const calls = readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line) as Array<string | { head: string; base: string; draft: boolean; body: string }>);
       const posts = calls.filter((args) => args.includes("POST"));
       assert.equal(posts.length, 2);
-      assert.deepEqual(posts[0]?.slice(0, 10), ["api", "--hostname", "github.com", "repos/example/fixture/pulls",
-        "--method", "POST", "-f", `head=${run.branch}`, "-f", "base=trunk"]);
-      assert.deepEqual(posts.map((args) => args[args.indexOf("-F") + 1]), ["draft=true", "draft=false"]);
+      assert.deepEqual(posts[0]?.slice(0, 7), ["api", "--hostname", "github.com", "repos/example/fixture/pulls", "--method", "POST", "--input"]);
+      const payloads = posts.map((args) => args.at(-1));
+      assert.ok(payloads.every((payload) => typeof payload === "object" && payload.head === run.branch && payload.base === "trunk" && /## Verification/.test(payload.body)));
+      assert.deepEqual(payloads.map((payload) => typeof payload === "object" && payload.draft), [true, false]);
       assert.ok(calls.some((args) => args.includes(`head=example:${run.branch}`) && args.includes("state=open")));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
@@ -980,6 +1018,107 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
       else process.env.SHIPYARD_TEST_GITHUB_COMPARISON = originalComparison;
     }
   } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("the draft PR handoff reviews unrelated histories, verifies a compatible branch, and publishes only after approval", { timeout: 60_000 }, async () => {
+  const { git } = await import("../src/exec.ts");
+  const { initRepoWithCommit } = await import("../src/worktree.ts");
+  const { manager, config } = await makeManager([fix]);
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const id = manager.start({ target: "t0", kind: "feature", request: "Fix addition", crew: [], checkpoints: [] });
+  const post = (body: object) => request(server.port, `/api/runs/${id}/draft-pull-request`, { method: "POST", headers, body });
+  const target = config.targets.t0!;
+  const defaultRepo = tempDir("sy-draft-base-");
+  const remote = tempDir("sy-draft-remote-");
+  const fake = tempDir("sy-draft-cli-");
+  const log = join(fake, "draft-created");
+  const closed = join(fake, "draft-closed");
+  const originalPath = process.env.PATH;
+  try {
+    const source = await manager.whenDone(id);
+    assert.ok(source?.status === "passed");
+    writeFiles(defaultRepo, {
+      "package.json": readFileSync(join(target.path, "package.json"), "utf8"),
+      "e2e/smoke.e2e.test.js": readFileSync(join(target.path, "e2e/smoke.e2e.test.js"), "utf8"),
+      "src/add.js": "export const add = (a, b) => a * b;\n",
+      "remote-only.md": "Keep the README from GitHub.\n",
+    });
+    await initRepoWithCommit(defaultRepo);
+    await git(["clone", "--bare", defaultRepo, remote], defaultRepo);
+    const base = await git(["rev-parse", "HEAD"], defaultRepo);
+    await git(["fetch", "--no-write-fetch-head", "--", remote, base], source.repo);
+    await git(["remote", "add", "origin", "https://github.com/example/draft-fixture"], source.repo);
+    const realGit = (await promisify(execFile)("which", ["git"])).stdout.trim();
+    writeFileSync(join(fake, "git"), `#!/usr/bin/env node
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+const origin = args.indexOf("origin");
+if (args.includes("push") && origin >= 0) args[origin] = ${JSON.stringify(remote)};
+process.exit(spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" }).status ?? 1);
+`, { mode: 0o755 });
+    const pr = "https://github.com/example/draft-fixture/pull/42";
+    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+const { execFileSync } = require("node:child_process");
+const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const args = process.argv.slice(2);
+const endpoint = args[3];
+if (endpoint === "repos/example/draft-fixture") console.log("main");
+else if (endpoint.includes("/git/ref/heads/")) {
+  const branch = decodeURIComponent(endpoint.split("/git/ref/heads/")[1]);
+  console.log(execFileSync(${JSON.stringify(realGit)}, ["rev-parse", "--verify", "refs/heads/" + branch], { cwd: ${JSON.stringify(remote)}, encoding: "utf8" }).trim());
+} else if (endpoint.includes("/compare/")) console.log("1");
+else if (endpoint.endsWith("/pulls") && args.includes("POST")) {
+  const input = readFileSync(args[args.indexOf("--input") + 1], "utf8");
+  const payload = JSON.parse(input);
+  if (payload.draft !== true || payload.base !== "main" || !payload.body.trim()) process.exit(1);
+  writeFileSync(${JSON.stringify(log)}, input);
+  console.log(${JSON.stringify(pr)});
+} else if (endpoint.endsWith("/pulls/42")) console.log(existsSync(${JSON.stringify(closed)}) ? "closed" : "open");
+else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !existsSync(${JSON.stringify(closed)})) console.log(${JSON.stringify(pr)});
+`, { mode: 0o755 });
+    process.env.PATH = `${fake}:${originalPath}`;
+    const ready = (await manager.result(id)).publish!;
+    assert.equal(ready.pushed, false);
+    assert.equal(ready.canDraftPullRequest, true);
+    const response = await post({ action: "review", head: ready.head, destination: ready.destination });
+    assert.equal(response.status, 200, response.body);
+    const { review } = JSON.parse(response.body);
+    assert.equal(review.base.head, base);
+    assert.deepEqual(review.transplant.conflicts, ["src/add.js"]);
+    assert.match(review.description, /## Summary[\s\S]*src\/add\.js[\s\S]*## Verification[\s\S]*npm run e2e/);
+    assert.equal(await git(["branch", "--list", review.branch], source.repo), "");
+    assert.equal(await git(["branch", "--list", review.branch], remote), "");
+    assert.equal((await post({ action: "create", token: "stale" })).status, 400);
+    assert.equal((await post({ action: "create", token: review.token, description: " \n " })).status, 400);
+    const originalTest = target.test;
+    target.test = "false";
+    assert.match((await post({ action: "create", token: review.token })).body, /failed on the proposed draft branch/);
+    target.test = originalTest;
+    assert.equal(await git(["branch", "--list", review.branch], remote), "");
+    const description = "## Summary\n\nFix numeric addition.\n\n## Verification\n\n- Unit and integration checks passed.\n";
+    const approved = await post({ action: "create", token: review.token, description });
+    assert.equal(approved.status, 200, approved.body);
+    assert.equal(JSON.parse(approved.body).result.publish.pullRequestUrl, pr);
+    const run = manager.store.get(id)!;
+    assert.equal(run.branch, review.branch);
+    assert.equal(await git(["rev-parse", "HEAD^"], run.worktree), base);
+    assert.equal(await git(["rev-parse", `refs/heads/${run.branch}`], remote), run.publication?.head);
+    assert.equal(await git(["rev-parse", `refs/heads/${source.branch}`], source.repo), ready.head);
+    assert.match(readFileSync(join(run.worktree, "remote-only.md"), "utf8"), /Keep the README/);
+    assert.match(readFileSync(join(run.worktree, "src/add.js"), "utf8"), /Number\(a\) \+ Number\(b\)/);
+    assert.deepEqual(run.verification?.checks.map(({ code }) => code), [0, 0]);
+    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, description);
+    writeFileSync(closed, "closed");
+    const handoff = (await manager.result(id)).publish;
+    assert.equal(handoff?.pullRequestUrl, undefined);
+    assert.equal(handoff?.closedPullRequestUrl, pr);
+    assert.equal(handoff?.canDraftPullRequest, true);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
     await Promise.all([manager.shutdown(), server.close()]);
   }
 });
@@ -1237,7 +1376,7 @@ test("feedback retrieves references and routes through a read-only orchestrator 
     assert.match(req.prompt, /Validate project data before rendering/);
     assert.doesNotMatch(req.prompt, /Improve the presentation of the cards/);
     assert(!existsSync(join(req.cwd, "planner-stray.txt")));
-    writeFiles(req.cwd, { "validation.js": "export const isProjectList = Array.isArray;\n" });
+    writeFiles(req.cwd, { "validation.js": `export const isProjectList = Array.isArray;\n// ${req.role.name} revision ${existsSync(join(req.cwd, "validation.js")) ? "2" : "1"}\n` });
   };
   const design: Step = (req) => {
     assert.equal(req.role.name, "ui-ux");
@@ -1245,7 +1384,7 @@ test("feedback retrieves references and routes through a read-only orchestrator 
     assert.match(req.prompt, /Improve the presentation of the cards/);
     assert(existsSync(join(req.cwd, "validation.js")));
     assert.equal(req.resumeSessionId, undefined);
-    writeFiles(req.cwd, { "design.css": "body { color: navy; }\n" });
+    writeFiles(req.cwd, { "design.css": `body { color: ${existsSync(join(req.cwd, "design.css")) ? "teal" : "navy"}; }\n` });
   };
   const invalidPlan: Step = () => ({ structured: { assignments: [assignments[0], assignments[0]] } });
   const claude = new FakeRunner([fix, orchestrator, backend, design, invalidPlan, invalidPlan]);
@@ -1255,7 +1394,8 @@ test("feedback retrieves references and routes through a read-only orchestrator 
   const server = await startUiServer({ manager, config, token });
   const id = manager.start({ target: "t0", kind: "feature", request: "Original portfolio brief", referenceUrls: [linkedin], crew: [], checkpoints: [] });
   const headers = { "x-shipyard-token": token };
-  const send = (body: object) => request(server.port, `/api/runs/${id}/feedback`, { method: "POST", headers, body });
+  let sourceId = id;
+  const send = (body: object) => request(server.port, `/api/runs/${sourceId}/feedback`, { method: "POST", headers, body });
   try {
     const parent = await manager.whenDone(id);
     assert.ok(parent?.status === "passed");
@@ -1269,7 +1409,7 @@ test("feedback retrieves references and routes through a read-only orchestrator 
     assert.equal(savedReference.status, 200);
     assert.equal(manager.store.get(id)?.references?.[0]?.status, "read");
     writeFiles(parent.worktree, { "source.html": "<h1>Portfolio</h1>" });
-    const parentTip = await commitAll(parent.worktree, "Refine the source locally");
+    let parentTip = await commitAll(parent.worktree, "Refine the source locally");
     assert.ok(parentTip);
     assert.equal((await send({ message: "   " })).status, 400);
     assert.equal((await send({ message: "Change it", provider: "unknown" })).status, 400);
@@ -1288,14 +1428,17 @@ test("feedback retrieves references and routes through a read-only orchestrator 
       assert.equal(manager.store.get(childId)?.stages.length, 0);
       const handoff = manager.openReferenceHandoff(childId, { url: linkedin, itemId: item.id }, server.port);
       assert.equal(new URL(handoff.href).protocol, `${provider}:`);
+      const handoffTicket = handoff.prompt.match(/\b[0-9a-f]{48}\b/)?.[0];
+      assert.ok(handoffTicket);
+      manager.returnReferenceHandoff(handoffTicket, { status: "ready", text: linkedinNotes, coverage: ["Experience"], missing: [] });
       manager.answer(item.id, { kind: "reference", action: "share", text: linkedinNotes });
       const revision = await manager.whenDone(childId);
       assert.equal(revision?.status, "passed");
       assert.equal(revision?.provider, provider);
-      assert.notEqual(revision?.branch, parent.branch);
-      assert.notEqual(revision?.worktree, parent.worktree);
+      assert.equal(revision?.branch, parent.branch);
+      assert.equal(revision?.worktree, parent.worktree);
       assert.equal(revision?.baseSha, parentTip);
-      assert.equal(revision?.followUp?.runId, parent.id);
+      assert.equal(revision?.followUp?.runId, sourceId);
       assert.equal(revision?.followUp?.orchestrated, true);
       const savedFile = revision?.followUp?.attachments?.find(({ name }) => name === "profile-notes.txt");
       assert.ok(savedFile);
@@ -1307,8 +1450,10 @@ test("feedback retrieves references and routes through a read-only orchestrator 
       assert.deepEqual(revision?.stages[0]?.attempts[0]?.revertedFiles, ["planner-stray.txt"]);
       assert.deepEqual(revision?.stages.slice(1).map((stage) => stage.attempts[0]?.gates.map((gate) => gate.code)), [[0, 0], [0, 0]]);
       assert.ok(revision?.stages.slice(1).every((stage) => stage.commit));
+      sourceId = childId;
+      parentTip = await git(["rev-parse", "HEAD"], parent.worktree);
     }
-    const invalid = await send({ message: "Improve the result" });
+    const invalid = await send({ message: "Improve the result", provider: "claude" });
     const failed = await manager.whenDone(JSON.parse(invalid.body).id);
     assert.equal(failed?.status, "failed");
     assert.match(failed?.error ?? "", /valid revision plan/);
@@ -1343,15 +1488,16 @@ test("rechecking a failed revision verifies saved edits and continues the same r
     assert.match(readFileSync(join(req.cwd, "e2e/metric.sh"), "utf8"), /18%/);
     writeFiles(req.cwd, { "README.md": "The corrected metric is 18%.\n" });
   };
-  const claude = new FakeRunner([fix, plan, update, docs]);
-  const codex = new FakeRunner([plan, update, docs]);
+  const unsuccessfulRepair: Step = () => ({ summary: "Could not repair the failed check." });
+  const claude = new FakeRunner([fix, plan, update, unsuccessfulRepair, docs]);
+  const codex = new FakeRunner([fix, plan, update, unsuccessfulRepair, docs]);
   const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
   const server = await startUiServer({ manager, config });
   const headers = { "x-shipyard-token": server.token };
-  const parentId = manager.start({ target: "t0", kind: "feature", request: "Prepare the portfolio", crew: [], checkpoints: [] });
   try {
-    assert.equal((await manager.whenDone(parentId))?.status, "passed");
     for (const [provider, runner] of [["claude", claude], ["codex", codex]] as const) {
+      const parentId = manager.start({ target: "t0", kind: "feature", request: "Prepare the portfolio", provider, crew: [], checkpoints: [] });
+      assert.equal((await manager.whenDone(parentId))?.status, "passed");
       const id = await manager.startFollowUp(parentId, { message: "Use 18% for the metric", provider });
       const failed = await manager.whenDone(id);
       assert.ok(failed && failed.status === "failed");
@@ -1392,6 +1538,139 @@ test("rechecking a failed revision verifies saved edits and continues the same r
       assert.equal(await git(["status", "--porcelain"], failed.worktree), "");
     }
     assert.match(readFileSync(join(target.path, "e2e/metric.sh"), "utf8"), /50%/);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("frontend revisions repair in place, with a dashboard retry when automatic repair cannot finish", { timeout: 30_000 }, async () => {
+  const { git } = await import("../src/exec.ts");
+  const { commitAll } = await import("../src/worktree.ts");
+  const { config } = await makeManager([]);
+  config.maxGateRetries = 0;
+  const target = config.targets.t0!;
+  target.test = "true";
+  target.e2e = "sh e2e/title.sh";
+  const check = (title: string) => `grep -Fq '${title}' index.html || { echo "Expected title: ${title}"; exit 1; }\n`;
+  writeFiles(target.path, { "index.html": "<h1>Original title</h1>", "e2e/title.sh": check("Original title") });
+  await commitAll(target.path, "Add the original title and its test");
+  const plan: Step = () => ({ structured: { assignments: [{ role: "frontend", task: "Change the heading" }] } });
+  const frontend: Step = (req) => {
+    assert.equal(req.lane, "no-e2e");
+    writeFiles(req.cwd, { "index.html": "<h1>Updated title</h1>" });
+  };
+  const repair: Step = (req) => {
+    assert.equal(req.role.name, "backend");
+    assert.equal(req.lane, "any");
+    assert.equal(req.resumeSessionId, undefined);
+    assert.match(req.prompt, /Expected title: Original title/);
+    assert.match(readFileSync(join(req.cwd, "index.html"), "utf8"), /Updated title/);
+    writeFiles(req.cwd, { "e2e/title.sh": check("Updated title") });
+  };
+  const requestDecision: Step = async (req) => {
+    assert.equal(req.role.name, "backend");
+    const answer = await req.ask!({ kind: "permission", tool: "WebFetch", input: { url: "https://example.com" } });
+    assert.deepEqual(answer, { kind: "permission", allow: true, message: undefined });
+    return repair(req);
+  };
+  const unsuccessfulRepair: Step = (req) => {
+    assert.equal(req.role.name, "backend");
+    return { summary: "The check still fails." };
+  };
+  const claude = new FakeRunner([fix, plan, frontend, requestDecision, fix, plan, frontend, unsuccessfulRepair, repair]);
+  const codex = new FakeRunner([fix, plan, frontend, repair, fix, plan, frontend, unsuccessfulRepair, repair]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const startParent = async (provider: "claude" | "codex") => {
+    const id = manager.start({ target: "t0", kind: "feature", request: "Prepare the portfolio", provider, crew: [], checkpoints: [] });
+    assert.equal((await manager.whenDone(id))?.status, "passed");
+    return id;
+  };
+  try {
+    for (const provider of ["claude", "codex"] as const) {
+      const id = await manager.startFollowUp(await startParent(provider), { message: "Use Updated title as the heading", provider });
+      if (provider === "claude") {
+        const inboxOrCompletion = await Promise.race([nextItem(manager, (item) => item.runId === id), manager.whenDone(id)]);
+        assert.ok(inboxOrCompletion && "kind" in inboxOrCompletion && inboxOrCompletion.kind === "permission");
+        const repairing = manager.store.get(id);
+        assert.equal(repairing?.status, "running");
+        assert.equal(repairing?.stages.at(-1)?.autoRepair?.command, "sh e2e/title.sh");
+        manager.answer(inboxOrCompletion.id, { kind: "permission", decision: "allow" });
+      }
+      const automatic = await manager.whenDone(id);
+      assert.equal(automatic?.status, "passed", automatic?.error ?? "Automatic repair did not pass");
+      const repairedStage = automatic?.stages.at(-1);
+      assert.deepEqual(repairedStage?.autoRepair, { command: "sh e2e/title.sh", afterAttempt: 1 });
+      assert.deepEqual(repairedStage?.attempts.map(({ passed, role }) => [passed, role]), [[false, undefined], [true, "backend"]]);
+      assert.match(await git(["show", "HEAD:e2e/title.sh"], automatic!.worktree), /Updated title/);
+
+      const retryId = await manager.startFollowUp(await startParent(provider), { message: "Still use Updated title as the heading", provider });
+      const failed = await manager.whenDone(retryId);
+      assert.equal(failed?.status, "failed");
+      assert.equal(failed?.stages.at(-1)?.attempts.length, 2);
+      assert.equal((await manager.result(retryId)).canFixRevision, true);
+      const accepted = await request(server.port, `/api/runs/${retryId}/fix`, { method: "POST", headers });
+      assert.equal(accepted.status, 202, accepted.body);
+      const recovered = await manager.whenDone(retryId);
+      assert.equal(recovered?.status, "passed", recovered?.error ?? "The repair did not complete");
+      assert.equal(recovered?.id, retryId);
+      assert.equal(recovered?.worktree, failed?.worktree);
+      assert.deepEqual(recovered?.stages.map((stage) => stage.name), ["orchestrate", "frontend"]);
+      assert.equal(recovered?.stages.at(-1)?.attempts.at(-1)?.role, "backend");
+      assert.match(await git(["show", "HEAD:e2e/title.sh"], recovered!.worktree), /Updated title/);
+    }
+    assert.match(readFileSync(join(target.path, "e2e/title.sh"), "utf8"), /Original title/);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("a Git-only revision can review and create a verified squashed branch from the dashboard", async () => {
+  const { git } = await import("../src/exec.ts");
+  const plan: Step = () => ({ structured: { assignments: [{ role: "backend", task: "Handle the feedback" }] } });
+  const noEdits: Step = () => ({ summary: "This request changes Git history." });
+  const { manager, config } = await makeManager([fix, plan,
+    (req) => writeFiles(req.cwd, { "notes.md": "Portfolio notes.\n" }), plan, noEdits, noEdits,
+  ]);
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const sourceId = manager.start({ target: "t0", kind: "feature", request: "Prepare the portfolio", crew: [], checkpoints: [] });
+  try {
+    const source = await manager.whenDone(sourceId);
+    assert.ok(source?.status === "passed");
+    const addNotes = await manager.startFollowUp(sourceId, { message: "Add portfolio notes" });
+    assert.equal((await manager.whenDone(addNotes))?.status, "passed");
+    const id = await manager.startFollowUp(addNotes, { message: "Rename the branch and squash its commits" });
+    const failed = await manager.whenDone(id);
+    assert.ok(failed?.status === "failed");
+    assert.equal((await manager.result(id)).canPrepareBranch, true);
+    const route = `/api/runs/${id}/prepare-branch`;
+    const read = await request(server.port, route, { headers });
+    assert.equal(read.status, 200);
+    const { plan } = JSON.parse(read.body);
+    assert.equal(plan.base, source.baseSha);
+    assert.equal(plan.commits, 2);
+    const oldTree = await git(["rev-parse", `${plan.head}^{tree}`], source.repo);
+    const approve = (override: object = {}) => request(server.port, route, { method: "POST", headers,
+      body: { name: "portfolio-update", confirm: true, head: plan.head, base: plan.base, ...override } });
+    assert.equal((await approve({ head: source.baseSha })).status, 400);
+    const target = config.targets.t0!;
+    const originalTest = target.test;
+    target.test = "false";
+    assert.match((await approve()).body, /project check failed/i);
+    target.test = originalTest;
+    assert.equal(await git(["branch", "--list", "shipyard/portfolio-update"], source.repo), "");
+    const prepared = await approve();
+    assert.equal(prepared.status, 200, prepared.body);
+    const run = manager.store.get(id)!;
+    assert.equal(run.id, id);
+    assert.equal(run.branch, "shipyard/portfolio-update");
+    assert.equal(run.status, "passed");
+    assert.equal(await git(["rev-list", "--count", `${plan.base}..HEAD`], run.worktree), "1");
+    assert.equal(await git(["rev-parse", "HEAD^{tree}"], run.worktree), oldTree);
+    assert.equal(await git(["rev-parse", "HEAD"], failed.worktree), plan.head);
+    assert.deepEqual(run.verification?.checks.map((gate) => gate.code), [0, 0]);
   } finally {
     await Promise.all([manager.shutdown(), server.close()]);
   }

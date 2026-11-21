@@ -1,15 +1,18 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { git } from "../exec.ts";
 
 const exec = promisify(execFile);
 
-interface Destination {
+export interface Destination {
   remote: string;
   label: string;
   key: string;
+  url: string;
   repository?: string;
 }
 
@@ -38,7 +41,7 @@ export async function pushDestination(repo: string, remotes: string): Promise<De
   const safeRepo = cleanPath && /^[\w.-]+(?:\/[\w.-]+)+$/.test(cleanPath) ? cleanPath : undefined;
   const github = host === "github.com" && safeRepo && /^[a-z\d][a-z\d-]*\/(?!\.{1,2}$)[\w.-]+$/i.test(safeRepo)
     ? `https://github.com/${safeRepo}` : undefined;
-  return { remote, label: safeRepo ? `${host}/${safeRepo}` : host, key: createHash("sha256").update(`${remote}\0${urls}`).digest("hex"), repository: github };
+  return { remote, label: safeRepo ? `${host}/${safeRepo}` : host, key: createHash("sha256").update(`${remote}\0${urls}`).digest("hex"), url: urls, repository: github };
 }
 
 export async function pushRunCommit(repo: string, destination: Destination, branch: string, head: string, signal: AbortSignal): Promise<void> {
@@ -66,7 +69,9 @@ export async function pushRunCommit(repo: string, destination: Destination, bran
   }
 }
 
-class PullRequestComparisonError extends Error {}
+class PullRequestComparisonError extends Error {
+  constructor(readonly reason: "unrelated" | "no-changes", message: string) { super(message); }
+}
 
 function githubApi(repo: string, signal: AbortSignal, timeout: number) {
   return async (...args: string[]) => (await exec("gh", ["api", "--hostname", "github.com", ...args], {
@@ -75,16 +80,60 @@ function githubApi(repo: string, signal: AbortSignal, timeout: number) {
   })).stdout.trim();
 }
 
+function githubHead(api: ReturnType<typeof githubApi>, path: string, branch: string) {
+  const ref = branch.split("/").map(encodeURIComponent).join("/");
+  return api(`${path}/git/ref/heads/${ref}`, "--jq", ".object.sha");
+}
+
+export async function linkedPullRequestState(repo: string, repository: string, link: string, signal: AbortSignal): Promise<"open" | "closed" | undefined> {
+  const url = URL.canParse(link) ? new URL(link) : undefined;
+  const number = url?.pathname.split("/").at(-1);
+  if (!number || !/^[1-9]\d*$/.test(number) || `${repository}/pull/${number}` !== link) return;
+  const path = `repos/${new URL(repository).pathname.slice(1)}/pulls/${number}`;
+  const state = await githubApi(repo, signal, 3000)(path, "--jq", ".state").catch(() => undefined);
+  return state === "open" || state === "closed" ? state : undefined;
+}
+
+export async function draftBase(repo: string, repository: string, signal: AbortSignal) {
+  const api = githubApi(repo, signal, 12_000);
+  const path = `repos/${new URL(repository).pathname.slice(1)}`;
+  try {
+    const branch = await api(path, "--jq", ".default_branch");
+    const head = await githubHead(api, path, branch);
+    if (!branch || !/^[a-f0-9]{40}$/.test(head)) throw new Error("GitHub returned an invalid base branch");
+    return { branch, head };
+  } catch (error) {
+    const failure = error as { code?: string; stderr?: string };
+    if (failure.code === "ENOENT" || /HTTP 401|gh auth login|bad credentials/i.test(failure.stderr ?? "")) {
+      throw new Error("Sign in to GitHub on this computer, then review the draft again.");
+    }
+    throw new Error("Shipyard couldn’t read the default branch on GitHub. Check the repository connection and try again.");
+  }
+}
+
+export async function fetchDraftBase(repo: string, destination: Destination, head: string, signal: AbortSignal): Promise<void> {
+  if (await git(["cat-file", "-e", `${head}^{commit}`], repo).then(() => true, () => false)) return;
+  try {
+    await exec("git", ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",
+      "fetch", "--no-tags", "--no-write-fetch-head", "--", destination.url, head], {
+      cwd: repo, signal, timeout: 30_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "Never" },
+    });
+  } catch {
+    throw new Error("Shipyard couldn’t fetch the reviewed commit from GitHub. Check the repository connection and try again.");
+  }
+}
+
 async function pullRequestBase(api: ReturnType<typeof githubApi>, apiPath: string, head: string): Promise<string> {
   const base = await api(apiPath, "--jq", ".default_branch");
   if (!base) throw new Error("GitHub did not return the default branch");
   try {
     const ahead = await api(`${apiPath}/compare/${encodeURIComponent(base)}...${head}`,
       "--method", "GET", "-F", "per_page=1", "--jq", ".ahead_by");
-    if (ahead === "0") throw new PullRequestComparisonError("The branch has no commits to merge into the repository’s default branch.");
+    if (ahead === "0") throw new PullRequestComparisonError("no-changes", "The branch has no commits to merge into the repository’s default branch.");
   } catch (error) {
     if (/no common ancestor/i.test((error as { stderr?: string }).stderr ?? "")) {
-      throw new PullRequestComparisonError("The run branch and GitHub’s default branch have unrelated histories. Apply the run’s changes to a new branch based on the GitHub default branch.");
+      throw new PullRequestComparisonError("unrelated", "The run branch and GitHub’s default branch have unrelated histories. Shipyard can prepare a compatible branch for a draft PR.");
     }
     throw error;
   }
@@ -92,19 +141,21 @@ async function pullRequestBase(api: ReturnType<typeof githubApi>, apiPath: strin
 }
 
 export async function pullRequestOptions(repo: string, repository: string, head: string, signal: AbortSignal):
-  Promise<{ canCreatePullRequest?: true; pullRequestUnavailable?: string }> {
+  Promise<{ canCreatePullRequest?: true; pullRequestUnavailable?: string; pullRequestBlocked?: "unrelated" | "no-changes" }> {
   const apiPath = `repos/${new URL(repository).pathname.slice(1)}`;
   const api = githubApi(repo, signal, 3_000);
   try {
     await pullRequestBase(api, apiPath, head);
   } catch (error) {
-    if (error instanceof PullRequestComparisonError) return { pullRequestUnavailable: error.message };
+    if (error instanceof PullRequestComparisonError) return { pullRequestUnavailable: error.message, pullRequestBlocked: error.reason };
     // Let the explicit creation request report authentication or connection errors.
   }
   return { canCreatePullRequest: true };
 }
 
-export async function createRunPullRequest(repo: string, repository: string, branch: string, head: string, signal: AbortSignal, draft = false): Promise<string> {
+export async function createRunPullRequest(repo: string, repository: string, branch: string, head: string, signal: AbortSignal,
+  options: { draft: boolean; description: string; reviewedBase?: { branch: string; head: string } }): Promise<string> {
+  const { draft, description, reviewedBase } = options;
   const slug = new URL(repository).pathname.slice(1);
   const apiPath = `repos/${slug}`;
   const api = githubApi(repo, signal, 30_000);
@@ -117,18 +168,26 @@ export async function createRunPullRequest(repo: string, repository: string, bra
   };
   let pullRequestUrl: string | undefined;
   try {
-    const ref = branch.split("/").map(encodeURIComponent).join("/");
-    const remoteHead = await api(`${apiPath}/git/ref/heads/${ref}`, "--jq", ".object.sha");
+    const remoteHead = await githubHead(api, apiPath, branch);
     if (remoteHead !== head) throw new Error("remote head changed");
     const existing = await api(`${apiPath}/pulls`, "--method", "GET",
       "-f", `head=${slug.split("/")[0]}:${branch}`, "-f", "state=open", "--jq", ".[].html_url");
     pullRequestUrl = existing.split("\n").map(confirmedUrl).find(Boolean);
     if (!pullRequestUrl) {
       const base = await pullRequestBase(api, apiPath, head);
+      if (reviewedBase && (base !== reviewedBase.branch || await githubHead(api, apiPath, base) !== reviewedBase.head)) {
+        throw new Error("reviewed base changed");
+      }
       const title = await git(["show", "-s", "--format=%s", head], repo);
-      const created = await api(`${apiPath}/pulls`, "--method", "POST", "-f", `head=${branch}`, "-f", `base=${base}`,
-        "-f", `title=${title || branch}`, "-F", `draft=${draft}`, "--jq", ".html_url");
-      pullRequestUrl = confirmedUrl(created);
+      const directory = await mkdtemp(join(tmpdir(), "shipyard-pr-"));
+      try {
+        const input = join(directory, "pull-request.json");
+        await writeFile(input, JSON.stringify({ head: branch, base, title: title || branch, draft, body: description }), { mode: 0o600 });
+        const created = await api(`${apiPath}/pulls`, "--method", "POST", "--input", input, "--jq", ".html_url");
+        pullRequestUrl = confirmedUrl(created);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
     }
   } catch (error) {
     if (error instanceof PullRequestComparisonError) throw error;
@@ -137,6 +196,7 @@ export async function createRunPullRequest(repo: string, repository: string, bra
     if (failure.message === "remote head changed") {
       throw new Error("GitHub’s branch no longer matches the pushed commit. Check the branch on GitHub before creating a pull request.");
     }
+    if (failure.message === "reviewed base changed") throw new Error("GitHub’s default branch moved. Review the draft against the current base.");
     if (signal.aborted || failure.killed) throw new Error("The GitHub request did not finish. Try again to find or create the pull request.");
     if (failure.code === "ENOENT") throw new Error("Install GitHub CLI (gh) and sign in with gh auth login to create pull requests from Shipyard.");
     if (/gh auth login|HTTP 401|bad credentials/i.test(message)) throw new Error("Sign in to GitHub CLI with gh auth login, then try again.");

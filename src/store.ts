@@ -1,4 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TokenUsage } from "./agent.ts";
 import type { FeedbackAttachment } from "./attachments.ts";
@@ -37,6 +38,7 @@ export const gateOk = (g: GateRecord): boolean => (g.expectFailure ? g.code !== 
 
 export interface AttemptRecord {
   attempt: number;
+  role?: string;
   rechecked?: boolean;
   provider?: Provider;
   interrupted?: "stopped" | "redirected" | "interrupted";
@@ -72,9 +74,18 @@ export function recoverableStage(run: RunRecord): StageRecord | undefined {
   if (stage.attempts.some((attempt) => !attempt.interrupted && attempt.gates.some((gate) => !gate.expectFailure && !gateOk(gate)))) return stage;
 }
 
+export function repairableRevisionStage(run: RunRecord): StageRecord | undefined {
+  const stage = recoverableStage(run);
+  if (run.followUp?.orchestrated && stage && canRepairRevisionRole(stage.name)) return stage;
+}
+
+export const canRepairRevisionRole = (role: string): boolean => ["frontend", "ui-ux", "backend"].includes(role);
+
 export interface StageRecord {
   name: string;
   role: string;
+  repairRole?: string;
+  autoRepair?: { command: string; afterAttempt: number };
   status: "running" | "passed" | "failed" | "stopped";
   attempts: AttemptRecord[];
   commit?: string;
@@ -108,6 +119,8 @@ export interface RunRecord {
   branch: string;
   worktree: string;
   baseSha: string;
+  /** The fork point of the shared branch, before any rounds of feedback. */
+  branchBaseSha?: string;
   followUp?: RunFollowUp;
   attachments?: FeedbackAttachment[];
   provider?: Provider;
@@ -140,6 +153,33 @@ export class RunStore {
 
   dir(runId: string): string {
     return join(this.runsDir, runId);
+  }
+
+  /** Reserve a branch while starting a revision, including across dashboard processes. */
+  claimBranch(run: RunRecord): (() => void) | undefined {
+    const lockDir = join(this.runsDir, ".branch-locks");
+    mkdirSync(lockDir, { recursive: true });
+    const key = createHash("sha256").update(`${run.repo}\0${run.branch}`).digest("hex");
+    const lock = join(lockDir, key);
+    const owner = String(process.pid);
+    try {
+      const previous = readlinkSync(lock);
+      try {
+        process.kill(Number(previous), 0);
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+      if (readlinkSync(lock) === previous) rmSync(lock, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    try {
+      symlinkSync(owner, lock);
+      return () => rmSync(lock, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
   }
 
   save(run: RunRecord): void {

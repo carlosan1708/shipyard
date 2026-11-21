@@ -120,6 +120,28 @@
       </form>
     </dialog>
 
+    <dialog class="dialog" id="draft-pr-dialog" aria-labelledby="draft-pr-title">
+      <form class="dialog-body" id="draft-pr-form">
+        <h2 id="draft-pr-title">Create draft pull request</h2>
+        <p class="field-help" id="draft-pr-status" role="status"></p>
+        <dl class="run-result-facts" id="draft-pr-facts" hidden></dl>
+        <div id="draft-pr-conflicts" hidden>
+          <p class="field-help">These files changed on both branches. Approving uses the verified run’s versions.</p>
+          <ul id="draft-pr-conflict-files" class="handoff-list mono"></ul>
+        </div>
+        <label class="field" id="draft-pr-description-field" hidden>
+          <span class="field-label">Description</span>
+          <textarea id="draft-pr-description" rows="9" maxlength="32000" aria-describedby="draft-pr-description-help" required disabled></textarea>
+          <span class="field-help" id="draft-pr-description-help">Review the changes and checks. You can edit this Markdown before it goes to GitHub.</span>
+        </label>
+        <p class="form-error" id="draft-pr-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="draft-pr-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="draft-pr-submit" disabled>Approve and create draft PR</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="dialog" id="publish-dialog" aria-labelledby="publish-title">
       <form method="dialog" class="dialog-body" id="publish-form">
         <h2 id="publish-title">Push branch</h2>
@@ -166,10 +188,27 @@
       </form>
     </dialog>
 
+    <dialog class="dialog" id="branch-preparation-dialog" aria-labelledby="branch-preparation-title">
+      <form class="dialog-body" id="branch-preparation-form">
+        <h2 id="branch-preparation-title">Create a squashed branch</h2>
+        <p class="field-help" id="branch-preparation-plan" role="status"></p>
+        <label class="field">
+          <span class="field-label">Branch name after <code>shipyard/</code></span>
+          <input id="branch-preparation-name" type="text" required maxlength="80" pattern="[a-z0-9][a-z0-9\-]*">
+        </label>
+        <p class="field-help">Shipyard verifies the project before creating one commit with the same files. It keeps the original branch as a backup.</p>
+        <p class="form-error" id="branch-preparation-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="branch-preparation-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="branch-preparation-submit" disabled>Verify and create branch</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="dialog" id="feedback-dialog" aria-labelledby="feedback-title">
       <form method="dialog" class="dialog-body" id="feedback-form">
         <h2 id="feedback-title">Give feedback</h2>
-        <p class="field-help" id="feedback-context">This starts a new revision run linked to the completed run, using its latest commit. Include any GitHub or LinkedIn links in your feedback. Shipyard asks for browser help in Needs you when needed.</p>
+        <p class="field-help" id="feedback-context">The crew starts from the latest commit and keeps working on this branch. Push the verified changes to update any open pull request.</p>
         <label class="field">
           <span class="field-label">What should change?</span>
           <textarea id="feedback-message" rows="6" maxlength="8000" required aria-describedby="feedback-context" placeholder="Describe what to change, what to keep, and how you’ll know it’s right."></textarea>
@@ -187,7 +226,7 @@
         <p class="form-error" id="feedback-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="btn btn-ghost" id="feedback-cancel">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="feedback-submit">Start revision run</button>
+          <button type="submit" class="btn btn-primary" id="feedback-submit">Start revision</button>
         </div>
       </form>
     </dialog>

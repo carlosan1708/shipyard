@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lstat } from "node:fs/promises";
 import { git, gitAllowing } from "./exec.ts";
@@ -37,6 +37,32 @@ export async function diffSinceHead(cwd: string): Promise<WorktreeDiff> {
 
 /** Commits made by shipyard are authored by a bot identity, so provenance is obvious in `git log`. */
 const BOT = ["-c", "user.name=shipyard", "-c", "user.email=shipyard@localhost"];
+
+/** Write one commit with the exact final tree and the requested base as its parent. */
+export function squashCommit(repo: string, head: string, base: string, message: string): Promise<string> {
+  return commitTree(repo, `${head}^{tree}`, base, message);
+}
+
+export function commitTree(repo: string, tree: string, parent: string, message: string): Promise<string> {
+  return git([...BOT, "commit-tree", tree, "-p", parent, "-m", message], repo);
+}
+
+/** A temporary checkout for preparing or verifying a GitHub-compatible branch. */
+export async function detachedWorktree(repo: string, root: string, head: string) {
+  mkdirSync(root, { recursive: true });
+  const dir = mkdtempSync(join(root, "draft-pr-"));
+  const worktree = join(dir, "worktree");
+  try {
+    await git(["-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach", worktree, head], repo);
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+  return { worktree, close: async () => {
+    await removeWorktree(repo, worktree);
+    rmSync(dir, { recursive: true, force: true });
+  } };
+}
 
 export async function repoRoot(path: string): Promise<string> {
   try {

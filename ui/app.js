@@ -64,6 +64,8 @@ const state = {
   browserPending: new Set(),
   verificationPending: new Set(),
   pullRequestPending: new Map(),
+  draftReview: null,
+  branchPreparation: null,
   wasDown: false,
 };
 
@@ -425,6 +427,7 @@ async function loadState() {
   const s = await api("/api/state");
   state.config = s.config;
   state.acceptsAttachments = s.acceptsAttachments === true;
+  state.feedbackReusesBranch = s.feedbackReusesBranch === true;
   state.stages = s.stages;
   state.efforts = s.efforts;
   state.codexEfforts = s.codexEfforts;
@@ -524,6 +527,11 @@ function connect() {
   on("run", ({ run }) => {
     const previous = state.runs.get(run.id);
     state.runs.set(run.id, run);
+    if (run.followUp && (!previous || previous.branch !== run.branch)) {
+      for (const other of state.runs.values()) {
+        if (other.repo === run.repo && (other.branch === run.branch || other.branch === previous?.branch)) state.results.delete(other.id);
+      }
+    }
     if (previous?.finishedAt !== run.finishedAt) {
       state.results.delete(run.id);
       if (run.finishedAt && !run.completionRead && completionLabel(run)) notifyCompletion(run);
@@ -537,6 +545,12 @@ function connect() {
   on("run-deleted", ({ runId }) => {
     const dialog = $("reference-handoff-dialog");
     if (dialog.open && $("reference-handoff-form").dataset.runId === runId) dialog.close();
+    const removed = state.runs.get(runId);
+    if (removed) {
+      for (const other of state.runs.values()) {
+        if (other.repo === removed.repo && other.branch === removed.branch) state.results.delete(other.id);
+      }
+    }
     forgetRun(runId);
   });
   on("preview", ({ runId, url }) => {
@@ -803,7 +817,12 @@ function renderDetail() {
   const result = run.finishedAt && completionLabel(run) ? finishedResult(run.id) : undefined;
   const recovery = result && (run.status === "failed" || run.status === "error" || result.recheckStage);
   const checking = recovery && (state.verificationPending.has(run.id) || result.savedEditsCheck === "checking");
-  const badge = recovery ? checking ? "Checking saved edits" : result.savedEditsCheck === "passed" ? "Ready to continue" : "Action needed" : STATUS_LABEL[status] ?? status;
+  const lastStage = run.stages.at(-1);
+  const repairInProgress = run.status === "running" && lastStage?.status === "running" && lastStage.repairRole;
+  const repairing = repairInProgress && status === "running";
+  const repairNeedsYou = repairInProgress && status === "waiting";
+  const badge = recovery ? checking ? "Checking saved edits" : result.savedEditsCheck === "passed" ? "Ready to continue" : "Action needed" :
+    repairing ? "Repairing" : repairNeedsYou ? "Repair needs you" : STATUS_LABEL[status] ?? status;
   const events = state.events.get(run.id);
   const focused = document.activeElement;
   const restoreHandoff = root.contains(focused) && focused.id === "run-handoff";
@@ -817,6 +836,10 @@ function renderDetail() {
       { class: "run-head" },
       h("div", { class: "run-head-top" }, h("h1", { text: run.followUp ? "Revision" : run.request }), h("span", { class: `pill s-${recovery ? "waiting" : status}`, text: badge })),
       recovery ? recoveryHandoff(run, result, checking) : null,
+      repairing ? h("p", { class: "banner", role: "status" },
+        lastStage.autoRepair ? `The crew is repairing the ${lastStage.autoRepair.command} failure in this revision.` : "The crew is repairing the failed check in this revision.",
+        " Shipyard will rerun the checks. No action is needed right now.",
+      ) : null,
       run.followUp ? h("div", { class: "feedback-brief" },
         h("strong", { text: "Your feedback" }),
         h("p", { text: run.request }),
@@ -846,13 +869,14 @@ function renderDetail() {
       ? h(
           "div",
           { class: "banner", role: "status" },
-          waiting[0].kind === "reference" ? `${waiting.length === 1 ? "1 reference needs" : `${waiting.length} references need`} your input in Needs you.` :
+          repairNeedsYou ? "The crew is waiting for your decision before it can continue the repair." :
+            waiting[0].kind === "reference" ? `${waiting.length === 1 ? "1 reference needs" : `${waiting.length} references need`} your input in Needs you.` :
             `${waiting.length === 1 ? "An agent is" : `${waiting.length} agents are`} waiting for your answer`,
           h("button", { type: "button", class: "btn btn-sm", onclick: () => focusItem(waiting[0].id) }, "Review"),
         )
       : null,
     result ? runResult(run, result, recovery) : null,
-    run.finishedAt ? runActions(run) : null,
+    run.finishedAt ? runActions(run, Boolean(result?.latestRevisionId)) : null,
     renderPipeline(run, assignments),
     assignments.length ? details(`${run.id}:assignments`, "Specialist assignments", h("ol", { class: "revision-assignments" },
       assignments.map(({ role, task }) => h("li", {}, h("strong", { text: roleLabel(role) }), h("p", { text: task }))),
@@ -923,17 +947,26 @@ function runResult(run, result, recovery) {
       run.cleanedUp ? "Empty worktree removed" : result.handoff?.uncommittedCount ?
         `${result.handoff.uncommittedCount} file${result.handoff.uncommittedCount === 1 ? "" : "s"} with saved edits` : `${commits} local commit${commits === 1 ? "" : "s"}`,
     ].join(" · ") }),
+    result.latestRevisionId ? h("p", { text: "This is an earlier result on the same branch." }) : null,
+    run.status === "passed" && run.stages.some((stage) => stage.repairRole && stage.attempts.at(-1)?.role === stage.repairRole)
+      ? h("p", { text: "The crew repaired a failed check and verified this revision." }) : null,
     !run.cleanedUp ? h("dl", { class: "run-result-facts" },
       h("dt", { text: "Branch" }), h("dd", { class: "mono", text: run.branch }),
-      run.status === "passed" ? [h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
+      run.status === "passed" && !result.latestRevisionId ? [h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
         h("span", { text: gitStatus }),
         result.hasRemote === false ? button("Connect Git remote", () => openGitRemote(run)) : null,
-        publication && !publication.pushed ? button("Push branch", () => openPublish(run, publication)) : null,
+        publication?.canDraftPullRequest && !publication.pullRequestUrl ? h("button", {
+          type: "button", class: "btn btn-primary btn-sm", text: "Create draft PR", onclick: () => openDraftReview(run.id, publication),
+          disabled: pendingPullRequest !== undefined,
+        }) : null,
+        publication?.closedPullRequestUrl ? h("a", { class: "btn btn-sm", href: publication.closedPullRequestUrl,
+          target: "_blank", rel: "noopener noreferrer", text: "View closed PR" }) : null,
+        publication && !publication.pushed ? button(publication.pullRequestUrl ? "Push updates" : "Push branch", () => openPublish(run, publication)) : null,
         publication?.pullRequestUrl ? h("a", {
           class: "btn btn-primary btn-sm", href: publication.pullRequestUrl, target: "_blank", rel: "noopener noreferrer", text: "Open PR on GitHub",
         }) : publication?.canCreatePullRequest ? [
-          h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pendingPullRequest !== undefined,
-            text: pendingPullRequest === true ? "Creating draft PR…" : "Create draft PR", onclick: () => createPullRequest(run.id, publication, true) }),
+          !publication.canDraftPullRequest ? h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pendingPullRequest !== undefined,
+            text: pendingPullRequest === true ? "Creating draft PR…" : "Create draft PR", onclick: () => createPullRequest(run.id, publication, true) }) : null,
           button(pendingPullRequest === false ? "Creating PR…" : "Create PR on GitHub",
             () => createPullRequest(run.id, publication, false), pendingPullRequest !== undefined),
         ] : publication?.pullRequestUnavailable ? h("span", { text: publication.pullRequestUnavailable }) : null,
@@ -943,7 +976,9 @@ function runResult(run, result, recovery) {
     result.cloudRelease ? h("p", { class: "field-help", text: `Cloud Run recorded revision ${result.cloudRelease.revision} for run commit ${result.cloudRelease.head.slice(0, 12)}. It had no traffic when verified.` }) : null,
     h("div", { class: "run-result-actions" },
       result.canReleaseToCloudRun && !state.config?.demo ? button("Review Cloud Run release", () => openCloudRelease(run.id)) : null,
-      run.status === "passed" && !run.cleanedUp ? button("Give feedback", () => openFeedback(run)) : null,
+      result.latestRevisionId ? button("View latest revision", () => select(result.latestRevisionId)) : null,
+      (result.canGiveFeedback ?? (run.status === "passed" && !run.cleanedUp && !result.loading)) && !recovery
+        ? button("Give feedback", () => openFeedback(run)) : null,
       !recovery && !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
       result.localApp?.url ? [
         h("a", { class: "btn btn-primary btn-sm", href: result.localApp.url, target: "_blank", rel: "noopener noreferrer", text: "Open local app" }),
@@ -972,32 +1007,44 @@ function recoveryHandoff(run, result, checking) {
   const stage = run.stages.findLast((entry) => entry.status === "failed" || entry.status === "stopped");
   const attempt = stage?.attempts.findLast((entry) => !entry.interrupted);
   const ready = result.savedEditsCheck === "passed";
+  const canFix = result.canFixRevision && !ready;
+  const autoRepair = stage?.autoRepair;
   const recentFailure = result.savedEditsCheck === "failed" ? run.verification?.checks.find((gate) => !gateOk(gate)) : undefined;
-  const failure = recentFailure ?? attempt?.gates.find((gate) => !gateOk(gate));
+  const failure = recentFailure ?? attempt?.gates.find((gate) => !gateOk(gate)) ??
+    (autoRepair && stage.attempts.find((entry) => entry.attempt === autoRepair.afterAttempt)?.gates.find((gate) => !gateOk(gate)));
   const hint = failure?.outputTail?.split("\n").map((line) => line.trim())
     .find((line) => /^(?:AssertionError|(?:[\w]+)?Error:|fatal:)/i.test(line));
   const busy = state.resuming.has(run.id) || state.active.has(run.id);
   const source = state.runs.get(run.followUp?.runId);
   const saved = result.handoff?.uncommittedCount;
+  const olderDashboard = !state.acceptsAttachments && saved && failure && !result.recheckStage;
   const previewBusy = state.previewPending.has(run.id);
   const choose = (label, onclick, primary = false, disabled = false) =>
     h("button", { type: "button", class: `btn btn-sm${primary ? " btn-primary" : ""}`, text: label, onclick, disabled });
   return h("section", { class: `run-recovery${ready ? " is-ready" : ""}`, "aria-label": "Next step" },
     h("h2", { id: "run-handoff", tabindex: "-1", text: checking ? "Checking your saved edits" : ready ? "Checks passed. Ready to continue." :
-      recentFailure ? "A check still needs a fix" : "The run paused after a failure" }),
+      result.canPrepareBranch ? "This revision needs a Git change" : autoRepair ? "The repair couldn’t finish" : recentFailure ? "A check still needs a fix" : "The run paused after a failure" }),
     !checking && !ready && (failure || run.error) ? h("p", { class: "recovery-reason" },
       failure ? h("strong", { text: `${failure.command} ${failure.timedOut ? "timed out" : "failed"}` }) : null,
       run.error || hint ? h("span", { text: run.error || hint.slice(0, 280) }) : null) : null,
     h("p", { role: "status", text: checking ? "Shipyard is running the checks. No action is needed right now." :
       result.loading ? "Loading your available actions…" : ready ? `You can review the edits or continue. Continuing commits them after a final check and resumes any remaining stages with ${providerLabel(run.provider)}.` :
+      result.canPrepareBranch ? "Review a new branch name and combine the existing commits. Shipyard will verify the project before creating the branch." :
+      olderDashboard ? "This tab is connected to an older Shipyard server. Open the current dashboard to recover this revision." :
+      autoRepair && canFix ? `Shipyard tried to repair ${autoRepair.command}. Retry to have ${providerLabel(run.provider)} pick up this revision and rerun its checks.` :
+      canFix ? `Ask the crew to fix the failure and rerun the checks using ${providerLabel(run.provider)}. It will pick up this revision and its saved edits.` :
       recentFailure ? "Your edits are still saved. Open the check details to see what failed, then check again after it’s fixed." :
       result.recheckStage ? "Start with Check saved edits. It runs the project checks and leaves the revision and its files as they are." :
+      result.canGiveFeedback ? "Give the crew updated instructions to continue on the same branch." :
       saved ? "Your edits are saved locally. Open the check details or copy the worktree path to inspect them." :
       source ? "Open the source run to review the last completed version." : "Review the failure before trying again." }),
     h("div", { class: "run-result-actions" },
+      canFix && !checking ? choose(busy ? "Starting repair…" : stage?.repairRole ? "Retry repair" : "Ask the crew to fix it", () => resumeRun(run.id, "fix"), true, busy) : null,
+      result.canPrepareBranch && !checking ? choose("Review branch cleanup", () => openBranchPreparation(run), true, busy) : null,
+      result.canGiveFeedback && !canFix && !checking ? choose("Give feedback", () => openFeedback(run), !result.canPrepareBranch, busy) : null,
       result.recheckStage && !checking ? ready
-        ? choose(busy ? "Continuing…" : "Continue this run", () => resumeRun(run.id, true), true, busy)
-        : choose(recentFailure ? "Check saved edits again" : "Check saved edits", () => verifyRunResult(run.id), true, busy)
+        ? choose(busy ? "Continuing…" : "Continue this run", () => resumeRun(run.id, "recheck"), true, busy)
+        : choose(recentFailure ? "Check saved edits again" : "Check saved edits", () => verifyRunResult(run.id), !canFix, busy)
         : null,
       result.previewUrl ? [
         h("a", { class: "btn btn-sm", href: result.previewUrl, target: "_blank", rel: "noopener noreferrer", text: "Open local preview" }),
@@ -1056,7 +1103,7 @@ function renderHandoff(run, result, checks) {
         const excerpt = (sections.get("delivered") ?? summary).split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#"));
         const intro = excerpt?.replace(/^[-*]\s+/, "").replace(/\*\*|`/g, "");
         return details(`${run.id}:report:${stage.name}`, h("span", { class: "handoff-report-line" },
-          h("strong", { text: roleLabel(stage.role) }),
+          h("strong", { text: roleLabel(stage.repairRole ?? stage.role) }),
           intro ? h("span", { class: "muted", text: intro.length > 160 ? `${intro.slice(0, 157)}…` : intro }) : null,
         ), h("div", { class: "handoff-report md" }, md(summary)));
       }) : h("p", { class: "muted", text: "No specialist report was recorded." }),
@@ -1241,8 +1288,8 @@ function renderLane(run, stage, events) {
     h(
       "header",
       { class: "lane-head" },
-      avatar(stage.role),
-      h("div", { class: "lane-title" }, h("strong", { text: roleLabel(stage.role) }), h("span", { text: `${stage.name} stage` })),
+      avatar(stage.repairRole ?? stage.role),
+      h("div", { class: "lane-title" }, h("strong", { text: roleLabel(stage.repairRole ?? stage.role) }), h("span", { text: `${stage.name} stage` })),
       h(
         "div",
         { class: "lane-stats" },
@@ -2226,7 +2273,7 @@ function toast(message, bad = false) {
   setTimeout(() => el.remove(), 6000);
 }
 
-function runActions(run) {
+function runActions(run, historical = false) {
   const active = (state.active.has(run.id) || !state.runs.has(run.id)) && run.status === "running";
   const button = (label, handler, style = "btn-ghost", disabled = false) => h("button", {
     type: "button", class: `btn btn-sm ${style}`, text: label, onclick: handler, disabled,
@@ -2240,7 +2287,7 @@ function runActions(run) {
         state.config?.demo ? null : button(`Switch to ${providerLabel(nextProvider)}`, () => openRunControl(run.id, nextProvider), "btn-ghost", stopping),
       ]
     : [
-        !run.cleanedUp && (run.status === "stopped" || run.status === "running")
+        !historical && !run.cleanedUp && (run.status === "stopped" || run.status === "running")
           ? button(state.resuming.has(run.id) ? "Resuming…" : "Resume run", () => resumeRun(run.id), "btn-primary", state.active.has(run.id) || state.resuming.has(run.id))
           : null,
         button(run.archivedAt ? "Restore run" : "Archive run", () => archiveRun(run.id, !run.archivedAt), "btn-ghost", state.active.has(run.id)),
@@ -2248,12 +2295,12 @@ function runActions(run) {
       ]);
 }
 
-async function resumeRun(id, recheck = false) {
+async function resumeRun(id, action = "resume") {
   if (state.resuming.has(id)) return;
   state.resuming.add(id);
   schedule("detail");
   try {
-    await api(`/api/runs/${id}/${recheck ? "recheck" : "resume"}`, { method: "POST" });
+    await api(`/api/runs/${id}/${action}`, { method: "POST" });
     if (state.selected === id) state.showArchived = false;
   } catch (error) {
     toast(error.message, true);
@@ -2362,6 +2409,10 @@ function wireRunControls() {
 }
 
 function openFeedback(run) {
+  if (!state.feedbackReusesBranch) {
+    toast("Open the current Shipyard dashboard to revise this branch.", true);
+    return;
+  }
   $("feedback-form").dataset.runId = run.id;
   $("feedback-message").value = "";
   $("feedback-attachments").value = "";
@@ -2555,6 +2606,118 @@ function openPublish(run, publication) {
   $("publish-submit").focus();
 }
 
+function openDraftReview(runId, publication) {
+  const view = { runId, review: null };
+  state.draftReview = view;
+  $("draft-pr-dialog").showModal();
+  void loadDraftReview(view, publication);
+}
+
+async function loadDraftReview(view, publication) {
+  const dialog = $("draft-pr-dialog");
+  const submit = $("draft-pr-submit");
+  const status = $("draft-pr-status");
+  const error = $("draft-pr-error");
+  const facts = $("draft-pr-facts");
+  const conflicts = $("draft-pr-conflicts");
+  const description = $("draft-pr-description");
+  view.review = null;
+  submit.disabled = true;
+  error.hidden = facts.hidden = conflicts.hidden = true;
+  $("draft-pr-description-field").hidden = true;
+  description.disabled = true;
+  status.textContent = "Checking the branch and GitHub destination…";
+  submit.textContent = "Approve and create draft PR";
+  try {
+    if (!publication) {
+      const result = await api(`/api/runs/${view.runId}/result`);
+      if (!dialog.open || state.draftReview !== view) return;
+      state.results.set(view.runId, result);
+      publication = result.publish;
+      if (publication?.pullRequestUrl) {
+        dialog.close();
+        schedule("detail");
+        toast("Pull request ready");
+        return;
+      }
+      if (!publication) throw new Error("The handoff no longer has a GitHub branch to publish.");
+    }
+    const { review } = await api(`/api/runs/${view.runId}/draft-pull-request`, { method: "POST",
+      body: { action: "review", head: publication.head, destination: publication.destination } });
+    if (!dialog.open || state.draftReview !== view) return;
+    view.review = review;
+    description.value = view.description ?? review.description;
+    description.disabled = false;
+    $("draft-pr-description-field").hidden = false;
+    facts.replaceChildren(...[
+      ["Repository", new URL(review.repository).pathname.slice(1)], ["Base", `${review.base.branch} · ${review.base.head.slice(0, 12)}`], ["Branch", review.branch],
+    ].flatMap(([label, value]) => [h("dt", { text: label }), h("dd", { class: "mono", text: value })]));
+    facts.hidden = false;
+    if (review.transplant?.conflicts.length) {
+      $("draft-pr-conflict-files").replaceChildren(...review.transplant.conflicts.map((file) => h("li", { text: file })));
+      conflicts.hidden = false;
+    }
+    status.textContent = review.transplant
+      ? "Shipyard will verify a new branch based on GitHub’s default branch, push it, and open a draft. The original branch is available as a backup."
+      : "Shipyard will push the verified commit if needed and open a draft pull request.";
+    submit.disabled = false;
+    submit.focus();
+  } catch (err) {
+    if (!dialog.open || state.draftReview !== view) return;
+    status.textContent = "";
+    error.textContent = err.message;
+    error.hidden = false;
+    submit.textContent = "Review again";
+    submit.disabled = false;
+  }
+}
+
+function wireDraftReview() {
+  const dialog = $("draft-pr-dialog");
+  const cancel = $("draft-pr-cancel");
+  const submit = $("draft-pr-submit");
+  const error = $("draft-pr-error");
+  const status = $("draft-pr-status");
+  const description = $("draft-pr-description");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (cancel.disabled) event.preventDefault(); });
+  $("draft-pr-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const view = state.draftReview;
+    if (!view || submit.disabled) return;
+    if (!view.review) return loadDraftReview(view);
+    if (!description.value.trim()) {
+      error.textContent = "Enter a description for the pull request.";
+      error.hidden = false;
+      description.focus();
+      return;
+    }
+    view.description = description.value;
+    description.disabled = true;
+    submit.disabled = cancel.disabled = true;
+    error.hidden = true;
+    status.textContent = view.review.transplant ? "Verifying the compatible branch and opening the draft…" : "Opening the draft pull request…";
+    try {
+      const { result } = await api(`/api/runs/${view.runId}/draft-pull-request`, { method: "POST",
+        body: { action: "create", token: view.review.token, description: view.description } });
+      state.results.set(view.runId, result);
+      dialog.close();
+      toast("Draft pull request ready");
+    } catch (err) {
+      state.results.delete(view.runId);
+      view.review = null;
+      status.textContent = "";
+      error.textContent = err.message;
+      error.hidden = false;
+      submit.textContent = "Review again";
+    } finally {
+      description.disabled = !view.review;
+      cancel.disabled = submit.disabled = false;
+      schedule("detail");
+    }
+  });
+}
+
 async function createPullRequest(runId, { destination, head }, draft) {
   if (state.pullRequestPending.has(runId)) return;
   state.pullRequestPending.set(runId, draft);
@@ -2723,6 +2886,68 @@ function wireGitRemote() {
   });
 }
 
+async function openBranchPreparation(run) {
+  const dialog = $("branch-preparation-dialog");
+  const planText = $("branch-preparation-plan");
+  const error = $("branch-preparation-error");
+  const submit = $("branch-preparation-submit");
+  const name = $("branch-preparation-name");
+  state.branchPreparation = { runId: run.id };
+  planText.textContent = "Reading the commits on this branch…";
+  name.value = "";
+  submit.disabled = true;
+  error.hidden = true;
+  dialog.showModal();
+  const opening = state.branchPreparation;
+  try {
+    const { plan } = await api(`/api/runs/${run.id}/prepare-branch`);
+    if (state.branchPreparation !== opening || !dialog.open) return;
+    opening.plan = plan;
+    planText.textContent = `Combine ${plan.commits} commit${plan.commits === 1 ? "" : "s"} into one, based on ${plan.base.slice(0, 8)}.`;
+    name.value = plan.name;
+    submit.disabled = false;
+    name.focus();
+  } catch (err) {
+    if (state.branchPreparation !== opening || !dialog.open) return;
+    planText.textContent = "";
+    error.textContent = err.message;
+    error.hidden = false;
+  }
+}
+
+function wireBranchPreparation() {
+  const dialog = $("branch-preparation-dialog");
+  const cancel = $("branch-preparation-cancel");
+  const submit = $("branch-preparation-submit");
+  const error = $("branch-preparation-error");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (cancel.disabled) event.preventDefault(); });
+  $("branch-preparation-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const { runId, plan } = state.branchPreparation ?? {};
+    if (!plan || submit.disabled) return;
+    cancel.disabled = submit.disabled = true;
+    submit.textContent = "Verifying…";
+    error.hidden = true;
+    try {
+      const { run } = await api(`/api/runs/${runId}/prepare-branch`, { method: "POST", body: {
+        name: $("branch-preparation-name").value.trim(), head: plan.head, base: plan.base, confirm: true,
+      } });
+      state.runs.set(runId, run);
+      state.results.delete(runId);
+      dialog.close();
+      schedule();
+      toast("Squashed branch verified and ready.");
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+    } finally {
+      cancel.disabled = submit.disabled = false;
+      submit.textContent = "Verify and create branch";
+    }
+  });
+}
+
 function wireFeedback() {
   const dialog = $("feedback-dialog");
   const button = $("feedback-submit");
@@ -2811,9 +3036,11 @@ async function main() {
   wireNewRun();
   wireAddRepo();
   wireRunControls();
+  wireBranchPreparation();
   wireFeedback();
   wireGitRemote();
   wirePublish();
+  wireDraftReview();
   wireCloudRelease();
   wireReferenceHandoff();
   try {

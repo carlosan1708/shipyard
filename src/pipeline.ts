@@ -49,7 +49,7 @@ import {
 import { requireRole, type Role } from "./roles.ts";
 import type { RunControl } from "./run-control.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, sharedReference, type ReferenceCheck, type ReferenceReview } from "./references.ts";
-import { gateOk, type AttemptRecord, type GateRecord, type RunFollowUp, type RunKind, type RunRecord, type RunStatus, type RunStore, type StageRecord } from "./store.ts";
+import { canRepairRevisionRole, gateOk, type AttemptRecord, type GateRecord, type RunFollowUp, type RunKind, type RunRecord, type RunStatus, type RunStore, type StageRecord } from "./store.ts";
 import { changedFiles, commitAll, createWorktree, removeWorktree, repoRoot, revertFiles, worktreeSnapshot } from "./worktree.ts";
 
 /** Agent stops that still deserve grading: the agent ran out of room, but may have done the work. */
@@ -143,6 +143,7 @@ export interface PipelineDeps {
   runnerForProvider?: (provider: Provider) => AgentRunner;
   control?: RunControl;
   recheckStage?: string;
+  repairStage?: string;
   store: RunStore;
   roles: Map<string, Role>;
   log?: (line: string) => void;
@@ -166,6 +167,7 @@ export interface PipelineRequest {
   id?: string;
   resume?: RunRecord;
   followUp?: RunFollowUp;
+  continueBranch?: Pick<RunRecord, "repo" | "branch" | "worktree" | "baseSha" | "branchBaseSha" | "publication">;
   browserAccess?: boolean;
   referenceUrls?: string[];
   browserReferenceHelp?: boolean;
@@ -187,6 +189,7 @@ interface AgentSession { provider: Provider; id: string }
 interface StageSpec {
   name: StageName;
   role: Role;
+  repairing?: boolean;
   lane: Lane;
   prompt: string;
   gates: string[];
@@ -251,7 +254,7 @@ interface StageOutcome {
  *   [docs]     docs-writer (docs only)        ---------------------------------> [checkpoint] --> commit
  *   [release]  release-manager (versions)     --gate: unit tests---------------> [checkpoint] --> commit
  *
- * Every stage runs in an isolated git worktree on its own branch. Gates are run by the
+ * Each branch has an isolated Git worktree shared by its feedback revisions. Gates are run by the
  * pipeline itself, never trusted from the agent's own report. A failed gate is fed back
  * to the same agent session, up to maxGateRetries times. With checkpoints on, a human
  * reviews each stage's result and can approve it, send feedback into the agent's session,
@@ -259,7 +262,7 @@ interface StageOutcome {
  */
 export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Promise<RunRecord> {
   const log = deps.log ?? (() => {});
-  const { target, kind, request, resume } = req;
+  const { target, kind, request, resume, continueBranch } = req;
   const referenceUrls = resume ? resume.referenceUrls ?? [] : parseReferencePermissions(req.referenceUrls);
   const followUp = resume?.followUp ?? req.followUp;
   const orchestrator = followUp?.orchestrated ? requireRole(deps.roles, "orchestrator") : undefined;
@@ -289,17 +292,21 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
   const model = req.model ?? defaults.model;
   const id = resume?.id ?? req.id ?? makeRunId(request);
   const repo = await repoRoot(target.path);
-  const worktree = resume?.worktree ?? join(deps.config.worktreeRoot, id);
-  const branch = resume?.branch ?? `shipyard/${id}`;
-  const baseSha = resume?.baseSha ?? await createWorktree(repo, worktree, branch, followUp?.baseSha);
+  const worktree = (resume ?? continueBranch)?.worktree ?? join(deps.config.worktreeRoot, id);
+  const branch = (resume ?? continueBranch)?.branch ?? `shipyard/${id}`;
+  const baseSha = (resume ?? continueBranch)?.baseSha ?? await createWorktree(repo, worktree, branch, followUp?.baseSha);
 
-  if (resume) {
-    const expectedHead = [...resume.stages].reverse().find((stage) => stage.commit)?.commit ?? baseSha;
-    const head = await git(["rev-parse", "HEAD"], worktree).catch(() => "");
-    const checkedOut = await git(["symbolic-ref", "HEAD"], worktree).catch(() => "");
-    if (repo !== resume.repo || head !== expectedHead || checkedOut !== `refs/heads/${branch}`) {
+  const existing = resume ?? continueBranch;
+  if (existing) {
+    const expectedHead = resume?.stages.findLast((stage) => stage.commit)?.commit ?? baseSha;
+    const [head, checkedOut] = await Promise.all([
+      git(["rev-parse", "HEAD"], worktree).catch(() => ""),
+      git(["symbolic-ref", "HEAD"], worktree).catch(() => ""),
+    ]);
+    if (repo !== existing.repo || head !== expectedHead || checkedOut !== `refs/heads/${branch}`) {
       throw new Error("The original worktree or branch has changed since Shipyard recorded it.");
     }
+    if (continueBranch && (await changedFiles(worktree)).length) throw new Error("There are saved edits in this branch’s worktree. Feedback was not started.");
   }
 
   const run: RunRecord = resume ? { ...resume, status: "running", ownerPid: process.pid, finishedAt: undefined, archivedAt: undefined, error: undefined } : {
@@ -316,6 +323,8 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     branch,
     worktree,
     baseSha,
+    branchBaseSha: continueBranch?.branchBaseSha,
+    publication: continueBranch?.publication,
     followUp,
     attachments: req.attachments,
     browserAccess: req.browserAccess ?? target.browserAccess,
@@ -448,14 +457,41 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
         return finish("failed");
       }
       const browserRole = assignments.findLast(({ role }) => role !== "docs-writer" && role !== "e2e-tester")?.role ?? assignments.at(-1)?.role;
+      const gates = target.e2e ? [target.test, target.e2e] : [target.test];
       for (const { role, task } of assignments) {
-        const outcome = await runStage({
+        const saved = resume?.stages.find((stage) => stage.name === role);
+        const spec: StageSpec = {
           name: role, role: requireRole(deps.roles, role), lane: REVISION_SPECIALISTS[role], maxAttempts,
-          prompt: specialistPrompt(request, target, followUp.brief, task),
-          gates: target.e2e ? [target.test, target.e2e] : [target.test],
+          prompt: specialistPrompt(request, target, followUp.brief, task), gates,
           browserCheck: target.browserCheck && role === browserRole,
           allowNoChanges: role === "docs-writer" || role === "dependency-updater",
+        };
+        const repair = (failure: GateRecord | undefined, attempts: number) => runStage({
+          ...spec, role: requireRole(deps.roles, "backend"), lane: "any", repairing: true, maxAttempts: attempts,
+          prompt: [
+            spec.prompt,
+            "Repair the failed check in the existing worktree. Preserve the requested behavior and unrelated saved edits. If the feedback explicitly changes a value the test asserts, update that expectation and keep the coverage. Fix application behavior when the test still reflects the user's request.",
+            "Carry out the diagnosis and repair yourself. Ask the user only for a required permission or a decision you cannot infer from their feedback. Shipyard will run the required checks after your repair.",
+            failure ? gateFailurePrompt({ ...failure, output: failure.outputTail }) : "",
+          ].filter(Boolean).join("\n\n"),
         }, run, deps);
+        const manualRepair = deps.repairStage === role;
+        let outcome: StageOutcome;
+        if (manualRepair || saved?.repairRole) {
+          const failure = saved?.attempts.findLast((attempt) => !attempt.interrupted && attempt.gates.some((gate) => !gateOk(gate)))
+            ?.gates.find((gate) => !gateOk(gate));
+          outcome = await repair(failure, saved?.autoRepair && !manualRepair ? 1 : maxAttempts);
+        } else {
+          outcome = await runStage(spec, run, deps);
+          const attempt = outcome.record.attempts.at(-1);
+          const failure = attempt?.gates.find((gate) => !gateOk(gate) && gates.includes(gate.command));
+          if (attempt && failure && !attempt.rechecked && !outcome.passed && !outcome.stopped && !outcome.replayed &&
+              !outOfBudget(run) && canRepairRevisionRole(role)) {
+            outcome.record.autoRepair = { command: failure.command, afterAttempt: attempt.attempt };
+            log(`  automatically repairing \`${failure.command}\` in ${role}`);
+            outcome = await repair(failure, 1);
+          }
+        }
         if (outcome.stopped) return finish("stopped");
         if (!outcome.passed) return finish("failed");
         await commit(outcome);
@@ -764,7 +800,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     log(`  error: ${run.error}`);
     // Don't leave an empty branch and worktree behind in the target repo for a run that produced nothing.
     if (
-      !resume && run.stages.every((s) => !s.commit) &&
+      !existing && run.stages.every((s) => !s.commit) &&
       (await changedFiles(worktree).catch(() => ["?"])).length === 0 &&
       (await git(["rev-parse", "HEAD"], worktree).catch(() => "")) === baseSha &&
       (await git(["symbolic-ref", "HEAD"], worktree).catch(() => "")) === `refs/heads/${branch}`
@@ -875,10 +911,12 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   const stage: StageRecord = previous ?? { name: spec.name, role: spec.role.name, status: "running", attempts: [] };
   if (!previous) run.stages.push(stage);
   stage.status = "running";
+  if (spec.repairing) stage.repairRole = spec.role.name;
   deps.store.save(run);
 
   const reviewed = deps.checkpoints?.stages.includes(spec.name) ?? false;
-  let session = sessionFor(last) ?? spec.resumeSession;
+  const freshRepair = spec.repairing && (deps.repairStage === spec.name || last?.role !== spec.role.name);
+  let session = freshRepair ? undefined : sessionFor(last) ?? spec.resumeSession;
   const deliveredImages = new Set<string>();
   let prompt = spec.prompt;
   let summary = last?.summary ?? "";
@@ -897,7 +935,9 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
       // A provider session from an earlier attempt can be used only if it matches the interrupted turn.
       session = sessionId ? { provider, id: sessionId } : session?.provider === provider ? session : undefined;
     }
-    prompt = `${spec.prompt}\n\nResume the interrupted stage on the existing worktree. Inspect any changes already present before continuing. A previous question may need to be asked again.`;
+    if (!spec.repairing) {
+      prompt = `${spec.prompt}\n\nResume the interrupted stage on the existing worktree. Inspect any changes already present before continuing. A previous question may need to be asked again.`;
+    }
   }
   let lastFailure: ExecResult | undefined;
   let judgeFeedback: string | undefined;
@@ -1044,6 +1084,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
 
     const base = {
       attempt,
+      ...(spec.repairing ? { role: spec.role.name } : {}),
       provider,
       sessionId: result.sessionId,
       agentOk: result.ok,

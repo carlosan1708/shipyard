@@ -18,8 +18,9 @@ The scripted crew adds `GET /health` to the bundled demo shop. Watch it ask abou
 | --- | --- |
 | **Keep your workspace free for other work** | Each run starts from committed Git history in its own worktree. Your current checkout stays available while the crew works. |
 | **See why a change is ready** | The dashboard brings together diffs, agent activity, checkpoint decisions, and the results of your repository’s test commands. |
-| **Stay involved when it matters** | Approve checkpoints, give feedback, or stop and resume. You can switch providers in the same worktree with a fresh agent session. |
-| **Recover after a failed check** | **Check saved edits** runs the project checks without committing. When they pass, **Continue this run** saves the verified edits and resumes the same run. |
+| **Stay involved when it matters** | Approve checkpoints, give feedback on the same branch, or stop and resume. You can switch providers in the same worktree with a fresh agent session. |
+| **Recover after a failed check** | When an implementation specialist exhausts its retries on a revision’s project check, Shipyard tries one full-stack repair and reruns the checks in the same worktree. If the repair needs another attempt, use **Retry repair**. **Check saved edits** runs the checks without committing, and **Continue this run** saves verified edits and resumes the run. |
+| **Recover a Git-only revision** | **Review branch cleanup** previews the commits and asks for a branch name. After you approve, Shipyard runs the configured checks and creates a squashed branch with the original available as a backup. |
 
 ## Quick start
 
@@ -51,7 +52,7 @@ The TypeScript pipeline controls stage order, retries, and checkpoints. Provider
 
 ## Publish from the dashboard
 
-- **GitHub draft PRs.** Sign in with `gh auth login`. In a completed run’s handoff, push the branch and choose **Create draft PR**. Shipyard opens the draft against GitHub’s default branch when the branches share Git history. If the run branch already has an open PR, Shipyard links it. [GitHub handoff controls](docs/reference.md#dashboard-controls)
+- **GitHub draft PRs.** Sign in with `gh auth login`. In a completed run’s handoff, choose **Create draft PR** to review the destination and edit a description based on the changes and checks. Approve the push and draft together. For unrelated histories, review how Shipyard will apply the run’s changes to GitHub’s current default branch and verify the result. Shipyard links an existing open PR when available. [GitHub handoff controls](docs/reference.md#dashboard-controls)
 - **Cloud Run releases.** Add **Google Cloud release** to the crew to get a read-only release plan. In the handoff, choose **Review Cloud Run release** and supply an existing single-container service and an Artifact Registry image pinned to a digest. Review the signed-in Google Cloud account, destination, and permissions before approving a new revision with zero traffic. [Cloud Run prerequisites and permissions](docs/reference.md#google-cloud-releases)
 
 ## How AI accelerates development

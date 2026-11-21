@@ -19,6 +19,7 @@ import {
   type CheckpointDecision,
   type Implementer,
   type OptionalStage,
+  type PipelineDeps,
   type PipelineRequest,
   type StageName,
 } from "../pipeline.ts";
@@ -28,11 +29,12 @@ import { git, sh } from "../exec.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, validReferenceText, type ReviewedReference } from "../references.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
-import { createRunPullRequest, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
+import { createRunPullRequest, draftBase, fetchDraftBase, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
+import { describePullRequest, markdownCode, MAX_PULL_REQUEST_DESCRIPTION, reviewDraftBranch, type DraftReview } from "./draft-pr.ts";
 import { CloudRunReleases } from "./cloud-release.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
-import { gateOk, recoverableStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
-import { changedFiles, diffSinceHead, repoRoot, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
+import { gateOk, recoverableStage, repairableRevisionStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
+import { changedFiles, commitTree, createWorktree, detachedWorktree, diffSinceHead, repoRoot, squashCommit, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
 
 /** Everything the UI is told about, as it happens. */
 export type LiveMessage =
@@ -155,6 +157,7 @@ export class RunManager {
   private readonly referenceChecks = new Map<string, Promise<RunRecord>>();
   private readonly referenceHandoffs = new ReferenceHandoffs();
   private readonly publications = new Map<string, Promise<void>>();
+  private readonly draftReviews = new Map<string, DraftReview>();
   private readonly clones = new Map<string, Promise<RepoInspection>>();
   private readonly stopResultChecks = new AbortController();
   private readonly cloudReleases = new CloudRunReleases(this.stopResultChecks.signal);
@@ -289,12 +292,13 @@ export class RunManager {
     }, req.checkpoints, id);
   }
 
-  resume(runId: string, recheck = false): void {
+  resume(runId: string, mode: "resume" | "recheck" | "fix" = "resume"): void {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
-    const stage = recheck ? recoverableStage(run) : undefined;
-    if (recheck && !stage) throw new UserError("This run has no failed check that can be rechecked on the saved edits");
-    if (!recheck && run.status !== "running" && run.status !== "stopped") throw new UserError("Only stopped or interrupted runs can be resumed");
+    const run = this.inactiveBranchRun(runId);
+    const stage = mode === "recheck" ? recoverableStage(run) : mode === "fix" ? repairableRevisionStage(run) : undefined;
+    if (mode === "fix" && !stage) throw new UserError("There is no failed revision stage the crew can repair here");
+    if (mode === "recheck" && !stage) throw new UserError("This run has no failed check that can be rechecked on the saved edits");
+    if (mode === "resume" && run.status !== "running" && run.status !== "stopped") throw new UserError("Only stopped or interrupted runs can be resumed");
     if (this.verifications.has(runId)) throw new UserError("Wait for the current project checks to finish");
     if (run.cleanedUp || !existsSync(run.worktree)) throw new UserError("The original worktree is unavailable");
     const target = this.opts.config.targets[run.target];
@@ -315,16 +319,17 @@ export class RunManager {
       crew: OPTIONAL_STAGES.filter((stage) => run.crew?.includes(stage) ?? DEFAULT_CREW.includes(stage)),
       implementer: IMPLEMENTERS.find((role) => role === run.implementer),
       resume: run,
-    }, checkpoints, run.id, stage?.name);
+    }, checkpoints, run.id, { recheckStage: mode === "recheck" ? stage?.name : undefined, repairStage: mode === "fix" ? stage?.name : undefined });
   }
 
   async startFollowUp(runId: string, input: { message?: unknown; provider?: unknown; browserAccess?: unknown; referenceUrls?: unknown; browserReferenceHelp?: unknown; attachments?: unknown }): Promise<string> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     const message = typeof input.message === "string" ? input.message.trim() : "";
     if (!message || message.length > 8000) throw new UserError("Enter feedback of 1 to 8,000 characters");
-    if (input.browserAccess !== undefined && typeof input.browserAccess !== "boolean") throw new UserError("Browser access must be true or false");
-    if (input.browserReferenceHelp !== undefined && typeof input.browserReferenceHelp !== "boolean") throw new UserError("Browser reference help must be true or false");
+    const { browserAccess, browserReferenceHelp } = input;
+    if (browserAccess !== undefined && typeof browserAccess !== "boolean") throw new UserError("Browser access must be true or false");
+    if (browserReferenceHelp !== undefined && typeof browserReferenceHelp !== "boolean") throw new UserError("Browser reference help must be true or false");
     let referenceUrls: string[];
     try {
       const explicit = input.referenceUrls === undefined ? referenceLinks(message) : [];
@@ -332,7 +337,7 @@ export class RunManager {
       referenceUrls = [...new Set([...parseReferencePermissions(explicit), ...approved])].slice(0, MAX_PUBLIC_REFERENCES);
     }
     catch (error) { throw new UserError((error as Error).message); }
-    if (run.status !== "passed" || run.cleanedUp) throw new UserError("Feedback needs a completed run with a branch");
+    if (!this.canGiveFeedback(run)) throw new UserError("Feedback needs a completed run or a finished revision on this branch");
     const target = this.opts.config.targets[run.target];
     if (!target || await repoRoot(target.path).catch(() => undefined) !== run.repo) {
       throw new UserError(`Configure the original target "${run.target}" to start a revision`);
@@ -340,30 +345,49 @@ export class RunManager {
     const provider = input.provider ?? run.provider ?? "claude";
     if (provider !== "claude" && provider !== "codex") throw new UserError("Provider must be claude or codex");
     if (provider === "codex" && !this.opts.codexRunner) throw new UserError("Codex runs are unavailable in this UI session");
-    const baseSha = await git(["rev-parse", "--verify", `refs/heads/${run.branch}^{commit}`], run.repo).catch(() => undefined);
-    const originalCommit = [...run.stages].reverse().find((stage) => stage.commit)?.commit ?? run.baseSha;
-    const matchesRun = baseSha && await git(["merge-base", "--is-ancestor", originalCommit, baseSha], run.repo).then(() => true, () => false);
-    if (!baseSha || !matchesRun) throw new UserError("The original branch no longer contains the completed run");
-    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const revisitingLinkedIn = /\blinkedin\b/i.test(message);
-    const sharedReferences = run.references?.map((check) => {
-      if (check.shared && check.status === "read" && revisitingLinkedIn && check.url?.startsWith("https://www.linkedin.com/")) {
-        return { ...check, status: "partial" as const, browserHelpSkipped: undefined,
-          detail: "Earlier notes are available. Check LinkedIn coverage again for this feedback." };
-      }
-      return { ...check, browserHelpSkipped: undefined };
-    });
-    const id = makeRunId(message);
-    const attachments = this.saveAttachments(id, input.attachments, true);
-    return this.startPipeline({
-      target, kind: "feature", request: message, provider, crew: [],
-      browserAccess: input.browserAccess ?? run.browserAccess,
-      referenceUrls,
-      browserReferenceHelp: input.browserReferenceHelp ?? true,
-      sharedReferences,
-      followUp: { runId, brief: run.followUp?.brief ?? run.request, baseSha, orchestrated: true,
-        attachments },
-    }, [], id);
+    const release = this.store.claimBranch(run);
+    if (!release) throw new UserError("A revision is already starting or running on this branch. Open its latest revision to follow progress.");
+    try {
+      return await withRepoLock(run.repo, async () => {
+        const source = this.inactiveBranchRun(runId);
+        if (this.verifications.has(runId) || this.browserChecks.has(runId)) throw new UserError("Wait for the current checks to finish before adding feedback");
+        const [baseSha, checkedOut] = await Promise.all([
+          git(["rev-parse", "--verify", `refs/heads/${run.branch}^{commit}`], run.repo).catch(() => undefined),
+          git(["symbolic-ref", "HEAD"], run.worktree).catch(() => undefined),
+        ]);
+        const originalCommit = source.stages.findLast((stage) => stage.commit)?.commit ?? source.baseSha;
+        const matchesRun = baseSha && await git(["merge-base", "--is-ancestor", originalCommit, baseSha], run.repo).then(() => true, () => false);
+        if (!baseSha || !matchesRun || checkedOut !== `refs/heads/${run.branch}`) {
+          throw new UserError("Shipyard couldn’t find the original branch in its worktree");
+        }
+        if ((await changedFiles(run.worktree)).length) throw new UserError("This branch has saved edits. Finish or recover its current work before starting a revision.");
+        if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+        const revisitingLinkedIn = /\blinkedin\b/i.test(message);
+        const sharedReferences = source.references?.map((check) => {
+          if (check.shared && check.status === "read" && revisitingLinkedIn && check.url?.startsWith("https://www.linkedin.com/")) {
+            return { ...check, status: "partial" as const, browserHelpSkipped: undefined,
+              detail: "Earlier notes are available. Check LinkedIn coverage again for this feedback." };
+          }
+          return { ...check, browserHelpSkipped: undefined };
+        });
+        const id = makeRunId(message);
+        const attachments = this.saveAttachments(id, input.attachments, true);
+        this.startPipeline({
+          target, kind: "feature", request: message, provider, crew: [],
+          browserAccess: browserAccess ?? run.browserAccess,
+          referenceUrls,
+          browserReferenceHelp: browserReferenceHelp ?? true,
+          sharedReferences,
+          continueBranch: { ...source, baseSha, branchBaseSha: source.branchBaseSha ?? source.baseSha },
+          followUp: { runId, brief: run.followUp?.brief ?? run.request, baseSha, orchestrated: true, attachments },
+        }, [], id);
+        void this.whenDone(id).finally(release);
+        return id;
+      });
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   private saveAttachments(runId: string, input: unknown, newRun = false): FeedbackAttachment[] | undefined {
@@ -376,7 +400,8 @@ export class RunManager {
     return files.length ? writeFeedbackAttachments(this.store.dir(runId), files, newRun) : undefined;
   }
 
-  private startPipeline(req: PipelineRequest, checkpoints: readonly StageName[], id = req.resume?.id ?? makeRunId(req.request), recheckStage?: string): string {
+  private startPipeline(req: PipelineRequest, checkpoints: readonly StageName[], id = req.resume?.id ?? makeRunId(req.request),
+    recovery?: Pick<PipelineDeps, "recheckStage" | "repairStage">): string {
     const control = new RunControl();
     if (req.resume) {
       for (const event of this.store.events(id, Infinity)) {
@@ -394,7 +419,7 @@ export class RunManager {
         runner: this.opts.runner,
         runnerForProvider: (current) => current === "codex" ? this.opts.codexRunner! : this.opts.runner,
         control,
-        recheckStage,
+        ...recovery,
         store: this.store,
         roles: this.opts.roles,
         log: this.opts.log ? (line) => this.opts.log!(`[${id.slice(-4)}] ${line}`) : undefined,
@@ -480,6 +505,97 @@ export class RunManager {
     return run;
   }
 
+  private latestBranchRun(run: RunRecord): RunRecord {
+    return this.store.list().find((entry) => entry.repo === run.repo && entry.branch === run.branch) ?? run;
+  }
+
+  private inactiveBranchRun(runId: string): RunRecord {
+    const run = this.inactiveRun(runId);
+    if (this.latestBranchRun(run).id !== runId) throw new UserError("Open the latest revision to continue working on this branch");
+    return run;
+  }
+
+  private canGiveFeedback(run: RunRecord): boolean {
+    return Boolean(run.finishedAt && !run.cleanedUp && run.branch.startsWith("shipyard/") &&
+      (run.status === "passed" || (run.followUp && run.status !== "running")));
+  }
+
+  private canPrepareBranch(run: RunRecord): boolean {
+    return this.canGiveFeedback(run) && run.status === "failed" && Boolean(run.followUp) && !recoverableStage(run) &&
+      run.stages.at(-1)?.attempts.at(-1)?.noChanges === true && !run.stages.some((stage) => stage.commit) &&
+      /\bsquash\b/i.test(run.request) && /\b(?:branch|commits?|history)\b/i.test(run.request);
+  }
+
+  async prepareBranch(runId: string, approval?: { name?: unknown; head?: unknown; base?: unknown; confirm?: unknown }) {
+    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    const run = this.inactiveBranchRun(runId);
+    if (!this.canPrepareBranch(run)) throw new UserError("This revision has no branch cleanup to prepare");
+    const release = approval && this.store.claimBranch(run);
+    if (approval && !release) throw new UserError("This branch is already being updated");
+    try {
+      const target = this.opts.config.targets[run.target];
+      if (!target || await repoRoot(target.path).catch(() => undefined) !== run.repo || (await changedFiles(run.worktree)).length) {
+        throw new UserError("Branch cleanup needs the original repository and a clean worktree");
+      }
+      const head = await git(["rev-parse", "HEAD"], run.worktree);
+      if (await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "") !== `refs/heads/${run.branch}`) {
+        throw new UserError("Shipyard couldn’t find the original branch in its worktree");
+      }
+      let base = run.branchBaseSha ?? run.baseSha;
+      const visited = new Set([runId]);
+      for (let parentId = run.followUp?.runId; parentId && !visited.has(parentId);) {
+        visited.add(parentId);
+        const parent = this.store.get(parentId);
+        if (parent?.repo !== run.repo) break;
+        const candidate = parent.branchBaseSha ?? parent.baseSha;
+        if (!await git(["merge-base", "--is-ancestor", candidate, base], run.repo).then(() => true, () => false)) break;
+        base = candidate;
+        parentId = parent.followUp?.runId;
+      }
+      if (!await git(["merge-base", "--is-ancestor", base, head], run.repo).then(() => true, () => false)) {
+        throw new UserError("The proposed base is outside the current branch history");
+      }
+      const commits = Number(await git(["rev-list", "--count", `${base}..${head}`], run.repo));
+      if (!commits) throw new UserError("There are no branch commits to squash");
+      const name = `${run.target.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "project"}-update`;
+      if (!approval) return { plan: { head, base, commits, name } };
+      if (approval.confirm !== true || approval.head !== head || approval.base !== base) {
+        throw new UserError("The branch or base changed. Reopen the review before approving");
+      }
+      if (typeof approval.name !== "string" || !/^[a-z0-9][a-z0-9-]{0,79}$/.test(approval.name)) {
+        throw new UserError("Enter a branch name with letters, numbers, or hyphens");
+      }
+      const branch = `shipyard/${approval.name}`;
+      if (await git(["show-ref", "--verify", `refs/heads/${branch}`], run.repo).then(() => true, () => false)) {
+        throw new UserError("This branch name is already in use. Choose another name");
+      }
+      if (this.verifications.has(runId) || this.browserChecks.has(runId)) throw new UserError("Wait for the current checks to finish");
+      const verification = await this.verifyResult(runId, true);
+      if (!verification.checks.every(gateOk)) throw new UserError("A project check failed during verification. See the latest check output in the handoff");
+      if (this.shuttingDown || verification.head !== head || (await changedFiles(run.worktree)).length ||
+          await git(["rev-parse", "HEAD"], run.worktree) !== head) throw new UserError("The run changed during verification. Review it again");
+      const commit = await squashCommit(run.repo, head, base, `Shipyard: ${approval.name.replaceAll("-", " ")}`);
+      const worktree = join(this.opts.config.worktreeRoot, `${runId}-squashed`);
+      await createWorktree(run.repo, worktree, branch, commit);
+      await this.stopLocalPreview(runId);
+      const saved = this.store.get(runId) ?? run;
+      const durationMs = verification.checks.reduce((total, check) => total + check.durationMs, 0);
+      saved.stages.push({ name: "branch-preparation", role: "Shipyard", status: "passed", commit, finalized: true, attempts: [{
+        attempt: 1, agentOk: true, costUsd: null, turns: 0, durationMs, passed: true, gates: verification.checks,
+        summary: `Combined ${commits} commits into one on ${branch} and verified the project. The original branch is available as a backup.`,
+      }] });
+      Object.assign(saved, { branch, worktree, baseSha: base, branchBaseSha: base, status: "passed", error: undefined,
+        publication: undefined, browserCheck: undefined, verification: { ...verification, head: commit }, finishedAt: new Date().toISOString(), completionRead: false });
+      saved.totals.durationMs += durationMs;
+      saved.totals.attempts++;
+      this.store.save(saved);
+      this.store.event(runId, { type: "branch-prepared", branch, base, head, commit, previousBranch: run.branch });
+      return { run: saved };
+    } finally {
+      if (release) release();
+    }
+  }
+
   setArchived(runId: string, archived: boolean): RunRecord {
     const run = this.inactiveRun(runId);
     run.archivedAt = archived ? run.archivedAt ?? new Date().toISOString() : undefined;
@@ -501,23 +617,30 @@ export class RunManager {
   async result(runId: string) {
     const run = this.store.get(runId);
     if (!run) throw new UserError("No such run");
+    const latest = this.latestBranchRun(run);
+    const historical = latest.id !== runId;
     const [remotes, preview, head] = await Promise.all([
       git(["remote"], run.repo).catch(() => undefined),
       this.previews.get(runId)?.catch(() => undefined),
-      git(["rev-parse", "--verify", `refs/heads/${run.branch}`], run.repo).catch(() => undefined),
+      historical ? run.stages.findLast((stage) => stage.commit)?.commit ?? run.baseSha :
+        git(["rev-parse", "--verify", `refs/heads/${run.branch}`], run.repo).catch(() => undefined),
     ]);
     const [committed, uncommitted] = await Promise.all([
       head ? git(["diff", "--name-status", "-z", "--no-renames", `${run.baseSha}..${head}`, "--"], run.repo, { raw: true }).catch(() => undefined) : undefined,
-      !run.cleanedUp ? changedFiles(run.worktree).catch(() => undefined) : undefined,
+      !run.cleanedUp && !historical ? changedFiles(run.worktree).catch(() => undefined) : undefined,
     ]);
     const files: Array<{ status: string; path: string }> = [];
     const changes = committed?.split("\0") ?? [];
     for (let i = 0; i + 1 < changes.length; i += 2) files.push({ status: changes[i]!, path: changes[i + 1]! });
     const target = this.opts.config.targets[run.target];
     const destination = remotes ? await pushDestination(run.repo, remotes).catch(() => undefined) : undefined;
-    const canPush = run.status === "passed" && Boolean(run.finishedAt) && Boolean(head && head !== run.baseSha) && run.branch.startsWith("shipyard/");
+    const canPush = !historical && run.status === "passed" && Boolean(run.finishedAt) &&
+      Boolean(head && head !== (run.branchBaseSha ?? run.baseSha)) && run.branch.startsWith("shipyard/");
     const pushed = Boolean(destination && run.publication?.head === head && run.publication?.destination === destination.key);
-    const pullRequestUrl = pushed ? run.publication?.pullRequestUrl : undefined;
+    const linkedUrl = destination && run.publication?.destination === destination.key ? run.publication.pullRequestUrl : undefined;
+    const closedUrl = canPush && destination?.repository && linkedUrl &&
+      await linkedPullRequestState(run.repo, destination.repository, linkedUrl, this.stopResultChecks.signal) === "closed" ? linkedUrl : undefined;
+    const pullRequestUrl = closedUrl ? undefined : linkedUrl;
     const pullRequest = pushed && destination?.repository && head && !pullRequestUrl
       ? await pullRequestOptions(run.repo, destination.repository, head, this.stopResultChecks.signal)
       : {};
@@ -526,22 +649,26 @@ export class RunManager {
     const verifiedEdits = stage && run.verification?.editsDigest &&
       run.verification.editsDigest === await editsDigest(run.worktree).catch(() => undefined);
     return {
+      latestRevisionId: historical ? latest.id : undefined,
+      canGiveFeedback: !historical && uncommitted?.length === 0 && this.canGiveFeedback(run),
+      canPrepareBranch: !historical && uncommitted?.length === 0 && this.canPrepareBranch(run),
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,
-        pushed,
-        pullRequestUrl, ...pullRequest,
+        pushed, canDraftPullRequest: Boolean(destination.repository && pullRequest.pullRequestBlocked !== "no-changes"),
+        pullRequestUrl, closedPullRequestUrl: closedUrl, ...pullRequest,
       } : undefined,
       publishUnavailable: remotes && canPush && !destination ? "Choose one push destination by configuring origin with a single supported Git URL." : undefined,
-      canReleaseToCloudRun: Boolean(head && run.status === "passed" && run.finishedAt &&
+      canReleaseToCloudRun: Boolean(!historical && head && run.status === "passed" && run.finishedAt &&
         run.stages.some((stage) => stage.name === "cloud-release" && stage.status === "passed")),
       cloudRelease: run.cloudRelease,
       hasRemote: remotes === undefined ? undefined : Boolean(remotes),
-      canPreview: Boolean(run.finishedAt) && ["passed", "failed"].includes(run.status) && !run.cleanedUp && canPreview(run.worktree),
+      canPreview: !historical && Boolean(run.finishedAt) && ["passed", "failed"].includes(run.status) && !run.cleanedUp && canPreview(run.worktree),
       recheckStage: stage?.name,
+      canFixRevision: Boolean(target && uncommitted && repairableRevisionStage(run)),
       savedEditsCheck: stage ? this.verifications.has(runId) ? "checking" : verifiedEdits ?
         run.verification!.checks.every(gateOk) ? "passed" : "failed" : "unchecked" : undefined,
       previewUrl: preview?.url,
-      canRunLocally: run.status === "passed" && Boolean(run.finishedAt) && !run.cleanedUp && existsSync(run.worktree),
+      canRunLocally: !historical && run.status === "passed" && Boolean(run.finishedAt) && !run.cleanedUp && existsSync(run.worktree),
       localApp: localApp ? { url: localApp.url, starting: !localApp.url } : undefined,
       handoff: {
         head, fileCount: committed === undefined ? undefined : files.length, files: files.slice(0, 40),
@@ -554,7 +681,7 @@ export class RunManager {
 
   async cloudRelease(runId: string, input: Record<string, unknown>) {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     if (run.status !== "passed" || !run.finishedAt || !run.stages.some((stage) => stage.name === "cloud-release" && stage.status === "passed")) {
       throw new UserError("Complete a run with the Google Cloud release specialist first");
     }
@@ -598,18 +725,19 @@ export class RunManager {
     this.emit({ type: "git-remote", repo: run.repo });
   }
 
-  publish(runId: string, input: { destination?: unknown; head?: unknown; draft?: unknown }, action: "push" | "pull-request" = "push"): Promise<void> {
+  publish(runId: string, input: { destination?: unknown; head?: unknown; draft?: unknown }, action: "push" | "pull-request" = "push",
+    review?: Pick<DraftReview, "base" | "description">): Promise<void> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     if (action === "pull-request" && input.draft !== undefined && typeof input.draft !== "boolean") {
       throw new UserError("Draft must be true or false");
     }
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     if (run.status !== "passed" || !run.finishedAt || !run.branch.startsWith("shipyard/")) {
       throw new UserError("Only a completed Shipyard run can publish its branch");
     }
     if (this.publications.has(runId)) throw new UserError("A GitHub or push operation is already running for this result");
     const publishing = withRepoLock(run.repo, async () => {
-      const saved = this.inactiveRun(runId);
+      const saved = this.inactiveBranchRun(runId);
       if (saved.finishedAt !== run.finishedAt || saved.status !== "passed" || saved.branch !== run.branch || this.shuttingDown) {
         throw new UserError("The run changed. Reopen the handoff to see its current details");
       }
@@ -618,16 +746,20 @@ export class RunManager {
         git(["rev-parse", "--verify", `refs/heads/${run.branch}^{commit}`], run.repo).catch(() => undefined),
       ]);
       const destination = await pushDestination(run.repo, remotes).catch(() => undefined);
-      if (!destination || !head || head === run.baseSha || input.head !== head || input.destination !== destination.key) {
+      if (!destination || !head || head === (run.branchBaseSha ?? run.baseSha) || input.head !== head || input.destination !== destination.key) {
         throw new UserError("The branch or destination changed. Reopen the handoff and review the current branch and remote");
       }
       const publication = saved.publication?.head === head && saved.publication.destination === destination.key ? saved.publication : undefined;
       if (action === "pull-request") {
         if (!publication || !destination.repository) throw new UserError("Push the completed branch to GitHub before creating a pull request");
-        if (publication.pullRequestUrl) return;
+        if (!review && publication.pullRequestUrl && await linkedPullRequestState(run.repo, destination.repository,
+          publication.pullRequestUrl, this.stopResultChecks.signal) !== "closed") return;
         let pullRequestUrl: string;
         try {
-          pullRequestUrl = await createRunPullRequest(run.repo, destination.repository, run.branch, head, this.stopResultChecks.signal, input.draft === true);
+          const description = review?.description ?? await describePullRequest(run.repo, run.branchBaseSha ?? run.baseSha,
+            head, describeRunChecks(saved, head));
+          pullRequestUrl = await createRunPullRequest(run.repo, destination.repository, run.branch, head,
+            this.stopResultChecks.signal, { draft: input.draft === true, description, reviewedBase: review?.base });
         } catch (error) {
           throw new UserError((error as Error).message);
         }
@@ -646,7 +778,8 @@ export class RunManager {
       }
       const updated = this.store.get(runId);
       if (!updated) return;
-      updated.publication = { head, destination: destination.key, pushedAt: new Date().toISOString() };
+      updated.publication = { head, destination: destination.key, pushedAt: new Date().toISOString(),
+        pullRequestUrl: saved.publication?.destination === destination.key ? saved.publication.pullRequestUrl : undefined };
       this.store.save(updated);
       this.store.event(runId, { type: "branch-pushed", branch: run.branch, remote: destination.remote, head });
       this.emit({ type: "git-remote", repo: run.repo });
@@ -655,9 +788,113 @@ export class RunManager {
     return publishing;
   }
 
+  async draftPullRequest(runId: string, input: { action?: unknown; destination?: unknown; head?: unknown; token?: unknown; description?: unknown }) {
+    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    const run = this.inactiveBranchRun(runId);
+    if (run.status !== "passed" || !run.finishedAt || run.cleanedUp || !run.branch.startsWith("shipyard/")) {
+      throw new UserError("Complete the run before creating a draft pull request");
+    }
+    if (input.action !== "review" && input.action !== "create") throw new UserError("Choose whether to review or create the draft pull request");
+    const review = input.action === "create" ? this.draftReviews.get(runId) : undefined;
+    if (input.action === "create" && (!review || input.token !== review.token)) {
+      throw new UserError("Reopen the review to confirm the current branch and destination");
+    }
+    const description = typeof input.description === "string" ? input.description : input.description === undefined ? review?.description ?? "" : "";
+    if (review && (!description.trim() || description.length > MAX_PULL_REQUEST_DESCRIPTION)) {
+      throw new UserError("Enter a pull request description between 1 and 32,000 characters");
+    }
+    const release = review && this.store.claimBranch(run);
+    if (review && !release) throw new UserError("An operation is already running on this branch");
+    let releasePrepared: (() => void) | undefined;
+    const signal = this.stopResultChecks.signal;
+    try {
+      const [remotes, head] = await Promise.all([
+        git(["remote"], run.repo).catch(() => ""),
+        git(["rev-parse", "--verify", `refs/heads/${run.branch}^{commit}`], run.repo),
+      ]);
+      const destination = await pushDestination(run.repo, remotes);
+      if (!destination?.repository || head === (run.branchBaseSha ?? run.baseSha) ||
+          (review?.head ?? input.head) !== head || (review?.destination ?? input.destination) !== destination.key) {
+        throw new UserError("The branch or GitHub destination changed. Reopen the handoff to review it again");
+      }
+      const base = await draftBase(run.repo, destination.repository, signal);
+      if (!review) {
+        await fetchDraftBase(run.repo, destination, base.head, signal);
+        const branch = await reviewDraftBranch(run, head, base.head, this.opts.config.worktreeRoot);
+        const target = this.opts.config.targets[run.target];
+        const checkLines = branch.transplant
+          ? [...new Set([target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined])]
+            .filter((check): check is string => Boolean(check)).map((check) => `- ${markdownCode(check)} required before publication.`)
+          : describeRunChecks(run, head);
+        const diffBase = branch.transplant ? base.head : await git(["merge-base", base.head, head], run.repo);
+        const description = await describePullRequest(run.repo, diffBase, branch.transplant?.tree ?? head, checkLines);
+        const details = { ...branch, base, head, description, repository: destination.repository,
+          destination: destination.key, token: randomBytes(24).toString("hex") };
+        this.draftReviews.set(runId, details);
+        return { review: details };
+      }
+      if (review.base.branch !== base.branch || review.base.head !== base.head) {
+        throw new UserError("GitHub’s default branch moved. Reopen the review to approve the current commit");
+      }
+      let draftHead = head;
+      if (review.transplant) {
+        const target = this.opts.config.targets[run.target];
+        if (!target || await repoRoot(target.path).catch(() => undefined) !== run.repo || (await changedFiles(run.worktree)).length) {
+          throw new UserError("Preparing the draft needs the original repository and a clean run worktree");
+        }
+        const title = await git(["show", "-s", "--format=%s", head], run.repo);
+        draftHead = await commitTree(run.repo, review.transplant.tree, base.head, title || `Shipyard update for ${run.target}`);
+        const candidate = await detachedWorktree(run.repo, this.opts.config.worktreeRoot, draftHead);
+        let adopted = false;
+        try {
+          const checks = await this.runProjectChecks(target, candidate.worktree, Boolean(target.browserCheck));
+          const failed = checks.find((gate) => !gateOk(gate));
+          if (failed) throw new UserError(`${failed.command} failed on the proposed draft branch. ${failed.outputTail.slice(-1200)}`);
+          const latestBase = await draftBase(run.repo, destination.repository, signal);
+          if (latestBase.branch !== base.branch || latestBase.head !== base.head) throw new UserError("GitHub’s default branch moved. Reopen the review to approve it again");
+          if (await git(["rev-parse", "HEAD"], candidate.worktree) !== draftHead || (await changedFiles(candidate.worktree)).length ||
+              await git(["rev-parse", "HEAD"], run.worktree) !== head || (await changedFiles(run.worktree)).length) {
+            throw new UserError("A worktree changed during verification. Reopen the review before publishing");
+          }
+          const updated = this.inactiveBranchRun(runId);
+          if (updated.branch !== run.branch || updated.finishedAt !== run.finishedAt) throw new UserError("The run changed. Reopen the draft review");
+          releasePrepared = this.store.claimBranch({ ...updated, branch: review.branch });
+          if (!releasePrepared) throw new UserError("The proposed branch is in use. Reopen the review for a new branch name");
+          await git(["-c", "core.hooksPath=/dev/null", "switch", "-c", review.branch], candidate.worktree);
+          const durationMs = checks.reduce((sum, gate) => sum + gate.durationMs, 0);
+          updated.stages.push({ name: "draft-pr-preparation", role: "Shipyard", status: "passed", commit: draftHead, finalized: true, attempts: [{
+            attempt: 1, agentOk: true, costUsd: null, turns: 0, durationMs, passed: true, gates: checks,
+            summary: `Prepared and verified ${review.branch} on GitHub’s ${base.branch} branch. The original branch is available as a backup.`,
+          }] });
+          Object.assign(updated, { branch: review.branch, worktree: candidate.worktree, baseSha: base.head, branchBaseSha: base.head,
+            publication: undefined, browserCheck: undefined, verification: { head: draftHead, checks }, finishedAt: new Date().toISOString() });
+          updated.totals.durationMs += durationMs;
+          updated.totals.attempts++;
+          this.store.save(updated);
+          adopted = true;
+          this.store.event(runId, { type: "draft-branch-prepared", previousBranch: run.branch, branch: review.branch, base: base.head, head: draftHead });
+          await this.stopLocalPreview(runId);
+        } finally {
+          if (!adopted) await candidate.close();
+        }
+      }
+      this.draftReviews.delete(runId);
+      const approval = { head: draftHead, destination: destination.key, draft: true };
+      await this.publish(runId, approval, "push");
+      await this.publish(runId, approval, "pull-request", { base: review.base, description });
+      return { result: await this.result(runId) };
+    } catch (error) {
+      if (error instanceof UserError) throw error;
+      throw new UserError((error as Error).message);
+    } finally {
+      releasePrepared?.();
+      release?.();
+    }
+  }
+
   async startLocalPreview(runId: string): Promise<string> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     if (!run.finishedAt || !["passed", "failed"].includes(run.status) || run.cleanedUp || !canPreview(run.worktree)) {
       throw new UserError("Local preview needs a finished run with an index.html in its worktree");
     }
@@ -680,7 +917,7 @@ export class RunManager {
 
   async startLocalApp(runId: string): Promise<string> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     if (run.status !== "passed" || !run.finishedAt || run.cleanedUp || !existsSync(run.worktree)) {
       throw new UserError("Running locally needs a completed run with its worktree");
     }
@@ -736,7 +973,7 @@ export class RunManager {
 
   checkLocalBrowser(runId: string): Promise<GateRecord> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     if (!run.finishedAt || run.cleanedUp || !canPreview(run.worktree)) {
       throw new UserError("Browser verification needs a finished run with an index.html in its worktree");
     }
@@ -755,9 +992,9 @@ export class RunManager {
     return check;
   }
 
-  verifyResult(runId: string): Promise<NonNullable<RunRecord["verification"]>> {
+  verifyResult(runId: string, includeBrowser = false): Promise<NonNullable<RunRecord["verification"]>> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
-    const run = this.inactiveRun(runId);
+    const run = this.inactiveBranchRun(runId);
     const target = this.opts.config.targets[run.target];
     if (!run.finishedAt || run.status === "stopped" || run.cleanedUp || !target || !existsSync(run.worktree)) {
       throw new UserError("Verification needs a finished run with its configured repository and worktree");
@@ -774,16 +1011,8 @@ export class RunManager {
         throw new UserError("Verification needs the original branch and a clean worktree");
       }
       const digest = recovery ? await editsDigest(run.worktree) : undefined;
-      const checks: GateRecord[] = [];
-      for (const command of new Set([target.test, target.e2e])) {
-        if (!command) continue;
-        const { code, timedOut, durationMs, output } = await sh(command, run.worktree, undefined, this.stopResultChecks.signal);
-        checks.push({ command, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
-      }
-      if (recovery?.attempts.some(({ gates }) => gates.some(({ command }) => command === BROWSER_CHECK)) && target.browserCheck) {
-        const { code, timedOut, durationMs, output } = await checkBrowser(run.worktree, undefined, this.stopResultChecks.signal);
-        checks.push({ command: BROWSER_CHECK, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
-      }
+      const hadBrowserFailure = recovery?.attempts.some(({ gates }) => gates.some(({ command }) => command === BROWSER_CHECK));
+      const checks = await this.runProjectChecks(target, run.worktree, Boolean(target.browserCheck && (includeBrowser || hadBrowserFailure)));
       if (await git(["rev-parse", "HEAD"], run.worktree) !== head ||
           await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "") !== branch ||
           (digest ? await editsDigest(run.worktree).catch(() => undefined) !== digest : (await changedFiles(run.worktree)).length > 0)) {
@@ -797,6 +1026,21 @@ export class RunManager {
     })().finally(() => this.verifications.delete(runId));
     this.verifications.set(runId, check);
     return check;
+  }
+
+  private async runProjectChecks(target: Target, worktree: string, browser: boolean): Promise<GateRecord[]> {
+    const signal = this.stopResultChecks.signal;
+    const checks: GateRecord[] = [];
+    for (const command of new Set([target.test, target.e2e])) {
+      if (!command) continue;
+      const { code, timedOut, durationMs, output } = await sh(command, worktree, undefined, signal);
+      checks.push({ command, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
+    }
+    if (browser) {
+      const { code, timedOut, durationMs, output } = await checkBrowser(worktree, undefined, signal);
+      checks.push({ command: BROWSER_CHECK, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
+    }
+    return checks;
   }
 
   checkResultReferences(runId: string, input: unknown): Promise<RunRecord> {
@@ -923,11 +1167,19 @@ export class RunManager {
   }
 
   async deleteHistory(runId: string): Promise<void> {
-    this.inactiveRun(runId);
-    this.referenceHandoffs.revoke(runId);
-    this.store.delete(runId);
-    await Promise.all([this.stopLocalPreview(runId), this.stopLocalApp(runId)]);
-    this.emit({ type: "run-deleted", runId });
+    const run = this.inactiveRun(runId);
+    const latest = this.latestBranchRun(run).id === runId;
+    const release = latest ? this.store.claimBranch(run) : undefined;
+    if (latest && !release) throw new UserError("Wait for the current branch operation to finish before deleting this run");
+    try {
+      this.referenceHandoffs.revoke(runId);
+      this.draftReviews.delete(runId);
+      this.store.delete(runId);
+      await Promise.all([this.stopLocalPreview(runId), this.stopLocalApp(runId)]);
+      this.emit({ type: "run-deleted", runId });
+    } finally {
+      release?.();
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -1023,6 +1275,14 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 /** An error caused by the request, shown to the user as-is (HTTP 400). */
 export class UserError extends Error {}
+
+function describeRunChecks(run: RunRecord, head: string): string[] {
+  const verified = run.verification?.head === head && !run.verification.editsDigest ? run.verification.checks : undefined;
+  const recorded = run.stages.findLast((stage) => stage.commit)?.commit === head
+    ? run.stages.flatMap((stage) => stage.attempts.at(-1)?.gates ?? []) : [];
+  const checks = new Map((verified ?? recorded).filter((check) => !check.expectFailure).map((check) => [check.command, check]));
+  return [...checks.values()].map((check) => `- ${gateOk(check) ? "Passed" : "Failed"} ${markdownCode(check.command)}.`);
+}
 
 async function editsDigest(worktree: string): Promise<string> {
   return createHash("sha256").update(await worktreeSnapshot(worktree)).digest("hex");
