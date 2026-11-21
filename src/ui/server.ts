@@ -218,9 +218,9 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, { stopped: true });
       }
 
-      const resumeMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/resume$/);
+      const resumeMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(resume|recheck)$/);
       if (req.method === "POST" && resumeMatch) {
-        opts.manager.resume(resumeMatch[1]!);
+        opts.manager.resume(resumeMatch[1]!, resumeMatch[2] === "recheck");
         return json(res, 202, { accepted: true });
       }
 

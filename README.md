@@ -19,6 +19,7 @@ The scripted crew adds `GET /health` to the bundled demo shop. Watch it ask abou
 | **Keep your workspace free for other work** | Each run starts from committed Git history in its own worktree. Your current checkout stays available while the crew works. |
 | **See why a change is ready** | The dashboard brings together diffs, agent activity, checkpoint decisions, and the results of your repository’s test commands. |
 | **Stay involved when it matters** | Approve checkpoints, give feedback, or stop and resume. You can switch providers in the same worktree with a fresh agent session. |
+| **Recover after a failed check** | **Check saved edits** runs the project checks without committing. When they pass, **Continue this run** saves the verified edits and resumes the same run. |
 
 ## Quick start
 

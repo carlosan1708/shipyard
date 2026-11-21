@@ -37,6 +37,7 @@ export const gateOk = (g: GateRecord): boolean => (g.expectFailure ? g.code !== 
 
 export interface AttemptRecord {
   attempt: number;
+  rechecked?: boolean;
   provider?: Provider;
   interrupted?: "stopped" | "redirected" | "interrupted";
   interruptionWaitMs?: number;
@@ -62,6 +63,13 @@ export interface AttemptRecord {
   output?: unknown;
   /** Reports from browser inspections the specialist requested during this attempt. */
   browserInspections?: string[];
+}
+
+export function recoverableStage(run: RunRecord): StageRecord | undefined {
+  if (!run.finishedAt || run.cleanedUp || !["failed", "stopped", "error"].includes(run.status)) return;
+  const stage = run.stages.at(-1);
+  if (!stage || stage.finalized || stage.commit || !["failed", "stopped"].includes(stage.status)) return;
+  if (stage.attempts.some((attempt) => !attempt.interrupted && attempt.gates.some((gate) => !gate.expectFailure && !gateOk(gate)))) return stage;
 }
 
 export interface StageRecord {
@@ -118,7 +126,7 @@ export interface RunRecord {
   cleanedUp?: boolean;
   /** Most recent browser verification requested from the completed result. */
   browserCheck?: GateRecord;
-  verification?: { head: string; checks: GateRecord[] };
+  verification?: { head: string; checks: GateRecord[]; editsDigest?: string };
   browserAccess?: boolean;
   referenceUrls?: string[];
   browserReferenceHelp?: boolean;

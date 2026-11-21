@@ -1241,6 +1241,81 @@ test("feedback retrieves references and routes through a read-only orchestrator 
   }
 });
 
+test("rechecking a failed revision verifies saved edits and continues the same run", { timeout: 30_000 }, async () => {
+  const { git } = await import("../src/exec.ts");
+  const { commitAll } = await import("../src/worktree.ts");
+  const { config } = await makeManager([]);
+  config.maxGateRetries = 0;
+  const target = config.targets.t0!;
+  target.test = "true";
+  target.e2e = "sh e2e/metric.sh";
+  const e2eCheck = (metric: number) => `grep -q '${metric}%' index.html || { echo "Missing metric ${metric}%"; exit 1; }\n`;
+  writeFiles(target.path, { "index.html": "<p>50%</p>", "e2e/metric.sh": e2eCheck(50) });
+  await commitAll(target.path, "Add the original portfolio metric");
+  const plan: Step = () => ({ structured: { assignments: [
+    { role: "frontend", task: "Update the displayed metric" },
+    { role: "docs-writer", task: "Record the correction in the README" },
+  ] } });
+  const update: Step = (req) => writeFiles(req.cwd, { "index.html": "<p>18%</p>" });
+  const docs: Step = (req) => {
+    assert.equal(req.role.name, "docs-writer");
+    assert.match(readFileSync(join(req.cwd, "e2e/metric.sh"), "utf8"), /18%/);
+    writeFiles(req.cwd, { "README.md": "The corrected metric is 18%.\n" });
+  };
+  const claude = new FakeRunner([fix, plan, update, docs]);
+  const codex = new FakeRunner([plan, update, docs]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const parentId = manager.start({ target: "t0", kind: "feature", request: "Prepare the portfolio", crew: [], checkpoints: [] });
+  try {
+    assert.equal((await manager.whenDone(parentId))?.status, "passed");
+    for (const [provider, runner] of [["claude", claude], ["codex", codex]] as const) {
+      const id = await manager.startFollowUp(parentId, { message: "Use 18% for the metric", provider });
+      const failed = await manager.whenDone(id);
+      assert.ok(failed && failed.status === "failed");
+      assert.equal((await manager.result(id)).recheckStage, "frontend");
+      assert.equal((await manager.result(id)).canPreview, true);
+      const callsBeforeRecheck = runner.calls.length;
+      const verify = () => request(server.port, `/api/runs/${id}/verify`, { method: "POST", headers });
+      const recheck = () => request(server.port, `/api/runs/${id}/recheck`, { method: "POST", headers });
+      assert.equal((await manager.result(id)).savedEditsCheck, "unchecked");
+      assert.equal((await verify()).status, 200);
+      assert.equal((await manager.result(id)).savedEditsCheck, "failed");
+      assert.equal((await recheck()).status, 202);
+      const rechecked = await manager.whenDone(id);
+      assert.equal(rechecked?.status, "failed");
+      assert.equal(rechecked?.stages.at(-1)?.attempts.at(-1)?.rechecked, true);
+      assert.equal(runner.calls.length, callsBeforeRecheck);
+      assert.equal(await git(["rev-parse", "HEAD"], failed.worktree), failed.baseSha);
+
+      writeFiles(failed.worktree, { "e2e/metric.sh": e2eCheck(18) });
+      assert.equal((await manager.result(id)).savedEditsCheck, "unchecked");
+      assert.equal((await verify()).status, 200);
+      assert.equal((await manager.result(id)).savedEditsCheck, "passed");
+      assert.equal(manager.store.get(id)?.status, "failed");
+      assert.equal(runner.calls.length, callsBeforeRecheck);
+      assert.equal(await git(["rev-parse", "HEAD"], failed.worktree), failed.baseSha);
+      assert.equal((await recheck()).status, 202);
+      const recovered = await manager.whenDone(id);
+      assert.ok(recovered && recovered.status === "passed", recovered?.error ?? "Recheck did not complete");
+      assert.equal(recovered.id, id);
+      assert.equal(recovered.worktree, failed.worktree);
+      assert.equal(recovered.branch, failed.branch);
+      assert.deepEqual(recovered.stages.map(({ name, status }) => [name, status]), [
+        ["orchestrate", "passed"], ["frontend", "passed"], ["docs-writer", "passed"],
+      ]);
+      assert.equal(runner.calls.length, callsBeforeRecheck + 1);
+      assert.equal((await manager.result(id)).recheckStage, undefined);
+      assert.match(await git(["show", "HEAD:e2e/metric.sh"], failed.worktree), /18%/);
+      assert.equal(await git(["status", "--porcelain"], failed.worktree), "");
+    }
+    assert.match(readFileSync(join(target.path, "e2e/metric.sh"), "utf8"), /50%/);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
 test("Run locally calls the run’s provider once and supervises the app in its worktree", { timeout: 25_000 }, async () => {
   const { config } = await makeManager([]);
   const identify: Step = (req) => {

@@ -49,7 +49,7 @@ import { requireRole, type Role } from "./roles.ts";
 import type { RunControl } from "./run-control.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, sharedReference, type ReferenceCheck, type ReferenceReview } from "./references.ts";
 import { gateOk, type AttemptRecord, type GateRecord, type RunFollowUp, type RunKind, type RunRecord, type RunStatus, type RunStore, type StageRecord } from "./store.ts";
-import { changedFiles, commitAll, createWorktree, removeWorktree, repoRoot, revertFiles } from "./worktree.ts";
+import { changedFiles, commitAll, createWorktree, removeWorktree, repoRoot, revertFiles, worktreeSnapshot } from "./worktree.ts";
 
 /** Agent stops that still deserve grading: the agent ran out of room, but may have done the work. */
 const LIMIT_ERRORS = new Set(["error_max_turns", "error_max_budget_usd"]);
@@ -141,6 +141,7 @@ export interface PipelineDeps {
   runner: AgentRunner;
   runnerForProvider?: (provider: Provider) => AgentRunner;
   control?: RunControl;
+  recheckStage?: string;
   store: RunStore;
   roles: Map<string, Role>;
   log?: (line: string) => void;
@@ -220,6 +221,7 @@ export interface Judgement {
 
 interface StageOutcome {
   lane: Lane;
+  verifiedSnapshot?: string;
   replayed?: boolean;
   record: StageRecord;
   passed: boolean;
@@ -356,6 +358,13 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
       if (outOfLane.length) throw new Error(`Cannot commit ${outcome.record.name}: files outside the stage lane: ${outOfLane.join(", ")}`);
     }
     if (deps.control?.stopped) throw new RunStoppedError();
+    if (outcome.verifiedSnapshot !== undefined && await worktreeSnapshot(worktree) !== outcome.verifiedSnapshot) {
+      outcome.record.status = "failed";
+      const attempt = outcome.record.attempts.at(-1)!;
+      attempt.passed = false;
+      attempt.summary = "The worktree changed after the checks. Recheck when the edits are ready.";
+      throw new Error(attempt.summary);
+    }
     outcome.record.commit = (await commitAll(worktree, commitMessage(outcome.record.name, run))) ?? undefined;
     outcome.record.finalized = true;
     deps.store.save(run);
@@ -796,6 +805,38 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   if (control?.stopped) throw new RunStoppedError();
   const previous = run.stages.find((stage) => stage.name === spec.name);
   const last = previous?.attempts.at(-1);
+  if (previous && last && (deps.recheckStage === spec.name || (last.rechecked && last.passed && !previous.finalized && !previous.commit))) {
+    if (spec.readOnly || spec.judge || spec.expectGateFailure || previous.commit || previous.finalized) {
+      throw new Error("This stage requires an agent decision before continuing");
+    }
+    previous.status = "running";
+    deps.store.save(run);
+    const started = Date.now();
+    const attempt = last.attempt + 1;
+    const signal = control?.beginAttempt();
+    deps.store.event(run.id, { stage: spec.name, attempt, type: "attempt_start", provider: run.provider, rechecked: true });
+    const noChanges = !spec.allowNoChanges && !(await changedFiles(run.worktree)).length;
+    const snapshot = noChanges ? undefined : await worktreeSnapshot(run.worktree);
+    const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run.worktree, deps, signal);
+    const changed = snapshot !== undefined && !signal?.aborted &&
+      (await worktreeSnapshot(run.worktree).catch(() => undefined)) !== snapshot;
+    const stopped = Boolean(control?.stopped);
+    const passed = !signal?.aborted && !noChanges && !changed && !failed;
+    const summary = noChanges ? "There are no saved edits to recheck." :
+      changed ? "The worktree changed during the checks. Recheck when the edits are ready." :
+      passed ? "Rechecked the saved edits. All required checks passed." : "Rechecked the saved edits.";
+    if (changed || noChanges) run.error = summary;
+    previous.status = stopped ? "stopped" : passed ? "passed" : "failed";
+    previous.attempts.push({
+      attempt, rechecked: true, provider: run.provider, sessionId: last.sessionId, agentOk: last.agentOk,
+      interrupted: signal?.aborted ? stopped ? "stopped" : "redirected" : undefined,
+      costUsd: run.provider === "codex" ? null : 0, turns: 0, durationMs: Date.now() - started, summary, gates, passed,
+    });
+    run.totals = { ...sumAttempts(run), durationMs: run.totals.durationMs };
+    deps.store.save(run);
+    return { lane: "any", verifiedSnapshot: passed ? snapshot : undefined, record: previous, passed, stopped, session: last.sessionId ?
+      { provider: last.provider ?? run.provider ?? "claude", id: last.sessionId } : undefined, summary, lastFailure: failed };
+  }
   const sessionFor = (attempt: AttemptRecord | undefined): AgentSession | undefined =>
     attempt?.sessionId ? { provider: attempt.provider ?? run.provider ?? "claude", id: attempt.sessionId } : undefined;
   if (previous && (previous.status === "passed" || previous.status === "failed") && (
@@ -827,7 +868,6 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   deps.store.save(run);
 
   const reviewed = deps.checkpoints?.stages.includes(spec.name) ?? false;
-  const checks = spec.browserCheck ? [...spec.gates, BROWSER_CHECK] : spec.gates;
   let session = sessionFor(last) ?? spec.resumeSession;
   const deliveredImages = new Set<string>();
   let prompt = spec.prompt;
@@ -1043,32 +1083,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
     if (noChanges) log(`    ✗ no changes in the worktree`);
 
     // Gates run here, by the pipeline, regardless of what the agent claims.
-    const gates: GateRecord[] = [];
-    let failed: ExecResult | undefined;
-    if (!noChanges) {
-      for (const [index, command] of checks.entries()) {
-        const gate = index === spec.gates.length
-          ? await checkBrowser(run.worktree, deps.gateTimeoutMs, signal)
-          : await sh(command, run.worktree, deps.gateTimeoutMs, signal);
-        if (signal?.aborted) break;
-        // Normally a gate must pass. For triage it must fail (and not just time out): that proves the bug.
-        const wrongWay = spec.expectGateFailure ? gate.code === 0 || gate.timedOut : gate.code !== 0;
-        gates.push({
-          command,
-          expectFailure: spec.expectGateFailure || undefined,
-          code: gate.code,
-          durationMs: gate.durationMs,
-          timedOut: gate.timedOut,
-          outputTail: tail(gate.output, 4000),
-        });
-        const note = spec.expectGateFailure ? (wrongWay ? " (passes: bug not reproduced)" : " (fails as expected: bug reproduced)") : "";
-        log(`    ${wrongWay ? "✗" : "✓"} gate \`${command}\`${note} (${(gate.durationMs / 1000).toFixed(1)}s)`);
-        if (wrongWay) {
-          failed = gate;
-          break;
-        }
-      }
-    }
+    const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run.worktree, deps, signal);
 
     if (signal?.aborted) {
       recordInterruption(gates);
@@ -1158,6 +1173,34 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
     prompt = passed ? reviewerFeedbackPrompt(decision.message, "passed") : reviewerFeedbackPrompt(decision.message, "failed", prompt);
     failuresInARow = 0;
   }
+}
+
+async function runStageGates(spec: StageSpec, worktree: string, deps: PipelineDeps, signal?: AbortSignal) {
+  const log = deps.log ?? (() => {});
+  const checks = spec.browserCheck ? [...spec.gates, BROWSER_CHECK] : spec.gates;
+  const gates: GateRecord[] = [];
+  for (const [index, command] of checks.entries()) {
+    const gate = index === spec.gates.length
+      ? await checkBrowser(worktree, deps.gateTimeoutMs, signal)
+      : await sh(command, worktree, deps.gateTimeoutMs, signal);
+    if (signal?.aborted) break;
+    // Normally a gate must pass. For triage it must fail (and not just time out): that proves the bug.
+    const wrongWay = spec.expectGateFailure ? gate.code === 0 || gate.timedOut : gate.code !== 0;
+    gates.push({
+      command,
+      expectFailure: spec.expectGateFailure || undefined,
+      code: gate.code,
+      durationMs: gate.durationMs,
+      timedOut: gate.timedOut,
+      outputTail: tail(gate.output, 4000),
+    });
+    const note = spec.expectGateFailure ? (wrongWay ? " (passes: bug not reproduced)" : " (fails as expected: bug reproduced)") : "";
+    log(`    ${wrongWay ? "✗" : "✓"} gate \`${command}\`${note} (${(gate.durationMs / 1000).toFixed(1)}s)`);
+    if (wrongWay) {
+      return { gates, failed: gate };
+    }
+  }
+  return { gates, failed: undefined };
 }
 
 function sumAttempts(run: RunRecord) {

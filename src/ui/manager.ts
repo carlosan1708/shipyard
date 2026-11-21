@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { AgentAnswer, AgentAsk, AgentQuestion, AgentRunner } from "../agent.ts";
@@ -30,8 +30,8 @@ import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
 import { createRunPullRequest, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
-import { RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
-import { changedFiles, diffSinceHead, repoRoot, withRepoLock, type WorktreeDiff } from "../worktree.ts";
+import { gateOk, recoverableStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
+import { changedFiles, diffSinceHead, repoRoot, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
 
 /** Everything the UI is told about, as it happens. */
 export type LiveMessage =
@@ -287,10 +287,13 @@ export class RunManager {
     }, req.checkpoints, id);
   }
 
-  resume(runId: string): void {
+  resume(runId: string, recheck = false): void {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveRun(runId);
-    if (run.status !== "running" && run.status !== "stopped") throw new UserError("Only stopped or interrupted runs can be resumed");
+    const stage = recheck ? recoverableStage(run) : undefined;
+    if (recheck && !stage) throw new UserError("This run has no failed check that can be rechecked on the saved edits");
+    if (!recheck && run.status !== "running" && run.status !== "stopped") throw new UserError("Only stopped or interrupted runs can be resumed");
+    if (this.verifications.has(runId)) throw new UserError("Wait for the current project checks to finish");
     if (run.cleanedUp || !existsSync(run.worktree)) throw new UserError("The original worktree is unavailable");
     const target = this.opts.config.targets[run.target];
     if (!target) throw new UserError(`Configure the original target "${run.target}" before resuming`);
@@ -310,7 +313,7 @@ export class RunManager {
       crew: OPTIONAL_STAGES.filter((stage) => run.crew?.includes(stage) ?? DEFAULT_CREW.includes(stage)),
       implementer: IMPLEMENTERS.find((role) => role === run.implementer),
       resume: run,
-    }, checkpoints);
+    }, checkpoints, run.id, stage?.name);
   }
 
   async startFollowUp(runId: string, input: { message?: unknown; provider?: unknown; browserAccess?: unknown; referenceUrls?: unknown; browserReferenceHelp?: unknown; attachments?: unknown }): Promise<string> {
@@ -371,7 +374,7 @@ export class RunManager {
     return files.length ? writeFeedbackAttachments(this.store.dir(runId), files, newRun) : undefined;
   }
 
-  private startPipeline(req: PipelineRequest, checkpoints: readonly StageName[], id = req.resume?.id ?? makeRunId(req.request)): string {
+  private startPipeline(req: PipelineRequest, checkpoints: readonly StageName[], id = req.resume?.id ?? makeRunId(req.request), recheckStage?: string): string {
     const control = new RunControl();
     if (req.resume) {
       for (const event of this.store.events(id, Infinity)) {
@@ -389,6 +392,7 @@ export class RunManager {
         runner: this.opts.runner,
         runnerForProvider: (current) => current === "codex" ? this.opts.codexRunner! : this.opts.runner,
         control,
+        recheckStage,
         store: this.store,
         roles: this.opts.roles,
         log: this.opts.log ? (line) => this.opts.log!(`[${id.slice(-4)}] ${line}`) : undefined,
@@ -516,6 +520,9 @@ export class RunManager {
       ? await pullRequestOptions(run.repo, destination, run.branch, head, this.stopResultChecks.signal)
       : {};
     const localApp = this.localApps.get(runId);
+    const stage = target && uncommitted?.length ? recoverableStage(run) : undefined;
+    const verifiedEdits = stage && run.verification?.editsDigest &&
+      run.verification.editsDigest === await editsDigest(run.worktree).catch(() => undefined);
     return {
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,
@@ -524,13 +531,17 @@ export class RunManager {
       } : undefined,
       publishUnavailable: remotes && canPush && !destination ? "Choose one push destination by configuring origin with a single supported Git URL." : undefined,
       hasRemote: remotes === undefined ? undefined : Boolean(remotes),
-      canPreview: run.status === "passed" && !run.cleanedUp && canPreview(run.worktree),
+      canPreview: Boolean(run.finishedAt) && ["passed", "failed"].includes(run.status) && !run.cleanedUp && canPreview(run.worktree),
+      recheckStage: stage?.name,
+      savedEditsCheck: stage ? this.verifications.has(runId) ? "checking" : verifiedEdits ?
+        run.verification!.checks.every(gateOk) ? "passed" : "failed" : "unchecked" : undefined,
       previewUrl: preview?.url,
       canRunLocally: run.status === "passed" && Boolean(run.finishedAt) && !run.cleanedUp && existsSync(run.worktree),
       localApp: localApp ? { url: localApp.url, starting: !localApp.url } : undefined,
       handoff: {
         head, fileCount: committed === undefined ? undefined : files.length, files: files.slice(0, 40),
         uncommittedCount: uncommitted?.length,
+        uncommittedFiles: uncommitted?.slice(0, 40),
         configuredChecks: [target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined].filter(Boolean),
       },
     };
@@ -615,8 +626,8 @@ export class RunManager {
   async startLocalPreview(runId: string): Promise<string> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveRun(runId);
-    if (run.status !== "passed" || run.cleanedUp || !canPreview(run.worktree)) {
-      throw new UserError("Local preview needs a completed run with an index.html in its worktree");
+    if (!run.finishedAt || !["passed", "failed"].includes(run.status) || run.cleanedUp || !canPreview(run.worktree)) {
+      throw new UserError("Local preview needs a finished run with an index.html in its worktree");
     }
     let pending = this.previews.get(runId);
     if (!pending) {
@@ -725,23 +736,30 @@ export class RunManager {
       if (await repoRoot(target.path).catch(() => undefined) !== run.repo) throw new UserError("Configure the original target first");
       const head = await git(["rev-parse", "HEAD"], run.worktree);
       const branch = await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "");
-      if (branch !== `refs/heads/${run.branch}` || (await changedFiles(run.worktree)).length) {
+      const dirty = (await changedFiles(run.worktree)).length > 0;
+      const recovery = dirty ? recoverableStage(run) : undefined;
+      if (branch !== `refs/heads/${run.branch}` || (dirty && !recovery)) {
         throw new UserError("Verification needs the original branch and a clean worktree");
       }
+      const digest = recovery ? await editsDigest(run.worktree) : undefined;
       const checks: GateRecord[] = [];
       for (const command of new Set([target.test, target.e2e])) {
         if (!command) continue;
         const { code, timedOut, durationMs, output } = await sh(command, run.worktree, undefined, this.stopResultChecks.signal);
         checks.push({ command, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
       }
+      if (recovery?.attempts.some(({ gates }) => gates.some(({ command }) => command === BROWSER_CHECK)) && target.browserCheck) {
+        const { code, timedOut, durationMs, output } = await checkBrowser(run.worktree, undefined, this.stopResultChecks.signal);
+        checks.push({ command: BROWSER_CHECK, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
+      }
       if (await git(["rev-parse", "HEAD"], run.worktree) !== head ||
           await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "") !== branch ||
-          (await changedFiles(run.worktree)).length) {
+          (digest ? await editsDigest(run.worktree).catch(() => undefined) !== digest : (await changedFiles(run.worktree)).length > 0)) {
         throw new UserError("The run or worktree changed during verification. Results were not saved.");
       }
       const saved = this.store.get(runId);
       if (this.shuttingDown || !saved || saved.finishedAt !== run.finishedAt) throw new UserError("The run changed during verification");
-      saved.verification = { head, checks };
+      saved.verification = { head, checks, ...(digest ? { editsDigest: digest } : {}) };
       this.store.save(saved);
       return saved.verification;
     })().finally(() => this.verifications.delete(runId));
@@ -972,6 +990,10 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 /** An error caused by the request, shown to the user as-is (HTTP 400). */
 export class UserError extends Error {}
+
+async function editsDigest(worktree: string): Promise<string> {
+  return createHash("sha256").update(await worktreeSnapshot(worktree)).digest("hex");
+}
 
 function gitRemoteUrl(input: unknown): string {
   const invalid = () => new UserError("Enter an HTTPS or SSH clone URL for the repository, with no embedded password or access token.");

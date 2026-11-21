@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { lstat } from "node:fs/promises";
 import { git, gitAllowing } from "./exec.ts";
 
 export interface WorktreeDiff {
@@ -75,6 +76,21 @@ export async function changedFiles(cwd: string): Promise<string[]> {
   const out = await git(["status", "--porcelain=v1", "--no-renames", "-uall", "-z"], cwd, { raw: true });
   if (!out) return [];
   return out.split("\0").filter(Boolean).map((entry) => entry.slice(3));
+}
+
+/** Identify the edits being checked without staging them or following untracked symlinks. */
+export async function worktreeSnapshot(cwd: string): Promise<string> {
+  const [head, branch, diff, untracked] = await Promise.all([
+    git(["rev-parse", "HEAD"], cwd),
+    git(["symbolic-ref", "HEAD"], cwd),
+    git(["diff", "--binary", "HEAD", "--"], cwd, { raw: true }),
+    git(["ls-files", "--others", "--exclude-standard", "-z"], cwd, { raw: true }),
+  ]);
+  const files = await Promise.all(untracked.split("\0").filter(Boolean).map(async (path) => {
+    const info = await lstat(join(cwd, path), { bigint: true });
+    return [path, info.ino, info.mode, info.size, info.mtimeNs, info.ctimeNs].join("\0");
+  }));
+  return JSON.stringify([head, branch, diff, files]);
 }
 
 /** Undo changes to the given files: restore tracked ones from HEAD, delete untracked ones. */

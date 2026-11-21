@@ -581,6 +581,31 @@ code,
   color: var(--bad);
 }
 
+.run-recovery {
+  display: grid;
+  gap: 8px;
+  padding: 13px 15px;
+  border: 1px solid var(--border-strong);
+  border-inline-start: 3px solid var(--warn);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+
+.run-recovery h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.run-recovery.is-ready { border-inline-start-color: var(--ok); }
+.run-recovery .recovery-reason { display: grid; gap: 3px; }
+.recovery-reason strong { color: var(--text); }
+
+.run-result .run-recovery p,
+.run-head .run-recovery p,
+.run-recovery .run-result-actions {
+  margin: 0;
+}
+
 .run-result-facts {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);

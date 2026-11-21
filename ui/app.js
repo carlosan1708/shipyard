@@ -527,6 +527,7 @@ function connect() {
       if (run.finishedAt && !run.completionRead && completionLabel(run)) notifyCompletion(run);
     }
     if (previous?.publication?.pullRequestUrl !== run.publication?.pullRequestUrl) state.results.delete(run.id);
+    if (previous?.verification?.checks[0]?.checkedAt !== run.verification?.checks[0]?.checkedAt) state.results.delete(run.id);
     if (run.id === state.selected && run.status === "running" && !run.archivedAt && state.active.has(run.id)) state.showArchived = false;
     state.starting.delete(run.id);
     schedule();
@@ -797,6 +798,10 @@ function renderDetail() {
   const status = runStatus(run);
   const assignments = revisionAssignments(run);
   const waiting = inboxFor(run.id);
+  const result = run.finishedAt && completionLabel(run) ? finishedResult(run.id) : undefined;
+  const recovery = result && (run.status === "failed" || run.status === "error" || result.recheckStage);
+  const checking = recovery && (state.verificationPending.has(run.id) || result.savedEditsCheck === "checking");
+  const badge = recovery ? checking ? "Checking saved edits" : result.savedEditsCheck === "passed" ? "Ready to continue" : "Action needed" : STATUS_LABEL[status] ?? status;
   const events = state.events.get(run.id);
   const focused = document.activeElement;
   const restoreHandoff = root.contains(focused) && focused.id === "run-handoff";
@@ -808,7 +813,8 @@ function renderDetail() {
     h(
       "section",
       { class: "run-head" },
-      h("div", { class: "run-head-top" }, h("h1", { text: run.followUp ? "Revision" : run.request }), h("span", { class: `pill s-${status}`, text: STATUS_LABEL[status] ?? status })),
+      h("div", { class: "run-head-top" }, h("h1", { text: run.followUp ? "Revision" : run.request }), h("span", { class: `pill s-${recovery ? "waiting" : status}`, text: badge })),
+      recovery ? recoveryHandoff(run, result, checking) : null,
       run.followUp ? h("div", { class: "feedback-brief" },
         h("strong", { text: "Your feedback" }),
         h("p", { text: run.request }),
@@ -832,7 +838,7 @@ function renderDetail() {
         h("span", { class: "chip", id: "elapsed", text: workingTime(run) }),
         h("span", { class: "chip", text: `${run.totals.attempts} attempt${run.totals.attempts === 1 ? "" : "s"}` }),
       ),
-      runActions(run),
+      !run.finishedAt ? runActions(run) : null,
     ),
     waiting.length
       ? h(
@@ -843,7 +849,8 @@ function renderDetail() {
           h("button", { type: "button", class: "btn btn-sm", onclick: () => focusItem(waiting[0].id) }, "Review"),
         )
       : null,
-    run.finishedAt && completionLabel(run) ? runResult(run) : null,
+    result ? runResult(run, result, recovery) : null,
+    run.finishedAt ? runActions(run) : null,
     renderPipeline(run, assignments),
     assignments.length ? details(`${run.id}:assignments`, "Specialist assignments", h("ol", { class: "revision-assignments" },
       assignments.map(({ role, task }) => h("li", {}, h("strong", { text: roleLabel(role) }), h("p", { text: task }))),
@@ -874,12 +881,16 @@ function loadResult(runId) {
     .finally(() => { if (state.selected === runId) schedule("detail"); });
 }
 
-function runResult(run) {
-  if (!state.results.has(run.id)) loadResult(run.id);
-  const result = state.results.get(run.id);
+function finishedResult(runId) {
+  if (!state.results.has(runId)) loadResult(runId);
+  return state.results.get(runId);
+}
+
+function runResult(run, result, recovery) {
   const commits = run.stages.filter((stage) => stage.commit).length;
   const latest = new Map(run.stages.flatMap((stage) => stage.attempts.at(-1)?.gates ?? []).map((gate) => [gate.command, gate]));
-  if (run.verification && run.verification.head === result.handoff?.head && result.handoff.uncommittedCount === 0) {
+  if (run.verification && (["passed", "failed"].includes(result.savedEditsCheck) ||
+      run.verification.head === result.handoff?.head && result.handoff?.uncommittedCount === 0)) {
     for (const gate of run.verification.checks) latest.set(gate.command, gate);
   }
   const browserCheck = run.browserCheck ?? latest.get("Chrome browser check (desktop and phone)");
@@ -900,18 +911,19 @@ function runResult(run) {
     h("button", { type: "button", class: "btn btn-sm", text: label, onclick, disabled });
   return h("section", { class: "run-result", "aria-label": "Run result" },
     h("div", { class: "run-result-heading" },
-      h("h2", { id: "run-handoff", tabindex: "-1", text: "Run handoff" }),
+      h("h2", { id: recovery ? undefined : "run-handoff", tabindex: "-1", text: "Run handoff" }),
       h("span", { class: `pill s-${run.status}`, text: completionLabel(run) }),
       h("time", { datetime: run.finishedAt, text: ago(run.finishedAt), "data-time": run.finishedAt }),
     ),
-    run.error ? h("p", { class: "run-result-error", text: run.error }) : null,
+    !recovery && run.error ? h("p", { class: "run-result-error", text: run.error }) : null,
     h("p", { text: [
       gates.length ? `${passed}/${gates.length} checks passed` : "No recorded checks",
-      run.cleanedUp ? "Empty worktree removed" : `${commits} local commit${commits === 1 ? "" : "s"}`,
+      run.cleanedUp ? "Empty worktree removed" : result.handoff?.uncommittedCount ?
+        `${result.handoff.uncommittedCount} file${result.handoff.uncommittedCount === 1 ? "" : "s"} with saved edits` : `${commits} local commit${commits === 1 ? "" : "s"}`,
     ].join(" · ") }),
     !run.cleanedUp ? h("dl", { class: "run-result-facts" },
       h("dt", { text: "Branch" }), h("dd", { class: "mono", text: run.branch }),
-      h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
+      run.status === "passed" ? [h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
         h("span", { text: gitStatus }),
         result.hasRemote === false ? button("Connect Git remote", () => openGitRemote(run)) : null,
         publication && !publication.pushed ? button("Push branch", () => openPublish(run, publication)) : null,
@@ -922,24 +934,24 @@ function runResult(run) {
             text: pullRequestBusy ? "Creating PR…" : "Create PR on GitHub", onclick: () => createPullRequest(run.id, publication) }),
           h("a", { class: "btn btn-sm", href: publication.compareUrl, target: "_blank", rel: "noopener noreferrer", text: "Compare on GitHub" }),
         ] : publication?.pullRequestUnavailable ? h("span", { text: publication.pullRequestUnavailable }) : null,
-      ),
+      )] : null,
     ) : null,
     result.error ? h("p", { class: "run-result-error", text: result.error }) : null,
     h("div", { class: "run-result-actions" },
       run.status === "passed" && !run.cleanedUp ? button("Give feedback", () => openFeedback(run)) : null,
-      !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
+      !recovery && !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
       result.localApp?.url ? [
         h("a", { class: "btn btn-primary btn-sm", href: result.localApp.url, target: "_blank", rel: "noopener noreferrer", text: "Open local app" }),
         button(localAppBusy ? "Stopping app…" : "Stop local app", () => updateLocalApp(run.id, "DELETE"), localAppBusy),
       ] : result.canRunLocally ? h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: localAppBusy,
         text: localAppBusy ? "Local app agent is starting…" : "Run locally", onclick: () => updateLocalApp(run.id, "POST") }) : null,
-      result.previewUrl ? [
+      recovery ? null : result.previewUrl ? [
         h("a", { class: "btn btn-primary btn-sm", href: result.previewUrl, target: "_blank", rel: "noopener noreferrer", text: "Open local preview" }),
         button(previewBusy ? "Stopping…" : "Stop preview", () => updatePreview(run.id, "DELETE"), previewBusy),
       ] : result.canPreview ? h("button", { type: "button", class: "btn btn-primary btn-sm", text: previewBusy ? "Opening preview…" : "Open local preview", disabled: previewBusy, onclick: () => openRunPreview(run.id) }) : null,
-      result.canPreview ? button(browserBusy ? "Running browser check…" : "Run browser check", () => checkRunBrowser(run.id), browserBusy) : null,
+      result.canPreview && run.status === "passed" ? button(browserBusy ? "Running browser check…" : "Run browser check", () => checkRunBrowser(run.id), browserBusy) : null,
     ),
-    result.canPreview ? h("p", { class: "browser-run-status", role: "status", text: browserBusy ? "Testing desktop and phone layouts in the background…" : "The browser check tests desktop and phone layouts in the background." }) : null,
+    result.canPreview && run.status === "passed" ? h("p", { class: "browser-run-status", role: "status", text: browserBusy ? "Testing desktop and phone layouts in the background…" : "The browser check tests desktop and phone layouts in the background." }) : null,
     browserCheck && !browserBusy ? details(`${run.id}:browser-check`, h("span", {},
       `Browser check ${gateOk(browserCheck) ? "passed" : "failed"}`,
       browserCheck.checkedAt ? h("time", { class: "browser-checked-at", datetime: browserCheck.checkedAt, "data-time": browserCheck.checkedAt, text: ago(browserCheck.checkedAt) }) : null,
@@ -948,6 +960,48 @@ function runResult(run) {
     [...state.runs.values()].filter((child) => child.followUp?.runId === run.id).map((child) =>
       h("button", { type: "button", class: "btn btn-sm feedback-child", onclick: () => select(child.id) }, `Revision · ${firstLine(child.request)}`),
     ),
+  );
+}
+
+function recoveryHandoff(run, result, checking) {
+  const stage = run.stages.findLast((entry) => entry.status === "failed" || entry.status === "stopped");
+  const attempt = stage?.attempts.findLast((entry) => !entry.interrupted);
+  const ready = result.savedEditsCheck === "passed";
+  const recentFailure = result.savedEditsCheck === "failed" ? run.verification?.checks.find((gate) => !gateOk(gate)) : undefined;
+  const failure = recentFailure ?? attempt?.gates.find((gate) => !gateOk(gate));
+  const hint = failure?.outputTail?.split("\n").map((line) => line.trim())
+    .find((line) => /^(?:AssertionError|(?:[\w]+)?Error:|fatal:)/i.test(line));
+  const busy = state.resuming.has(run.id) || state.active.has(run.id);
+  const source = state.runs.get(run.followUp?.runId);
+  const saved = result.handoff?.uncommittedCount;
+  const previewBusy = state.previewPending.has(run.id);
+  const choose = (label, onclick, primary = false, disabled = false) =>
+    h("button", { type: "button", class: `btn btn-sm${primary ? " btn-primary" : ""}`, text: label, onclick, disabled });
+  return h("section", { class: `run-recovery${ready ? " is-ready" : ""}`, "aria-label": "Next step" },
+    h("h2", { id: "run-handoff", tabindex: "-1", text: checking ? "Checking your saved edits" : ready ? "Checks passed. Ready to continue." :
+      recentFailure ? "A check still needs a fix" : "The run paused after a failure" }),
+    !checking && !ready && (failure || run.error) ? h("p", { class: "recovery-reason" },
+      failure ? h("strong", { text: `${failure.command} ${failure.timedOut ? "timed out" : "failed"}` }) : null,
+      run.error || hint ? h("span", { text: run.error || hint.slice(0, 280) }) : null) : null,
+    h("p", { role: "status", text: checking ? "Shipyard is running the checks. No action is needed right now." :
+      result.loading ? "Loading your available actions…" : ready ? `You can review the edits or continue. Continuing commits them after a final check and resumes any remaining stages with ${providerLabel(run.provider)}.` :
+      recentFailure ? "Your edits are still saved. Open the check details to see what failed, then check again after it’s fixed." :
+      result.recheckStage ? "Start with Check saved edits. It runs the project checks and leaves the revision and its files as they are." :
+      saved ? "Your edits are saved locally. Open the check details or copy the worktree path to inspect them." :
+      source ? "Open the source run to review the last completed version." : "Review the failure before trying again." }),
+    h("div", { class: "run-result-actions" },
+      result.recheckStage && !checking ? ready
+        ? choose(busy ? "Continuing…" : "Continue this run", () => resumeRun(run.id, true), true, busy)
+        : choose(recentFailure ? "Check saved edits again" : "Check saved edits", () => verifyRunResult(run.id), true, busy)
+        : null,
+      result.previewUrl ? [
+        h("a", { class: "btn btn-sm", href: result.previewUrl, target: "_blank", rel: "noopener noreferrer", text: "Open local preview" }),
+        choose("Stop preview", () => updatePreview(run.id, "DELETE"), false, previewBusy),
+      ] : result.canPreview ? choose(previewBusy ? "Opening preview…" : "Preview saved edits", () => openRunPreview(run.id), false, previewBusy) : null,
+      saved && run.worktree ? choose("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
+      !result.recheckStage && !result.loading && source ? choose("Open source run", () => select(source.id)) : null,
+    ),
+    failure?.outputTail ? details(`${run.id}:recovery-output`, ready ? "View previous failure" : "View failed check output", h("pre", { class: "browser-check-output", text: failure.outputTail }), Boolean(recentFailure)) : null,
   );
 }
 
@@ -966,23 +1020,22 @@ function renderHandoff(run, result, checks) {
   const info = result.handoff;
   const reports = run.stages.filter((stage) => stage.name !== "orchestrate" && stage.name !== "plan")
     .flatMap((stage) => {
-      const summary = stage.attempts.at(-1)?.summary?.trim();
+      const summary = stage.attempts.findLast((attempt) => !attempt.rechecked)?.summary?.trim();
       return summary ? [{ stage, summary, sections: reportSections(summary) }] : [];
     });
   const missing = (info?.configuredChecks ?? []).filter((command) => !checks.has(command) || checks.get(command).expectFailure);
-  const unfinished = revisionAssignments(run).filter(({ role }) => !run.stages.some((stage) => stage.role === role && stage.status === "passed"));
+  const unfinished = revisionAssignments(run).filter(({ role }) => !run.stages.some((stage) => stage.role === role));
   const blocked = [...checks.values()].filter((gate) => !gateOk(gate));
   const needsProjectChecks = [...missing, ...blocked.map((gate) => gate.command)].some((command) =>
     info?.configuredChecks?.includes(command) && command !== "Chrome browser check (desktop and phone)");
   const verifying = state.verificationPending.has(run.id);
   const pending = [
-    ...(run.status !== "passed" && !unfinished.length ? [run.status === "stopped" ? "The run stopped before completion." : "Resolve the failed stage or run error before continuing."] : []),
-    ...unfinished.map(({ role, task }) => `${roleLabel(role)} · ${task}`),
-    ...blocked.map((gate) => `${gate.command} · ${gate.timedOut ? "timed out" : "failed"}`),
+    ...(run.status === "stopped" && !unfinished.length ? ["The run stopped before completion."] : []),
+    ...unfinished.map(({ role }) => `${roleLabel(role)} is waiting for an earlier stage`),
     ...missing.map((command) => `${command} · awaiting verification`),
-    ...((info?.uncommittedCount ?? 0) ? [`${info.uncommittedCount} uncommitted file${info.uncommittedCount === 1 ? "" : "s"} in the worktree`] : []),
   ];
   const agentPending = reports.flatMap(({ stage, sections }) => {
+    if (stage.attempts.at(-1)?.rechecked) return [];
     const text = sections.get("remaining")?.trim();
     return text && !/^(?:[-*]\s+)?(?:none|nothing pending|no outstanding items)\.?$/i.test(text) ? [{ stage, text }] : [];
   });
@@ -992,6 +1045,8 @@ function renderHandoff(run, result, checks) {
     h("section", { class: "handoff-panel" },
       h("h3", { text: "What changed" }),
       info?.head ? h("p", { class: "muted", text: `${info.fileCount ?? "—"} committed files · ${info.head.slice(0, 8)}` }) : null,
+      info?.uncommittedFiles?.length ? details(`${run.id}:saved-edits`, `Saved worktree edits (${info.uncommittedCount})`,
+        h("ul", { class: "handoff-files mono" }, info.uncommittedFiles.map((path) => h("li", { text: path })))) : null,
       reports.length ? reports.map(({ stage, summary, sections }) => {
         const excerpt = (sections.get("delivered") ?? summary).split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#"));
         const intro = excerpt?.replace(/^[-*]\s+/, "").replace(/\*\*|`/g, "");
@@ -1004,7 +1059,7 @@ function renderHandoff(run, result, checks) {
         h("ul", { class: "handoff-files mono" }, info.files.map(({ status, path }) => h("li", { text: `${status}  ${path}` })))) : null,
     ),
     h("section", { class: "handoff-panel" },
-      h("h3", { text: "Verified" }),
+      h("h3", { text: "Project checks" }),
       checks.size ? h("ul", {}, [...checks.values()].map((gate) => h("li", {},
         h("span", { class: `handoff-check ${gateOk(gate) ? "is-pass" : "is-fail"}`, text: gateOk(gate) ? gate.expectFailure ? "Reproduced" : "Passed" : "Failed" }),
         gate.command,
@@ -1025,8 +1080,8 @@ function renderHandoff(run, result, checks) {
           onclick: () => openReferenceHandoff(run.id, check.url) }) : null,
       )),
       agentPending.map(({ stage, text }) => h("div", { class: "handoff-report md" }, h("strong", { text: `From ${roleLabel(stage.role)}` }), md(text))),
-      !pending.length && !agentPending.length && !referenceGaps.length ? h("p", { class: "muted", text: "No open work or checks recorded." }) : null,
-      needsProjectChecks && !run.cleanedUp && run.status !== "stopped" ? h("button", { type: "button", class: "btn btn-sm handoff-action", onclick: () => verifyRunResult(run.id), disabled: verifying, text: verifying ? "Running project checks…" : "Run project checks" }) : null,
+      !pending.length && !agentPending.length && !referenceGaps.length ? h("p", { class: "muted", text: "No additional items." }) : null,
+      needsProjectChecks && !run.cleanedUp && run.status === "passed" ? h("button", { type: "button", class: "btn btn-sm handoff-action", onclick: () => verifyRunResult(run.id), disabled: verifying, text: verifying ? "Running project checks…" : "Run project checks" }) : null,
     ),
   );
 }
@@ -1057,6 +1112,7 @@ async function verifyRunResult(runId) {
     const { verification } = await api(`/api/runs/${runId}/verify`, { method: "POST" });
     const run = state.runs.get(runId);
     if (run) run.verification = verification;
+    state.results.delete(runId);
     const ok = verification.checks.every(gateOk);
     toast(ok ? "Project checks passed" : "A project check failed. See the handoff.", !ok);
   } catch (error) {
@@ -2184,12 +2240,12 @@ function runActions(run) {
       ]);
 }
 
-async function resumeRun(id) {
+async function resumeRun(id, recheck = false) {
   if (state.resuming.has(id)) return;
   state.resuming.add(id);
   schedule("detail");
   try {
-    await api(`/api/runs/${id}/resume`, { method: "POST" });
+    await api(`/api/runs/${id}/${recheck ? "recheck" : "resume"}`, { method: "POST" });
     if (state.selected === id) state.showArchived = false;
   } catch (error) {
     toast(error.message, true);
