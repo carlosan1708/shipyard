@@ -53,6 +53,11 @@ async function main() {
   const require = createRequire(join(checkout, "package.json"));
   const cli = ["--import", pathToFileURL(require.resolve("tsx")).href, join(checkout, "src", "cli.ts")];
   const cliOptions = { cwd: checkout, env: { ...process.env, SHIPYARD_ROOT: root } };
+  const version = command(process.execPath, [...cli, "ui-link", "--revision"], cliOptions);
+  const revision = version.stdout?.trim();
+  if (version.status !== 0 || !/^[a-f0-9]{12}$/.test(revision ?? "")) {
+    throw new Error("Could not identify the Shipyard dashboard version for this checkout.");
+  }
 
   let lastProbe = `No ${mode} dashboard link was found.`;
   let sawCandidate = false;
@@ -80,8 +85,13 @@ async function main() {
         lastProbe = `Dashboard state returned HTTP ${state.status}.`;
         return false;
       }
-      if ((await state.json()).config?.demo !== demo) {
+      const dashboard = await state.json();
+      if (dashboard.config?.demo !== demo) {
         lastProbe = "Dashboard mode did not match the request.";
+        return false;
+      }
+      if (dashboard.dashboardRevision !== revision) {
+        lastProbe = "The running dashboard belongs to a different Shipyard version.";
         return false;
       }
       return true;
@@ -112,13 +122,13 @@ async function main() {
   }
 
   const checkoutKey = createHash("sha256").update(root).digest("hex").slice(0, 12);
-  const label = `dev.shipyard.dashboard.${checkoutKey}.${mode}`;
+  const label = `dev.shipyard.dashboard.${checkoutKey}.${mode}.${revision}`;
   const domain = `gui/${process.getuid?.()}`;
   const service = `${domain}/${label}`;
   // launchd opens the job files before Node starts. Keep them outside the checkout.
   const stateDir = join(homedir(), "Library", "Application Support", "Shipyard", checkoutKey);
-  const plistPath = join(stateDir, `${mode}.plist`);
-  const logPath = join(stateDir, `${mode}.log`);
+  const plistPath = join(stateDir, `${mode}.${revision}.plist`);
+  const logPath = join(stateDir, `${mode}.${revision}.log`);
   const launchctl = (...args) => command("/bin/launchctl", args, { timeout: 15000 });
   const jobStatus = () => launchctl("print", service);
   const describeJob = (job) => {

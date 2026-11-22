@@ -85,20 +85,53 @@ function githubHead(api: ReturnType<typeof githubApi>, path: string, branch: str
   return api(`${path}/git/ref/heads/${ref}`, "--jq", ".object.sha");
 }
 
-export async function linkedPullRequestState(repo: string, repository: string, link: string, signal: AbortSignal): Promise<"open" | "closed" | undefined> {
+function linkedPullRequestNumber(repository: string, link: string): string | undefined {
   const url = URL.canParse(link) ? new URL(link) : undefined;
   const number = url?.pathname.split("/").at(-1);
   if (!number || !/^[1-9]\d*$/.test(number) || `${repository}/pull/${number}` !== link) return;
+  return number;
+}
+
+export async function linkedPullRequestState(repo: string, repository: string, link: string, signal: AbortSignal): Promise<"open" | "closed" | undefined> {
+  const number = linkedPullRequestNumber(repository, link);
+  if (!number) return;
   const path = `repos/${new URL(repository).pathname.slice(1)}/pulls/${number}`;
-  const state = await githubApi(repo, signal, 3000)(path, "--jq", ".state").catch(() => undefined);
+  const state = await githubApi(repo, signal, 3000)(path, "--jq", 'if .merged then "merged" else .state end').catch(() => undefined);
   return state === "open" || state === "closed" ? state : undefined;
 }
 
-export async function draftBase(repo: string, repository: string, signal: AbortSignal) {
+export async function closedPullRequest(repo: string, repository: string, link: string, branch: string, signal: AbortSignal) {
+  const number = linkedPullRequestNumber(repository, link);
+  if (!number) throw new Error("The linked pull request is unavailable in this repository.");
+  const slug = new URL(repository).pathname.slice(1);
+  const path = `repos/${slug}/pulls/${number}`;
+  const api = githubApi(repo, signal, 12_000);
+  const details = await api(path, "--jq", '{state, merged, body, branch:.head.ref, repository:.head.repo.full_name, base:.base.ref}')
+    .then((value) => JSON.parse(value) as { state?: string; merged?: boolean; body?: string | null; branch?: string; repository?: string; base?: string })
+    .catch(() => { throw new Error("Shipyard couldn’t read the linked pull request on GitHub. Try reviewing it again."); });
+  if (details.state !== "closed" || details.merged !== false || details.branch !== branch || details.repository?.toLowerCase() !== slug.toLowerCase() || !details.base) {
+    throw new Error("The linked pull request must be closed, unmerged, and use this branch to reopen it.");
+  }
+  return { link, number, base: details.base, body: details.body ?? "" };
+}
+
+export async function reopenRunPullRequest(repo: string, repository: string, link: string, branch: string, head: string,
+  base: { branch: string; head: string }, description: string, signal: AbortSignal): Promise<void> {
+  const closed = await closedPullRequest(repo, repository, link, branch, signal);
+  const path = `repos/${new URL(repository).pathname.slice(1)}`;
+  const api = githubApi(repo, signal, 30_000);
+  if (closed.base !== base.branch || await githubHead(api, path, base.branch) !== base.head || await githubHead(api, path, branch) !== head) {
+    throw new Error("The GitHub branches changed. Review the pull request again before reopening it.");
+  }
+  const opened = await writePullRequest(api, `${path}/pulls/${closed.number}`, "PATCH", { state: "open", body: description }, ".state");
+  if (opened !== "open") throw new Error("GitHub did not confirm that the pull request reopened.");
+}
+
+export async function draftBase(repo: string, repository: string, signal: AbortSignal, requestedBranch?: string) {
   const api = githubApi(repo, signal, 12_000);
   const path = `repos/${new URL(repository).pathname.slice(1)}`;
   try {
-    const branch = await api(path, "--jq", ".default_branch");
+    const branch = requestedBranch ?? await api(path, "--jq", ".default_branch");
     const head = await githubHead(api, path, branch);
     if (!branch || !/^[a-f0-9]{40}$/.test(head)) throw new Error("GitHub returned an invalid base branch");
     return { branch, head };
@@ -107,7 +140,18 @@ export async function draftBase(repo: string, repository: string, signal: AbortS
     if (failure.code === "ENOENT" || /HTTP 401|gh auth login|bad credentials/i.test(failure.stderr ?? "")) {
       throw new Error("Sign in to GitHub on this computer, then review the draft again.");
     }
-    throw new Error("Shipyard couldn’t read the default branch on GitHub. Check the repository connection and try again.");
+    throw new Error("Shipyard couldn’t read the base branch on GitHub. Check the repository connection and try again.");
+  }
+}
+
+async function writePullRequest(api: ReturnType<typeof githubApi>, path: string, method: "POST" | "PATCH", body: object, field: string) {
+  const directory = await mkdtemp(join(tmpdir(), "shipyard-pr-"));
+  try {
+    const input = join(directory, "pull-request.json");
+    await writeFile(input, JSON.stringify(body), { mode: 0o600 });
+    return await api(path, "--method", method, "--input", input, "--jq", field);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -179,15 +223,8 @@ export async function createRunPullRequest(repo: string, repository: string, bra
         throw new Error("reviewed base changed");
       }
       const title = await git(["show", "-s", "--format=%s", head], repo);
-      const directory = await mkdtemp(join(tmpdir(), "shipyard-pr-"));
-      try {
-        const input = join(directory, "pull-request.json");
-        await writeFile(input, JSON.stringify({ head: branch, base, title: title || branch, draft, body: description }), { mode: 0o600 });
-        const created = await api(`${apiPath}/pulls`, "--method", "POST", "--input", input, "--jq", ".html_url");
-        pullRequestUrl = confirmedUrl(created);
-      } finally {
-        await rm(directory, { recursive: true, force: true });
-      }
+      const created = await writePullRequest(api, `${apiPath}/pulls`, "POST", { head: branch, base, title: title || branch, draft, body: description }, ".html_url");
+      pullRequestUrl = confirmedUrl(created);
     }
   } catch (error) {
     if (error instanceof PullRequestComparisonError) throw error;

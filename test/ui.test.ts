@@ -305,6 +305,60 @@ test("the server needs its token, checks Host and Origin, and serves the API", a
   }
 });
 
+test("each dashboard serves the UI assets from its own startup", async () => {
+  const { manager, config } = await makeManager([]);
+  const uiDir = tempDir("sy-ui-assets-");
+  const original = { "index.html": "Original dashboard", "app.js": "Original script", "styles.css": "Original styles" };
+  writeFiles(uiDir, original);
+  const old = await startUiServer({ manager, config, uiDir, revision: "old" });
+  try {
+    const replacement = { "index.html": "New dashboard", "app.js": "New script", "styles.css": "New styles" };
+    writeFiles(uiDir, replacement);
+    const current = await startUiServer({ manager, config, uiDir, revision: "new" });
+    try {
+      for (const [server, expected, revision] of [[old, original, "old"], [current, replacement, "new"]] as const) {
+        const headers = { "x-shipyard-token": server.token };
+        assert.equal((await request(server.port, "/", { headers })).body, expected["index.html"]);
+        assert.equal((await request(server.port, "/app.js", { headers })).body, expected["app.js"]);
+        assert.equal((await request(server.port, "/styles.css")).body, expected["styles.css"]);
+        assert.equal(JSON.parse((await request(server.port, "/api/state", { headers })).body).dashboardRevision, revision);
+      }
+    } finally {
+      await current.close();
+    }
+  } finally {
+    await Promise.all([old.close(), manager.shutdown()]);
+  }
+});
+
+test("the launcher opens links only for a server that matches the current checkout", { timeout: 30_000 }, async () => {
+  const { dashboardRevision, writeSession } = await import("../src/ui/session.ts");
+  const { manager, config } = await makeManager([]);
+  const root = tempDir("sy-ui-launcher-");
+  const token = "a".repeat(48);
+  const revision = dashboardRevision();
+  const old = await startUiServer({ manager, config, token, revision: "old" });
+  const current = await startUiServer({ manager, config, token, revision });
+  const command = promisify(execFile);
+  const options = { env: { ...process.env, SHIPYARD_ROOT: root } };
+  try {
+    writeFiles(root, { "shipyard.config.yaml": "targets: {}\n", ".shipyard/ui-token": token });
+    const sessionsDir = join(root, ".shipyard");
+    const olderBuild = { port: old.port, pid: process.pid, demo: false, startedAt: "2026-01-02" };
+    writeSession(olderBuild, sessionsDir);
+    writeSession({ port: current.port, pid: process.pid, demo: false, startedAt: "2026-01-01", revision }, sessionsDir);
+    const list = await command(process.execPath, ["--import", "tsx", "src/cli.ts", "ui-link"], options);
+    assert.deepEqual(list.stdout.trim().split("\n").map((link) => new URL(link).port), [String(current.port)]);
+
+    // A misleading session record still has to pass the authenticated API version check.
+    writeSession({ ...olderBuild, revision }, sessionsDir);
+    const checked = await command(process.execPath, [".agents/skills/shipyard/scripts/dashboard.mjs", "check"], options);
+    assert.match(checked.stdout, new RegExp(`on port ${current.port}\\.`));
+  } finally {
+    await Promise.all([old.close(), current.close(), manager.shutdown()]);
+  }
+});
+
 test("end to end over HTTP with the demo crew: start, stream, answer the question, permission and checkpoints", async () => {
   const { manager, config } = await makeManager("demo");
   // The demo crew edits the demo-shop app; point the target at a real copy of it.
@@ -1022,7 +1076,7 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
   }
 });
 
-test("the draft PR handoff reviews unrelated histories, verifies a compatible branch, and publishes only after approval", { timeout: 60_000 }, async () => {
+test("the draft PR handoff reviews, verifies, publishes, and reopens only after approval", { timeout: 75_000 }, async () => {
   const { git } = await import("../src/exec.ts");
   const { initRepoWithCommit } = await import("../src/worktree.ts");
   const { manager, config } = await makeManager([fix]);
@@ -1036,6 +1090,7 @@ test("the draft PR handoff reviews unrelated histories, verifies a compatible br
   const fake = tempDir("sy-draft-cli-");
   const log = join(fake, "draft-created");
   const closed = join(fake, "draft-closed");
+  const reopened = join(fake, "draft-reopened");
   const originalPath = process.env.PATH;
   try {
     const source = await manager.whenDone(id);
@@ -1062,7 +1117,7 @@ process.exit(spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" }).s
     const pr = "https://github.com/example/draft-fixture/pull/42";
     writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
 const { execFileSync } = require("node:child_process");
-const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { existsSync, readFileSync, unlinkSync, writeFileSync } = require("node:fs");
 const args = process.argv.slice(2);
 const endpoint = args[3];
 if (endpoint === "repos/example/draft-fixture") console.log("main");
@@ -1076,7 +1131,20 @@ else if (endpoint.endsWith("/pulls") && args.includes("POST")) {
   if (payload.draft !== true || payload.base !== "main" || !payload.body.trim()) process.exit(1);
   writeFileSync(${JSON.stringify(log)}, input);
   console.log(${JSON.stringify(pr)});
-} else if (endpoint.endsWith("/pulls/42")) console.log(existsSync(${JSON.stringify(closed)}) ? "closed" : "open");
+} else if (endpoint.endsWith("/pulls/42")) {
+  const isClosed = existsSync(${JSON.stringify(closed)});
+  if (args.includes("PATCH")) {
+    if (!isClosed) process.exit(1);
+    const input = readFileSync(args[args.indexOf("--input") + 1], "utf8");
+    writeFileSync(${JSON.stringify(reopened)}, input);
+    unlinkSync(${JSON.stringify(closed)});
+    console.log("open");
+  } else if (args.at(-1).includes(".head.ref")) {
+    const saved = JSON.parse(readFileSync(${JSON.stringify(log)}, "utf8"));
+    console.log(JSON.stringify({state:isClosed ? "closed" : "open", merged:false, body:saved.body,
+      branch:saved.head, repository:"example/draft-fixture", base:saved.base}));
+  } else console.log(isClosed ? "closed" : "open");
+}
 else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !existsSync(${JSON.stringify(closed)})) console.log(${JSON.stringify(pr)});
 `, { mode: 0o755 });
     process.env.PATH = `${fake}:${originalPath}`;
@@ -1116,6 +1184,19 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
     assert.equal(handoff?.pullRequestUrl, undefined);
     assert.equal(handoff?.closedPullRequestUrl, pr);
     assert.equal(handoff?.canDraftPullRequest, true);
+    const reopenedReview = await post({ action: "review", reopen: true, head: handoff?.head, destination: handoff?.destination });
+    assert.equal(reopenedReview.status, 200, reopenedReview.body);
+    const { review: reopen } = JSON.parse(reopenedReview.body);
+    assert.deepEqual(reopen.reopen, { number: "42", url: pr });
+    assert.equal(reopen.description, description);
+    assert.equal(existsSync(reopened), false);
+    const edit = `${description}\nReady for another review.\n`;
+    const reopenedPR = await post({ action: "create", token: reopen.token, description: edit });
+    assert.equal(reopenedPR.status, 200, reopenedPR.body);
+    assert.deepEqual(JSON.parse(readFileSync(reopened, "utf8")), { state: "open", body: edit });
+    assert.equal(JSON.parse(reopenedPR.body).result.publish.pullRequestUrl, pr);
+    assert.equal(manager.store.get(id)?.branch, run.branch);
+    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, description);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;

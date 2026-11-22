@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SHIPYARD_ROOT } from "../config.ts";
 
 export const TOKEN_FILE = join(SHIPYARD_ROOT, ".shipyard", "ui-token");
@@ -11,6 +13,28 @@ export interface UiSession {
   pid: number;
   demo: boolean;
   startedAt: string;
+  revision?: string;
+}
+
+/** Identify the dashboard's server code, assets, and runtime dependencies at launch. */
+export function dashboardRevision(): string {
+  const checkout = fileURLToPath(new URL("../../", import.meta.url));
+  const hash = createHash("sha256");
+  function addFile(path: string) {
+    const data = readFileSync(join(checkout, path));
+    hash.update(`${path}\0${data.length}\0`).update(data);
+  }
+  function addDirectory(path: string) {
+    const entries = readdirSync(join(checkout, path), { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name, "en"));
+    for (const entry of entries) {
+      const name = `${path}/${entry.name}`;
+      if (entry.isDirectory()) addDirectory(name);
+      else if (entry.isFile()) addFile(name);
+    }
+  }
+  for (const file of ["package.json", "package-lock.json"]) addFile(file);
+  for (const dir of ["src", "ui", "bin", "plugins/shipyard"]) addDirectory(dir);
+  return hash.digest("hex").slice(0, 12);
 }
 
 const fileFor = (dir: string, port: number) => join(dir, `ui-session-${port}.json`);

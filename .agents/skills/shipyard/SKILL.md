@@ -9,7 +9,7 @@ Use the installed `shipyard` CLI. If it is unavailable and the Shipyard checkout
 
 For `$shipyard start UI`, use the standard mode. For `$shipyard start demo UI`, add `--demo` to every helper call. On macOS, run the skill's [dashboard helper](scripts/dashboard.mjs) in two **separate shell commands**:
 
-1. Run `node <skill-folder>/scripts/dashboard.mjs ensure`. It reuses a healthy dashboard of the requested mode or starts a macOS GUI LaunchAgent. Launchd owns the server independently of the chat command.
+1. Run `node <skill-folder>/scripts/dashboard.mjs ensure`. It reuses a healthy dashboard for the current checkout and requested mode or starts a macOS GUI LaunchAgent for that version. Launchd owns the server independently of the chat command.
 2. After that command exits, run `node <skill-folder>/scripts/dashboard.mjs open`. It fetches the private link internally, checks for authenticated HTTP 200 before opening, and checks again afterward. Report success only when this command succeeds.
 
 If opening or the post-open check fails, inspect the helper's process status and redacted logs. Use its `diagnose` action for more detail, then retry `ensure` and `open` separately when recovery is possible. Report the observed result if it still fails. Keep the token out of chat and tool output by letting the helper consume the link and open the browser. Dashboard startup ends with an open, verified page. Start a fleet run only when the user asks for one. On other platforms the helper can verify and open an existing dashboard.

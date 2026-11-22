@@ -10,6 +10,7 @@ export interface DraftReview {
   base: { branch: string; head: string };
   branch: string;
   description: string;
+  reopen?: { url: string; number: string };
   transplant?: { tree: string; conflicts: string[] };
 }
 

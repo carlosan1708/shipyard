@@ -7,7 +7,7 @@ import { CodexAgentRunner } from "./codex.ts";
 import { DemoRunner } from "./ui/demo.ts";
 import { RunManager } from "./ui/manager.ts";
 import { loadOrCreateToken, startUiServer } from "./ui/server.ts";
-import { clearSession, readLiveSessions, TOKEN_FILE, writeSession } from "./ui/session.ts";
+import { clearSession, dashboardRevision, readLiveSessions, TOKEN_FILE, writeSession } from "./ui/session.ts";
 import { ignoredBillingVars } from "./auth.ts";
 import { SHIPYARD_ROOT, loadConfig, providerOptions, resolveProvider, validateRunOptions, type Provider, type RunEffort, type ShipyardConfig } from "./config.ts";
 import { DEMO_APP_DIR, formatReport, loadTasks, runEval, validateTask } from "./eval.ts";
@@ -323,8 +323,9 @@ async function main(argv: string[]): Promise<number> {
         configFile: values.demo ? undefined : join(SHIPYARD_ROOT, "shipyard.config.yaml"),
       });
       const token = loadOrCreateToken(TOKEN_FILE, values["new-token"]);
-      const server = await startUiServer({ manager, config: uiConfig, port: Number(values.port), demo: values.demo, token });
-      writeSession({ port: server.port, pid: process.pid, demo: values.demo, startedAt: new Date().toISOString() });
+      const revision = dashboardRevision();
+      const server = await startUiServer({ manager, config: uiConfig, port: Number(values.port), demo: values.demo, token, revision });
+      writeSession({ port: server.port, pid: process.pid, demo: values.demo, startedAt: new Date().toISOString(), revision });
       console.log(`shipyard ui${values.demo ? " (demo mode: scripted agents, no provider usage)" : ""}`);
       if (!values.demo) console.log(runHeader(uiConfig, uiConfig.defaultProvider ?? "claude"));
       if (values["quiet-link"]) console.log(`Dashboard listening on 127.0.0.1:${server.port}`);
@@ -348,9 +349,15 @@ async function main(argv: string[]): Promise<number> {
     }
 
     case "ui-link": {
-      const sessions = readLiveSessions();
+      const { values } = parseArgs({ args: rest, options: { revision: { type: "boolean" } } });
+      const revision = dashboardRevision();
+      if (values.revision) {
+        console.log(revision);
+        return 0;
+      }
+      const sessions = readLiveSessions().filter((session) => session.revision === revision);
       if (!sessions.length || !existsSync(TOKEN_FILE)) {
-        console.error("No shipyard ui is running from this folder. Start it with: npm run shipyard -- ui");
+        console.error("No dashboard for this Shipyard version is running. Start it with: npm run shipyard -- ui");
         return 1;
       }
       const token = readFileSync(TOKEN_FILE, "utf8").trim();

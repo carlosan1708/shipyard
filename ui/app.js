@@ -955,8 +955,11 @@ function runResult(run, result, recovery) {
       run.status === "passed" && !result.latestRevisionId ? [h("dt", { text: "Pull request" }), h("dd", { class: "git-remote-status" },
         h("span", { text: gitStatus }),
         result.hasRemote === false ? button("Connect Git remote", () => openGitRemote(run)) : null,
+        publication?.closedPullRequestUrl ? h("button", { type: "button", class: "btn btn-primary btn-sm",
+          text: "Reopen PR", onclick: () => openDraftReview(run.id, publication, true), disabled: pendingPullRequest !== undefined }) : null,
         publication?.canDraftPullRequest && !publication.pullRequestUrl ? h("button", {
-          type: "button", class: "btn btn-primary btn-sm", text: "Create draft PR", onclick: () => openDraftReview(run.id, publication),
+          type: "button", class: `btn btn-sm${publication.closedPullRequestUrl ? "" : " btn-primary"}`,
+          text: "Create draft PR", onclick: () => openDraftReview(run.id, publication),
           disabled: pendingPullRequest !== undefined,
         }) : null,
         publication?.closedPullRequestUrl ? h("a", { class: "btn btn-sm", href: publication.closedPullRequestUrl,
@@ -2606,9 +2609,10 @@ function openPublish(run, publication) {
   $("publish-submit").focus();
 }
 
-function openDraftReview(runId, publication) {
-  const view = { runId, review: null };
+function openDraftReview(runId, publication, reopen = false) {
+  const view = { runId, reopen, review: null };
   state.draftReview = view;
+  $("draft-pr-title").textContent = reopen ? "Reopen pull request" : "Create draft pull request";
   $("draft-pr-dialog").showModal();
   void loadDraftReview(view, publication);
 }
@@ -2627,7 +2631,7 @@ async function loadDraftReview(view, publication) {
   $("draft-pr-description-field").hidden = true;
   description.disabled = true;
   status.textContent = "Checking the branch and GitHub destination…";
-  submit.textContent = "Approve and create draft PR";
+  submit.textContent = view.reopen ? "Approve and reopen PR" : "Approve and create draft PR";
   try {
     if (!publication) {
       const result = await api(`/api/runs/${view.runId}/result`);
@@ -2643,7 +2647,7 @@ async function loadDraftReview(view, publication) {
       if (!publication) throw new Error("The handoff no longer has a GitHub branch to publish.");
     }
     const { review } = await api(`/api/runs/${view.runId}/draft-pull-request`, { method: "POST",
-      body: { action: "review", head: publication.head, destination: publication.destination } });
+      body: { action: "review", head: publication.head, destination: publication.destination, reopen: view.reopen } });
     if (!dialog.open || state.draftReview !== view) return;
     view.review = review;
     description.value = view.description ?? review.description;
@@ -2651,13 +2655,14 @@ async function loadDraftReview(view, publication) {
     $("draft-pr-description-field").hidden = false;
     facts.replaceChildren(...[
       ["Repository", new URL(review.repository).pathname.slice(1)], ["Base", `${review.base.branch} · ${review.base.head.slice(0, 12)}`], ["Branch", review.branch],
+      ...(review.reopen ? [["Pull request", `#${review.reopen.number}`]] : []),
     ].flatMap(([label, value]) => [h("dt", { text: label }), h("dd", { class: "mono", text: value })]));
     facts.hidden = false;
     if (review.transplant?.conflicts.length) {
       $("draft-pr-conflict-files").replaceChildren(...review.transplant.conflicts.map((file) => h("li", { text: file })));
       conflicts.hidden = false;
     }
-    status.textContent = review.transplant
+    status.textContent = review.reopen ? "Shipyard will push the verified commit if needed and reopen this pull request with the description below." : review.transplant
       ? "Shipyard will verify a new branch based on GitHub’s default branch, push it, and open a draft. The original branch is available as a backup."
       : "Shipyard will push the verified commit if needed and open a draft pull request.";
     submit.disabled = false;
@@ -2696,13 +2701,13 @@ function wireDraftReview() {
     description.disabled = true;
     submit.disabled = cancel.disabled = true;
     error.hidden = true;
-    status.textContent = view.review.transplant ? "Verifying the compatible branch and opening the draft…" : "Opening the draft pull request…";
+    status.textContent = view.reopen ? "Reopening the pull request…" : view.review.transplant ? "Verifying the compatible branch and opening the draft…" : "Opening the draft pull request…";
     try {
       const { result } = await api(`/api/runs/${view.runId}/draft-pull-request`, { method: "POST",
         body: { action: "create", token: view.review.token, description: view.description } });
       state.results.set(view.runId, result);
       dialog.close();
-      toast("Draft pull request ready");
+      toast(view.reopen ? "Pull request reopened" : "Draft pull request ready");
     } catch (err) {
       state.results.delete(view.runId);
       view.review = null;

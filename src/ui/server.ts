@@ -25,6 +25,7 @@ export interface UiServerOptions {
   token?: string;
   demo?: boolean;
   uiDir?: string;
+  revision?: string;
 }
 
 export interface UiServer {
@@ -60,6 +61,9 @@ export function loadOrCreateToken(file: string, rotate = false): string {
 export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
   const token = opts.token ?? randomBytes(24).toString("hex");
   const uiDir = opts.uiDir ?? UI_DIR;
+  // An upgraded checkout must not change the UI of a server that still handles the previous API.
+  const assets = new Map(Object.entries(STATIC).map(([path, { file, type }]) =>
+    [path, { type, content: readFileSync(join(uiDir, file)) }] as const));
   const clients = new Set<http.ServerResponse>();
   let port = 0;
 
@@ -76,7 +80,7 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
       if (!allowedHosts.includes(req.headers.host ?? "")) return text(res, 403, "Forbidden host");
 
       // The stylesheet is public, so the sign-in page below can use it. It holds no data.
-      if (req.method === "GET" && url.pathname === "/styles.css") return sendAsset(res, STATIC["/styles.css"]!, uiDir);
+      if (req.method === "GET" && url.pathname === "/styles.css") return sendAsset(res, assets.get("/styles.css")!);
 
       // Opening the printed link: trade the token in the URL for a cookie, then drop it from the address bar.
       if (req.method === "GET" && url.pathname === "/" && url.searchParams.has("token")) {
@@ -106,14 +110,15 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         if (origin && !allowedHosts.some((h) => origin === `http://${h}`)) return json(res, 403, { error: "Cross-origin request refused" });
       }
 
-      const asset = STATIC[url.pathname];
-      if (req.method === "GET" && asset) return sendAsset(res, asset, uiDir);
+      const asset = assets.get(url.pathname);
+      if (req.method === "GET" && asset) return sendAsset(res, asset);
 
       if (req.method === "GET" && url.pathname === "/api/state") {
         return json(res, 200, {
           config: { ...opts.config, demo: Boolean(opts.demo), canAddTargets: opts.manager.canAddTargets, canCloneTargets: opts.manager.canAddTargets },
           acceptsAttachments: true,
           feedbackReusesBranch: true,
+          dashboardRevision: opts.revision,
           efforts: EFFORTS,
           codexEfforts: CODEX_EFFORTS,
           roles: opts.manager.roles(),
@@ -345,9 +350,9 @@ const SECURITY_HEADERS = {
   "referrer-policy": "no-referrer",
 };
 
-function sendAsset(res: http.ServerResponse, asset: { file: string; type: string }, uiDir: string): void {
+function sendAsset(res: http.ServerResponse, asset: { content: Buffer; type: string }): void {
   res.writeHead(200, { "content-type": asset.type, "cache-control": "no-store", "x-content-type-options": "nosniff", ...SECURITY_HEADERS });
-  res.end(readFileSync(join(uiDir, asset.file)));
+  res.end(asset.content);
 }
 
 /** Shown instead of the app when this browser has no (or an old) token. Static text only. */

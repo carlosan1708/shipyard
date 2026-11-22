@@ -79,7 +79,7 @@ Use **Open local preview** to see the static site. **Run browser check** verifie
 
 The **Run handoff** lists changes, specialist reports, recorded verification and pending items. Choose **Allow local browser access** on a run or revision to let either provider inspect screenshots and activate local controls in an isolated browser. `browserAccess: true` sets the target default, and `--browser` or `--no-browser` overrides it in the CLI. Include GitHub or LinkedIn URLs in the run request or use `--reference=<url>` in the CLI to pass public source material to the crew. Shipyard logs permission gaps, public access failures, and sign-in requirements in the run. It uses a separate connection with no account cookies or tokens.
 
-In a finished result, **Run project checks** records the configured unit and end-to-end checks against the current run branch. Under **Pull request**, choose **Connect Git remote** to save the clone URL of an existing repository as `origin`. **Create draft PR** lets you review the GitHub destination, base, branch, and editable Markdown description before approving the push and draft together. If the histories are unrelated, Shipyard applies the run’s changes to GitHub’s default branch in a separate worktree. The review lists overlapping files whose run versions will be used. Shipyard reruns the configured checks before publishing that branch. **Push branch** is also available for publishing just the branch. Shipyard uses the local GitHub CLI account (`gh auth login`) to create or find the PR. **Open PR on GitHub** opens the saved URL. A closed PR can still be viewed from the handoff, and you can create a fresh draft when the branch has changes to merge.
+In a finished result, **Run project checks** records the configured unit and end-to-end checks against the current run branch. Under **Pull request**, choose **Connect Git remote** to save the clone URL of an existing repository as `origin`. **Create draft PR** lets you review the GitHub destination, base, branch, and editable Markdown description before approving the push and draft together. If the histories are unrelated, Shipyard applies the run’s changes to GitHub’s default branch in a separate worktree. The review lists overlapping files whose run versions will be used. Shipyard reruns the configured checks before publishing that branch. **Push branch** is also available for publishing just the branch. Shipyard uses the local GitHub CLI account (`gh auth login`) to create or find the PR. **Open PR on GitHub** opens the saved URL. Choose **Reopen PR** to review and update the description of a closed, unmerged PR on the run branch before reopening the same PR.
 
 ### Google Cloud releases
 
@@ -138,7 +138,7 @@ ln -s "$(pwd)/.agents/skills/shipyard" ~/.agents/skills/shipyard
 npm link
 ```
 
-The skill uses the registered names shown by `shipyard targets`. Use the dashboard for interactive approvals. On macOS, the skill reuses a healthy dashboard of the requested mode or starts a GUI LaunchAgent, then verifies the authenticated page before and after opening the browser.
+The skill uses the registered names shown by `shipyard targets`. Use the dashboard for interactive approvals. On macOS, the skill reuses a dashboard built from the current checkout in the requested mode or starts a GUI LaunchAgent for that version. It verifies the authenticated page before and after opening the browser. A server serves the UI assets it loaded at startup.
 
 ## Claude Code plugin
 

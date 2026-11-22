@@ -29,7 +29,7 @@ import { git, sh } from "../exec.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, validReferenceText, type ReviewedReference } from "../references.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
-import { createRunPullRequest, draftBase, fetchDraftBase, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit } from "./publication.ts";
+import { closedPullRequest, createRunPullRequest, draftBase, fetchDraftBase, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit, reopenRunPullRequest } from "./publication.ts";
 import { describePullRequest, markdownCode, MAX_PULL_REQUEST_DESCRIPTION, reviewDraftBranch, type DraftReview } from "./draft-pr.ts";
 import { CloudRunReleases } from "./cloud-release.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
@@ -788,7 +788,7 @@ export class RunManager {
     return publishing;
   }
 
-  async draftPullRequest(runId: string, input: { action?: unknown; destination?: unknown; head?: unknown; token?: unknown; description?: unknown }) {
+  async draftPullRequest(runId: string, input: { action?: unknown; destination?: unknown; head?: unknown; token?: unknown; description?: unknown; reopen?: unknown }) {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveBranchRun(runId);
     if (run.status !== "passed" || !run.finishedAt || run.cleanedUp || !run.branch.startsWith("shipyard/")) {
@@ -817,24 +817,32 @@ export class RunManager {
           (review?.head ?? input.head) !== head || (review?.destination ?? input.destination) !== destination.key) {
         throw new UserError("The branch or GitHub destination changed. Reopen the handoff to review it again");
       }
-      const base = await draftBase(run.repo, destination.repository, signal);
+      const reopening = review ? Boolean(review.reopen) : input.reopen === true;
+      const linked = run.publication?.destination === destination.key ? run.publication.pullRequestUrl : undefined;
+      if (reopening && (!linked || (review?.reopen && review.reopen.url !== linked))) {
+        throw new UserError("The linked pull request changed. Review the handoff again.");
+      }
+      const closed = reopening && linked ? await closedPullRequest(run.repo, destination.repository, linked, run.branch, signal) : undefined;
+      const base = await draftBase(run.repo, destination.repository, signal, closed?.base);
       if (!review) {
         await fetchDraftBase(run.repo, destination, base.head, signal);
         const branch = await reviewDraftBranch(run, head, base.head, this.opts.config.worktreeRoot);
+        if (closed && branch.transplant) throw new UserError("The linked pull request needs a compatible branch. Review Create draft PR to prepare one.");
         const target = this.opts.config.targets[run.target];
         const checkLines = branch.transplant
           ? [...new Set([target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined])]
             .filter((check): check is string => Boolean(check)).map((check) => `- ${markdownCode(check)} required before publication.`)
           : describeRunChecks(run, head);
         const diffBase = branch.transplant ? base.head : await git(["merge-base", base.head, head], run.repo);
-        const description = await describePullRequest(run.repo, diffBase, branch.transplant?.tree ?? head, checkLines);
+        const description = closed?.body.trim() && closed.body.length <= MAX_PULL_REQUEST_DESCRIPTION ? closed.body :
+          await describePullRequest(run.repo, diffBase, branch.transplant?.tree ?? head, checkLines);
         const details = { ...branch, base, head, description, repository: destination.repository,
-          destination: destination.key, token: randomBytes(24).toString("hex") };
+          destination: destination.key, token: randomBytes(24).toString("hex"), reopen: closed ? { url: closed.link, number: closed.number } : undefined };
         this.draftReviews.set(runId, details);
         return { review: details };
       }
       if (review.base.branch !== base.branch || review.base.head !== base.head) {
-        throw new UserError("GitHub’s default branch moved. Reopen the review to approve the current commit");
+        throw new UserError("GitHub’s base branch moved. Reopen the review to approve the current commit");
       }
       let draftHead = head;
       if (review.transplant) {
@@ -878,10 +886,15 @@ export class RunManager {
           if (!adopted) await candidate.close();
         }
       }
-      this.draftReviews.delete(runId);
       const approval = { head: draftHead, destination: destination.key, draft: true };
       await this.publish(runId, approval, "push");
-      await this.publish(runId, approval, "pull-request", { base: review.base, description });
+      if (review.reopen) {
+        await reopenRunPullRequest(run.repo, destination.repository, review.reopen.url, run.branch, head, base, description, signal);
+        this.store.event(runId, { type: "pull-request-reopened", branch: run.branch, head, url: review.reopen.url });
+      } else {
+        await this.publish(runId, approval, "pull-request", { base: review.base, description });
+      }
+      this.draftReviews.delete(runId);
       return { result: await this.result(runId) };
     } catch (error) {
       if (error instanceof UserError) throw error;
