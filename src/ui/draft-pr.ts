@@ -10,6 +10,8 @@ export interface DraftReview {
   base: { branch: string; head: string };
   branch: string;
   description: string;
+  regressionNotes?: string;
+  descriptionMaxLength: number;
   reopen?: { url: string; number: string };
   transplant?: { tree: string; conflicts: string[] };
 }
@@ -26,14 +28,14 @@ export async function describePullRequest(repo: string, base: string, head: stri
       if (changes[index] === status) files.push(changes[index + 1]!);
     }
     if (!files.length) continue;
-    const paths = files.slice(0, 8).map(markdownCode).join(", ");
+    const paths = files.slice(0, 8).map((path) => markdownCode(path)).join(", ");
     summary.push(`- ${verb} ${paths}${files.length > 8 ? ` and ${files.length - 8} more` : ""}.`);
   }
   return ["## Summary", ...summary, "", "## Verification", ...(checks.length ? checks : ["- No checks recorded for this commit."])].join("\n");
 }
 
-export function markdownCode(text: string): string {
-  const normalized = text.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 300);
+export function markdownCode(text: string, max = 300): string {
+  const normalized = text.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, max);
   const backticks = normalized.match(/`+/g) ?? [];
   if (!backticks.length) return `\`${normalized}\``;
   const marker = "`".repeat(1 + Math.max(0, ...backticks.map((run) => run.length)));

@@ -5,6 +5,7 @@ import { addTokenUsage, type AgentAnswer, type AgentAsk, type AgentResult, type 
 import { attachmentContext, MAX_FEEDBACK_BYTES, resolveAttachments, type FeedbackAttachment } from "./attachments.ts";
 import { BROWSER_CHECK, checkBrowser } from "./browser-check.ts";
 import { BROWSER_TOOL_NOTE } from "./browser-tool.ts";
+import { recordBugExpectation, verifyBugFix } from "./bug-verification.ts";
 import { providerOptions, type Provider, type RunEffort, type ShipyardConfig, type Target } from "./config.ts";
 import { git, sh, tail, type ExecResult } from "./exec.ts";
 import { inLane, type Lane } from "./guards.ts";
@@ -125,6 +126,7 @@ export interface CheckpointContext {
   canContinue: boolean;
   attempt: number;
   summary: string;
+  expectedBehavior?: string;
   gates: GateRecord[];
   noChanges: boolean;
   worktree: string;
@@ -169,7 +171,7 @@ export interface PipelineRequest {
   id?: string;
   resume?: RunRecord;
   followUp?: RunFollowUp;
-  continueBranch?: Pick<RunRecord, "repo" | "branch" | "worktree" | "baseSha" | "branchBaseSha" | "publication">;
+  continueBranch?: Pick<RunRecord, "repo" | "branch" | "worktree" | "baseSha" | "branchBaseSha" | "publication" | "bugVerification">;
   browserAccess?: boolean;
   referenceUrls?: string[];
   browserReferenceHelp?: boolean;
@@ -196,7 +198,7 @@ interface StageSpec {
   prompt: string;
   gates: string[];
   browserCheck?: boolean;
-  /** The gates must FAIL (bug triage: a failing reproduction proves the bug). */
+  /** For bug triage, the gate expects the project test command to fail. */
   expectGateFailure?: boolean;
   /** What to tell the agent when a gate goes the wrong way. Defaults to the gate output. */
   failurePrompt?: (gate: ExecResult) => string;
@@ -328,6 +330,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     baseSha,
     branchBaseSha: continueBranch?.branchBaseSha,
     publication: continueBranch?.publication,
+    bugVerification: continueBranch?.bugVerification,
     followUp,
     attachments: req.attachments,
     browserAccess: req.browserAccess ?? target.browserAccess,
@@ -519,6 +522,9 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
           judge: (r) => {
             if (!isTriageReport(r.structured)) return { passed: false, feedback: notReproducedPrompt(false), summary: r.summary || "The triager returned no report." };
             const report = r.structured;
+            if (report.reproduced && (!report.expected.trim() || report.expected.trim().length > 500)) {
+              return { passed: false, feedback: "Describe one concrete expected behavior in 500 characters or fewer for checkpoint approval." };
+            }
             return { passed: report.reproduced, feedback: notReproducedPrompt(false), summary: formatTriage(report), output: report };
           },
         },
@@ -532,8 +538,13 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
       }
       triage = triaged.output as TriageReport;
       await commit(triaged);
+      if (!run.bugVerification && triaged.record.commit) {
+        run.bugVerification = recordBugExpectation(run, triaged.record.commit);
+        deps.store.save(run);
+      }
     }
 
+    const approvedBugBehavior = run.bugVerification?.approved ? run.bugVerification.expected : undefined;
     // 1. Plan: the planner studies the repo (and may ask you questions) before any code is written.
     let plan: string | undefined;
     if (planner) {
@@ -543,7 +554,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
           role: planner,
           lane: "none",
           readOnly: true,
-          prompt: planPrompt(kind, request, target),
+          prompt: planPrompt(kind, request, target, approvedBugBehavior),
           gates: [],
           maxAttempts,
           judge: (r) => (r.summary.trim().length >= 80 ? { passed: true } : { passed: false, feedback: planMissingPrompt() }),
@@ -562,7 +573,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
         name: "implement",
         role: implementer,
         lane: implementerLane,
-        prompt: followUp ? feedbackPrompt(request, target, followUp.brief) : implementPrompt(kind, request, target, plan, triage),
+        prompt: followUp ? feedbackPrompt(request, target, followUp.brief) : implementPrompt(kind, request, target, plan, triage, approvedBugBehavior),
         gates: followUp && target.e2e ? [target.test, target.e2e] : [target.test],
         browserCheck: target.browserCheck && !designer,
         maxAttempts,
@@ -794,6 +805,12 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
       if (cloudRelease.stopped) return finish("stopped");
       if (!cloudRelease.passed) return finish("failed");
     }
+    if (kind === "bug") {
+      const head = run.stages.findLast((stage) => stage.commit)?.commit ?? baseSha;
+      log("▸ bug verification · comparing the original and final commits");
+      run.bugVerification = await verifyBugFix(run, head, deps.config.worktreeRoot, deps.gateTimeoutMs, deps.control?.stopSignal);
+      log(run.bugVerification.gap ? `    Needs review · ${run.bugVerification.gap}` : "    ✓ named regression test failed before and passed after");
+    }
     return finish("passed");
   } catch (err) {
     if (deps.control?.stopped || err instanceof RunStoppedError) return finish("stopped");
@@ -930,6 +947,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   deps.store.save(run);
 
   const reviewed = deps.checkpoints?.stages.includes(spec.name) ?? false;
+  let verifiedSnapshot: string | undefined;
   const freshRepair = spec.repairing && (deps.repairStage === spec.name || last?.role !== spec.role.name);
   let session = freshRepair ? undefined : sessionFor(last) ?? spec.resumeSession;
   const deliveredImages = new Set<string>();
@@ -962,7 +980,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   const done = (status: "passed" | "failed" | "stopped"): StageOutcome => {
     stage.status = status;
     deps.store.save(run);
-    return { lane: spec.lane, record: stage, passed: status === "passed", stopped: status === "stopped", session, summary, lastFailure, judgeFeedback, output };
+    return { lane: spec.lane, verifiedSnapshot, record: stage, passed: status === "passed", stopped: status === "stopped", session, summary, lastFailure, judgeFeedback, output };
   };
 
   for (let attempt = (stage.attempts.at(-1)?.attempt ?? 0) + 1; ; attempt++) {
@@ -1149,6 +1167,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
     if (noChanges) log(`    ✗ no changes in the worktree`);
 
     // Gates run here, by the pipeline, regardless of what the agent claims.
+    verifiedSnapshot = reviewed && spec.name === "triage" && !noChanges ? await worktreeSnapshot(run.worktree) : undefined;
     const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run.worktree, deps, signal);
 
     if (signal?.aborted) {
@@ -1201,6 +1220,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
       canContinue: passed || Boolean(spec.failureContinues && (failed || judgeFailed)),
       attempt,
       summary: record.summary,
+      expectedBehavior: spec.name === "triage" && isTriageReport(record.output) ? record.output.expected : undefined,
       gates,
       noChanges,
       worktree: run.worktree,
@@ -1250,7 +1270,7 @@ async function runStageGates(spec: StageSpec, worktree: string, deps: PipelineDe
       ? await checkBrowser(worktree, deps.gateTimeoutMs, signal)
       : await sh(command, worktree, deps.gateTimeoutMs, signal);
     if (signal?.aborted) break;
-    // Normally a gate must pass. For triage it must fail (and not just time out): that proves the bug.
+    // Triage expects a failing command. Final regression verification checks the named assertion separately.
     const wrongWay = spec.expectGateFailure ? gate.code === 0 || gate.timedOut : gate.code !== 0;
     gates.push({
       command,
@@ -1260,7 +1280,7 @@ async function runStageGates(spec: StageSpec, worktree: string, deps: PipelineDe
       timedOut: gate.timedOut,
       outputTail: tail(gate.output, 4000),
     });
-    const note = spec.expectGateFailure ? (wrongWay ? " (passes: bug not reproduced)" : " (fails as expected: bug reproduced)") : "";
+    const note = spec.expectGateFailure ? (gate.timedOut ? " (timed out)" : wrongWay ? " (expected failure, got a pass)" : " (failed as expected)") : "";
     log(`    ${wrongWay ? "✗" : "✓"} gate \`${command}\`${note} (${(gate.durationMs / 1000).toFixed(1)}s)`);
     if (wrongWay) {
       return { gates, failed: gate };

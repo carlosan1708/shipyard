@@ -155,7 +155,10 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
       }
 
       const resultMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/result$/);
-      if (req.method === "GET" && resultMatch) return json(res, 200, await opts.manager.result(resultMatch[1]!));
+      if (req.method === "GET" && resultMatch) {
+        const runId = resultMatch[1]!;
+        return json(res, 200, url.searchParams.get("head") === "1" ? { head: await opts.manager.resultHead(runId) } : await opts.manager.result(runId));
+      }
 
       const remoteMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/remote$/);
       if (req.method === "POST" && remoteMatch) {

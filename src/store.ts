@@ -35,13 +35,35 @@ export interface ReviewRecord {
 
 export interface GateRecord {
   command: string;
-  /** For a bug triage the tests are expected to fail: that failure proves the bug. */
+  /** Bug triage expects the project test command to fail. */
   expectFailure?: boolean;
   code: number;
   durationMs: number;
   timedOut: boolean;
   outputTail: string;
   checkedAt?: string;
+}
+
+export interface BugVerification {
+  baseSha: string;
+  head: string;
+  expected?: string;
+  actual?: string;
+  testFile?: string;
+  testName?: string;
+  assertionMessage?: string;
+  approved: boolean;
+  before?: RegressionObservation;
+  after?: RegressionObservation;
+  gap?: string;
+  recheck?: { head: string; gap: string };
+}
+
+export interface RegressionObservation {
+  outcome: "expected-failure" | "passed" | "inconclusive";
+  exitCode: number;
+  durationMs: number;
+  detail: string;
 }
 
 /** Did this gate go the way it should? Normally that means it passed; for a triage, that it failed. */
@@ -156,6 +178,7 @@ export interface RunRecord {
   /** Most recent browser verification requested from the completed result. */
   browserCheck?: GateRecord;
   verification?: { head: string; checks: GateRecord[]; editsDigest?: string };
+  bugVerification?: BugVerification;
   browserAccess?: boolean;
   referenceUrls?: string[];
   browserReferenceHelp?: boolean;

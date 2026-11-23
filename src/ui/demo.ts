@@ -89,7 +89,7 @@ export class DemoRunner implements AgentRunner {
   private async planner(req: AgentRequest, tool: Tool): Promise<string> {
     await tool("Bash", "ls -R src test e2e && cat package.json CLAUDE.md");
     await tool("Read", join(req.cwd, "src/server.js"));
-    const withCount = await this.askPayload(req);
+    const withCount = !req.prompt.includes("<approved_behavior>") && await this.askPayload(req);
     return [
       "Goal: a GET /health endpoint that monitors can poll to see the shop is up.",
       `Approach: one route in src/server.js next to the other GET routes, returning ${withCount ? '{"status": "ok", "products": <count>} (you asked for the product count)' : '{"status": "ok"}'} with 200.`,
@@ -153,6 +153,8 @@ export class DemoRunner implements AgentRunner {
       structured: {
         reproduced: true,
         reproduction_test: "test/triage-health.test.js",
+        test_name: "uptime monitors can poll GET /health",
+        assertion_message: "GET /health returns HTTP 200",
         steps: "Start the server and request GET /health.",
         expected: '200 with {"status": "ok"}',
         actual: '404 {"error": "not_found"}: there is no such route',
@@ -221,7 +223,7 @@ export class DemoRunner implements AgentRunner {
 
     // With a planner, the question was already asked and its answer is in the plan.
     const plan = req.prompt.match(/<plan>([\s\S]*?)<\/plan>/)?.[1];
-    const withCount = plan ? /product count/i.test(plan) : await this.askPayload(req);
+    const withCount = plan ? /product count/i.test(plan) : !req.prompt.includes("<triage>") && await this.askPayload(req);
 
     await tool("Edit", join(req.cwd, "src/server.js"), () => addHealthRoute(req.cwd, withCount));
     await tool("Write", join(req.cwd, "test/health.test.js"), () => writeFile(req.cwd, "test/health.test.js", unitTest(withCount)));
@@ -371,7 +373,8 @@ ${serverHelper}
 test("uptime monitors can poll GET /health", () =>
   withServer(async (base) => {
     const res = await fetch(\`\${base}/health\`);
-    assert.equal(res.status, 200);
+    assert.equal(res.status, 200, "GET /health returns HTTP 200");
+    assert.deepEqual(await res.json(), { status: "ok" });
   }));
 `;
 

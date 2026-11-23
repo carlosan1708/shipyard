@@ -71,6 +71,7 @@ export function terminalReviewer(io: { input: Readable; output: Writable } = { i
 
     write();
     write(`━━ checkpoint · ${title} ━━`);
+    if (ctx.expectedBehavior) write(`\nExpected behavior to approve: ${ctx.expectedBehavior}`);
     if (ctx.summary.trim()) {
       write(`\n${ctx.role} says:`);
       for (const line of ctx.summary.trim().split("\n")) write(`  ${line}`);
@@ -81,10 +82,10 @@ export function terminalReviewer(io: { input: Readable; output: Writable } = { i
     if (ctx.gates.length) {
       write(`\nGates:`);
       for (const g of ctx.gates) {
-        const expected = g.expectFailure ? (gateOk(g) ? ", fails as expected: bug reproduced" : ", passes: bug not reproduced") : "";
+        const expected = g.expectFailure ? (g.timedOut ? ", timed out" : gateOk(g) ? ", failed as expected" : ", expected failure, got a pass") : "";
         write(`  ${gateOk(g) ? "✓" : "✗"} ${g.command} (${(g.durationMs / 1000).toFixed(1)}s${g.code === 0 ? "" : `, exit ${g.code}`}${expected})`);
       }
-      // Show the test output when it matters: a real failure, or a triage that proves the bug.
+      // Show test output for a failed gate or the expected failure at triage.
       const failedGate = ctx.gates.find((g) => !gateOk(g) || (g.expectFailure && g.code !== 0));
       if (failedGate) {
         write(failedGate.expectFailure ? `\nThe reproduction failing:` : `\nEnd of the failing output:`);

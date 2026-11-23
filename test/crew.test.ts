@@ -256,11 +256,13 @@ test("a runner that throws closes the stage as failed instead of leaving it runn
 // ── bug-triager ──────────────────────────────────────────
 
 const reproTest = (req: Parameters<Step>[0]) =>
-  writeFiles(req.cwd, { "test/repro.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("add(2, 3) is 5", () => assert.equal(add(2, 3), 5));\n' });
+  writeFiles(req.cwd, { "test/repro.test.js": 'import { describe, test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ndescribe("addition", () => {\n  test("add(2, 3) is 5", () => assert.equal(add(2, 3), 5, "addition returns the sum"));\n});\n' });
 const triageReport = (reproduced = true) => ({
   structured: {
     reproduced,
     reproduction_test: "test/repro.test.js",
+    test_name: "add(2, 3) is 5",
+    assertion_message: "addition returns the sum",
     steps: "call add(2, 3)",
     expected: "5",
     actual: "-1",
@@ -293,6 +295,43 @@ test("triage proves the bug with a failing test first; the implementer must make
   assert.match(runner.calls[1]!.prompt, /reproduced this bug with a failing test in test\/repro\.test\.js/);
   assert.match(runner.calls[1]!.prompt, /<triage>\nReproduced by test\/repro\.test\.js\./);
   assert.equal(runner.calls[0]!.lane, "tests", "the triager may only write tests");
+});
+
+test("the approved reproduction records the same named test on both commits for either provider", async () => {
+  for (const provider of ["claude", "codex"] as const) {
+    const { deps, target } = await setup([
+      (req) => { reproTest(req); return triageReport(); },
+      (req) => writeFiles(req.cwd, { "src/add.js": "export const add = (a, b) => a + b;\n" }),
+    ]);
+    deps.checkpoints = { stages: ["triage"], review: async (ctx) => {
+      assert.equal(ctx.expectedBehavior, "5");
+      return { action: "continue" };
+    } };
+    const run = await runPipeline({ target, kind: "bug", provider, request: "add subtracts", crew: ["triage"] }, deps);
+    assert.equal(run.status, "passed", run.error ?? "");
+    assert.equal(run.bugVerification?.head, run.stages.at(-1)?.commit);
+    assert.equal(run.bugVerification?.before?.outcome, "expected-failure", run.bugVerification?.gap ?? "");
+    assert.equal(run.bugVerification?.after?.outcome, "passed", run.bugVerification?.gap ?? "");
+    assert.equal(run.bugVerification?.gap, undefined);
+  }
+});
+
+test("a weakened final test cannot verify the bug even when all project gates pass", async () => {
+  const { deps, target } = await setup([
+    (req) => { reproTest(req); return triageReport(); },
+    (req) => {
+      reproTest(req);
+      const path = "test/repro.test.js";
+      const test = readFileSync(join(req.cwd, path), "utf8").replace('assert.equal(add(2, 3), 5,', 'assert.equal(5, 5,');
+      writeFiles(req.cwd, { [path]: test, "src/add.js": "export const add = (a, b) => a + b;\n" });
+    },
+  ]);
+  deps.checkpoints = { stages: ["triage"], review: async () => ({ action: "continue" }) };
+  const run = await runPipeline({ target, kind: "bug", request: "add subtracts", crew: ["triage"] }, deps);
+  assert.equal(run.status, "passed", run.error ?? "");
+  assert.equal(run.bugVerification?.before?.outcome, "inconclusive");
+  assert.equal(run.bugVerification?.after?.outcome, "passed");
+  assert.match(run.bugVerification?.gap ?? "", /did not reproduce/);
 });
 
 test("a triage test that passes on the current code doesn't count as a reproduction", async () => {

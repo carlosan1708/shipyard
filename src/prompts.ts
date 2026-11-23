@@ -12,20 +12,21 @@ export const DEFAULT_DEPS_REQUEST = "Update dependencies: patch and minor versio
 
 const taskBlock = (kind: RunKind, request: string) => `${kindLabel(kind)}:\n<task>\n${request.trim()}\n</task>`;
 
-export function planPrompt(kind: RunKind, request: string, target: Target): string {
+export function planPrompt(kind: RunKind, request: string, target: Target, approvedBugBehavior?: string): string {
   return [
     taskBlock(kind, request),
     `Plan this ${kindNoun(kind)} for the implementer. Explore the repository, but do not change any files.`,
+    approvedBugBehavior ? `Plan for the behavior approved at triage:\n<approved_behavior>\n${approvedBugBehavior}\n</approved_behavior>` : "",
     `The implementer's work will be gated by \`${target.test}\`${target.e2e ? ` and then \`${target.e2e}\`` : ""}, so plan the tests that make those pass.`,
     "End with the plan as your final message: Goal, Approach, Files, Tasks (numbered), Tests, Risks / open questions.",
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }
 
 export function planMissingPrompt(): string {
   return "Your final message didn't contain a plan. Write it now as your final message: Goal, Approach, Files, Tasks (numbered), Tests, Risks / open questions.";
 }
 
-export function implementPrompt(kind: RunKind, request: string, target: Target, plan?: string, triage?: TriageReport): string {
+export function implementPrompt(kind: RunKind, request: string, target: Target, plan?: string, triage?: TriageReport, approvedBugBehavior?: string): string {
   const how =
     kind === "deps"
       ? "Update the dependencies as asked, adapt the code only where an upgrade breaks it, and keep every test passing."
@@ -37,6 +38,7 @@ export function implementPrompt(kind: RunKind, request: string, target: Target, 
   return [
     taskBlock(kind, request),
     triage ? `The triage report:\n<triage>\n${formatTriage(triage)}\n</triage>` : "",
+    approvedBugBehavior ? `Implement the behavior approved at triage:\n<approved_behavior>\n${approvedBugBehavior}\n</approved_behavior>` : "",
     plan?.trim()
       ? `A planner already studied the repo and wrote this plan. Follow it unless the code shows it is wrong, and say so in your summary if you deviate:\n<plan>\n${plan.trim()}\n</plan>`
       : "",
@@ -155,12 +157,14 @@ export function formatFindings(v: ReviewVerdict): string {
 export const TRIAGE_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["reproduced", "reproduction_test", "steps", "expected", "actual", "suspected_cause", "suspected_files"],
+  required: ["reproduced", "reproduction_test", "test_name", "assertion_message", "steps", "expected", "actual", "suspected_cause", "suspected_files"],
   properties: {
     reproduced: { type: "boolean", description: "True only if your new test fails on the current code for the reported reason." },
     reproduction_test: { type: "string", description: "Path of the test file you added, relative to the repo root." },
+    test_name: { type: "string", description: "Exact name of the single regression test, or an empty string if unavailable." },
+    assertion_message: { type: "string", description: "Exact explicit message of the assertion that fails on the original code, or an empty string if unavailable." },
     steps: { type: "string" },
-    expected: { type: "string" },
+    expected: { type: "string", description: "One concrete expected behavior in the user's terms, up to 500 characters." },
     actual: { type: "string" },
     suspected_cause: { type: "string" },
     suspected_files: { type: "array", items: { type: "string" } },
@@ -170,6 +174,8 @@ export const TRIAGE_SCHEMA = {
 export interface TriageReport {
   reproduced: boolean;
   reproduction_test: string;
+  test_name?: string;
+  assertion_message?: string;
   steps: string;
   expected: string;
   actual: string;
@@ -179,7 +185,11 @@ export interface TriageReport {
 
 export function isTriageReport(value: unknown): value is TriageReport {
   const t = value as TriageReport;
-  return Boolean(t) && typeof t.reproduced === "boolean" && typeof t.reproduction_test === "string";
+  return Boolean(t) && typeof t.reproduced === "boolean" &&
+    [t.reproduction_test, t.steps, t.expected, t.actual, t.suspected_cause].every((field) => typeof field === "string") &&
+    (t.test_name === undefined || typeof t.test_name === "string") &&
+    (t.assertion_message === undefined || typeof t.assertion_message === "string") &&
+    Array.isArray(t.suspected_files) && t.suspected_files.every((file) => typeof file === "string");
 }
 
 export function formatTriage(t: TriageReport): string {
@@ -188,6 +198,8 @@ export function formatTriage(t: TriageReport): string {
     `Steps: ${t.steps}`,
     `Expected: ${t.expected}`,
     `Actual: ${t.actual}`,
+    t.test_name ? `Regression test: ${t.test_name}` : "",
+    t.assertion_message ? `Expected failing assertion: ${t.assertion_message}` : "",
     `Suspected cause: ${t.suspected_cause}`,
     t.suspected_files.length ? `Likely files: ${t.suspected_files.join(", ")}` : "",
   ]
@@ -199,7 +211,7 @@ export function triagePrompt(request: string, target: Target): string {
   return [
     taskBlock("bug", request),
     "Triage this bug: reproduce it with the smallest failing test you can, through the code's public interface. Do not fix it and do not change application code.",
-    `The pipeline then runs \`${target.test}\` and expects it to FAIL because of your new test. That failure is the proof the bug is real; the implementer's job is to make it pass.`,
+    `The pipeline runs \`${target.test}\` and expects it to fail because of your new test. The implementer's job is to make it pass.`,
     "If you cannot reproduce it, report reproduced: false with what you tried.",
   ].join("\n\n");
 }

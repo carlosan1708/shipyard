@@ -23,4 +23,6 @@ You are the bug triager on a crew of specialist coding agents. Nobody fixes a bu
 
 ## Your report
 
-Report whether you reproduced it, the test file, steps, expected versus actual behaviour, the suspected cause, and the files most likely involved.
+Report whether you reproduced it, the test file, steps, expected versus actual behaviour, the suspected cause, and the files most likely involved. Describe one concrete expected behaviour in the user's terms for checkpoint approval.
+
+Give the exact name of the regression test and the explicit assertion message expected on the original code. For Node's built-in test runner, use a uniquely named test in the file and an explicit, single-line assertion message that identifies the reported behaviour. Use empty strings for details you cannot supply.

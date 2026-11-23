@@ -1131,6 +1131,17 @@ test("the draft PR handoff reviews, verifies, publishes, and reopens only after 
   try {
     const source = await manager.whenDone(id);
     assert.ok(source?.status === "passed");
+    const sourceHead = source.stages.at(-1)!.commit!;
+    source.bugVerification = {
+      baseSha: source.baseSha, head: sourceHead, approved: true,
+      expected: "Adding two integers returns their sum.", testName: "adds", testFile: "test/add.test.js",
+      before: { outcome: "expected-failure", exitCode: 1, durationMs: 10, detail: "The named test failed with the approved assertion." },
+      after: { outcome: "passed", exitCode: 0, durationMs: 10, detail: "The named test passed." },
+    };
+    manager.store.save(source);
+    const originalEvidence = (await manager.result(id)).handoff.regression;
+    assert.equal(originalEvidence?.status, "Verified");
+    assert.match(originalEvidence?.patch ?? "", /diff --git a\/src\/add\.js/);
     writeFiles(defaultRepo, {
       "package.json": readFileSync(join(target.path, "package.json"), "utf8"),
       "e2e/smoke.e2e.test.js": readFileSync(join(target.path, "e2e/smoke.e2e.test.js"), "utf8"),
@@ -1177,7 +1188,7 @@ else if (endpoint.endsWith("/pulls") && args.includes("POST")) {
     console.log("open");
   } else if (args.at(-1).includes(".head.ref")) {
     const saved = JSON.parse(readFileSync(${JSON.stringify(log)}, "utf8"));
-    console.log(JSON.stringify({state:isClosed ? "closed" : "open", merged:false, body:saved.body,
+    console.log(JSON.stringify({state:isClosed ? "closed" : "open", merged:false, body:saved.body + "\\n\\nEdited on GitHub.",
       branch:saved.head, repository:"example/draft-fixture", base:saved.base}));
   } else console.log(isClosed ? "closed" : "open");
 }
@@ -1193,6 +1204,8 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
     assert.equal(review.base.head, base);
     assert.deepEqual(review.transplant.conflicts, ["src/add.js"]);
     assert.match(review.description, /## Summary[\s\S]*src\/add\.js[\s\S]*## Verification[\s\S]*npm run e2e/);
+    assert.match(review.regressionNotes, /Out of date/);
+    assert.match(review.regressionNotes, new RegExp(sourceHead));
     assert.equal(await git(["branch", "--list", review.branch], source.repo), "");
     assert.equal(await git(["branch", "--list", review.branch], remote), "");
     assert.equal((await post({ action: "create", token: "stale" })).status, 400);
@@ -1214,7 +1227,9 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
     assert.match(readFileSync(join(run.worktree, "remote-only.md"), "utf8"), /Keep the README/);
     assert.match(readFileSync(join(run.worktree, "src/add.js"), "utf8"), /Number\(a\) \+ Number\(b\)/);
     assert.deepEqual(run.verification?.checks.map(({ code }) => code), [0, 0]);
-    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, description);
+    const publishedDescription = `${description.trimEnd()}\n\n<!-- shipyard-regression-evidence -->\n${review.regressionNotes}\n<!-- /shipyard-regression-evidence -->`;
+    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, publishedDescription);
+    assert.equal((await manager.result(id)).handoff.regression?.status, "Out of date");
     writeFileSync(closed, "closed");
     const handoff = (await manager.result(id)).publish;
     assert.equal(handoff?.pullRequestUrl, undefined);
@@ -1224,15 +1239,17 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
     assert.equal(reopenedReview.status, 200, reopenedReview.body);
     const { review: reopen } = JSON.parse(reopenedReview.body);
     assert.deepEqual(reopen.reopen, { number: "42", url: pr });
-    assert.equal(reopen.description, description);
+    assert.equal(reopen.description, `${description.trimEnd()}\n\nEdited on GitHub.`);
     assert.equal(existsSync(reopened), false);
     const edit = `${description}\nReady for another review.\n`;
     const reopenedPR = await post({ action: "create", token: reopen.token, description: edit });
     assert.equal(reopenedPR.status, 200, reopenedPR.body);
-    assert.deepEqual(JSON.parse(readFileSync(reopened, "utf8")), { state: "open", body: edit });
+    assert.deepEqual(JSON.parse(readFileSync(reopened, "utf8")), {
+      state: "open", body: `${edit.trimEnd()}\n\n<!-- shipyard-regression-evidence -->\n${reopen.regressionNotes}\n<!-- /shipyard-regression-evidence -->`,
+    });
     assert.equal(JSON.parse(reopenedPR.body).result.publish.pullRequestUrl, pr);
     assert.equal(manager.store.get(id)?.branch, run.branch);
-    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, description);
+    assert.equal(JSON.parse(readFileSync(log, "utf8")).body, publishedDescription);
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;

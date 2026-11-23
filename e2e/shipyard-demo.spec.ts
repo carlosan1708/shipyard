@@ -45,6 +45,40 @@ const test = base.extend<{ demo: { url: string; repo: string; baseCommit: string
   },
 });
 
+test("shows the approved bug behavior, both test outcomes, and the fix diff", async ({ demo, page }) => {
+  test.skip(recording, "The recording follows the feature workflow.");
+  await page.goto(demo.url);
+  await page.getByRole("banner").getByRole("button", { name: "New run", exact: true }).click();
+  const form = page.getByRole("dialog", { name: "New run" });
+  await form.getByRole("radio", { name: "Fix a bug" }).check();
+  await form.getByLabel("Bug report").fill("Fix GET /health returning 404 for uptime monitors.");
+  for (const stage of ["plan", "implement"]) await form.getByLabel(`Pause after ${stage}`, { exact: true }).uncheck();
+  for (const stage of ["plan", "review", "e2e"]) {
+    await form.locator(`tr[data-stage="${stage}"] input[name="run"]`).uncheck();
+  }
+  await form.getByRole("button", { name: "Start run" }).click();
+  const inbox = page.getByRole("complementary", { name: "Needs you" });
+  await expect(inbox.getByText("Expected behavior", { exact: true })).toBeVisible();
+  await inbox.getByRole("button", { name: "Approve expected behavior" }).click();
+  await page.getByRole("button", { name: "View result" }).click();
+  const regression = page.getByRole("region", { name: "Bug verification" });
+  await expect(regression.getByRole("heading")).toHaveText("Bug verification · Verified");
+  await expect(regression.getByText("uptime monitors can poll GET /health", { exact: true })).toBeVisible();
+  await expect(regression.getByText(/failed with the approved assertion/)).toBeVisible();
+  await expect(regression.getByText(/named test passed/)).toBeVisible();
+  await regression.getByText("Fix diff", { exact: true }).click();
+  await expect(regression.getByText("diff --git a/src/server.js b/src/server.js", { exact: true })).toBeVisible();
+
+  const worktrees = await git(["worktree", "list", "--porcelain"], demo.repo);
+  const worktree = worktrees.split("\n").filter((line) => line.startsWith("worktree ")).at(-1)!.slice("worktree ".length);
+  await git(["-c", "user.name=demo", "-c", "user.email=demo@example.com", "commit", "--allow-empty", "-m", "Advance the run branch"], worktree);
+  const newHead = await git(["rev-parse", "HEAD"], worktree);
+  await expect(regression.getByRole("heading")).toHaveText("Bug verification · Out of date");
+  await regression.getByRole("button", { name: "Recheck regression" }).click();
+  await expect(regression.getByRole("heading")).toHaveText("Bug verification · Verified");
+  await expect(regression.getByText(newHead.slice(0, 12), { exact: true })).toBeVisible();
+});
+
 test("ships a health endpoint from request to verified handoff", async ({ demo, page }) => {
   const button = (name: string) => page.getByRole("button", { name, exact: true });
   const inbox = page.getByRole("complementary", { name: "Needs you" });

@@ -46,7 +46,7 @@ Search and filter the run list by repository and status. Each run shows the loca
 
 | Stage | Role | Edit scope | Outcome |
 | --- | --- | --- | --- |
-| Triage | Bug triager | Tests | Proves the bug with an expected failing test. |
+| Triage | Bug triager | Tests | Adds a failing reproduction and proposes the expected behavior. |
 | Plan | Planner | Read-only | Produces a plan for the implementer. |
 | Implement | Backend, frontend, or dependency updater | Worktree | Unit tests pass. |
 | Review → revise | Reviewer, then implementer if needed | Read-only review, then worktree edits | Blocking findings get a revision and another unit gate. |
@@ -67,6 +67,16 @@ Use `--checkpoints` to pause at every stage or list the stages you want, such as
 - **Stop** ends the run and keeps the branch and worktree.
 
 When a retry limit is reached at a checkpoint, you can give feedback to try again. E2E failures can go to the implementer for repair. The dashboard also lets you steer or switch providers during an active attempt. Resume keeps completed stages and the original worktree. Shipyard continues the unfinished stage using the saved agent session when available. Older records with no checkpoint configuration ask for review at the remaining stages.
+
+## Bug verification
+
+For a bug run, enable **bug-triager** and **Pause after triage**. Approve the expected behavior or send it back with feedback. On the CLI, use `--crew=triage --checkpoints=triage` to run triage and implementation with that pause.
+
+The handoff shows the original symptom, approved behavior, fix diff, and the named regression test’s results on both commits. Shipyard runs the final version of the test file in two temporary checkouts. It overlays that file on the original commit and checks that the named test fails with the approved assertion. It then checks that the same test passes on the final commit.
+
+Exact test verification supports Node’s built-in test runner and test files that can run from a clean checkout with Shipyard’s Node executable. Project checks still run as configured. If the approval, runner evidence, or test setup is unavailable, the handoff shows **Needs review**. If the branch moves, the earlier evidence shows as **Out of date**. Use **Recheck regression** on a clean worktree to verify the newer commit.
+
+Shipyard includes the verification status, observations, and any gap when it creates a draft PR. If it needs to prepare a compatible branch on a different GitHub base, the earlier regression evidence is marked out of date. Existing project gates still control whether Shipyard can prepare and publish a draft. Later pushes leave the draft description intact, with the evidence tied to its recorded commit.
 
 ## Dashboard controls
 

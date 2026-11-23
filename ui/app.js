@@ -24,12 +24,12 @@ const DEPLOYMENT_PROVIDERS = { firebase: "Firebase Hosting", aws: "AWS", azure: 
 const DEPLOYMENT_ACTIONS = { "firebase-release": "firebase", "aws-release": "aws", "azure-release": "azure" };
 const deploymentPending = new Set();
 
-/** Did a gate go the way it should? For a bug triage the tests must fail: that proves the bug. */
+/** The triage gate expects the project test command to fail. */
 const gateOk = (g) => (g.expectFailure ? g.code !== 0 && !g.timedOut : g.code === 0);
 function gateLabel(g) {
   const base = `${gateOk(g) ? "✓" : "✕"} ${g.command} · ${secs(g.durationMs)}${g.code === 0 ? "" : ` · exit ${g.code}`}`;
   if (!g.expectFailure) return base;
-  return `${base} · ${gateOk(g) ? "fails as expected: bug reproduced" : "passes: bug not reproduced"}`;
+  return `${base} · ${g.timedOut ? "timed out" : gateOk(g) ? "failed as expected" : "expected failure, got a pass"}`;
 }
 const STATUS_LABEL = {
   starting: "Starting",
@@ -812,7 +812,9 @@ function select(id) {
   if (id !== state.selected && state.runs.get(id)?.deployment) $("detail").scrollTop = 0;
   state.selected = id;
   if (id) {
-    state.showArchived = Boolean(state.runs.get(id)?.archivedAt);
+    const run = state.runs.get(id);
+    state.showArchived = Boolean(run?.archivedAt);
+    if (run?.finishedAt && (run.kind === "bug" || run.bugVerification)) state.results.delete(id);
     history.replaceState(null, "", `#run/${id}`);
     if (!state.events.has(id)) loadEvents(id);
   } else {
@@ -1004,6 +1006,7 @@ function runResult(run, result, recovery) {
         `${result.handoff.uncommittedCount} file${result.handoff.uncommittedCount === 1 ? "" : "s"} with saved edits` : `${commits} local commit${commits === 1 ? "" : "s"}`,
     ].join(" · ") }),
     result.latestRevisionId ? h("p", { text: "This is an earlier result on the same branch." }) : null,
+    result.handoff?.regression ? renderRegression(run, result.handoff.regression) : null,
     run.status === "passed" && run.stages.some((stage) => stage.repairRole && stage.attempts.at(-1)?.role === stage.repairRole)
       ? h("p", { text: "The crew repaired a failed check and verified this revision." }) : null,
     !run.cleanedUp ? h("dl", { class: "run-result-facts" },
@@ -1068,6 +1071,30 @@ function runResult(run, result, recovery) {
     [...state.runs.values()].filter((child) => child.followUp?.runId === run.id).map((child) =>
       h("button", { type: "button", class: "btn btn-sm feedback-child", onclick: () => select(child.id) }, `Revision · ${firstLine(child.request)}`),
     ),
+  );
+}
+
+function renderRegression(run, { status, reason, evidence, patch, patchTruncated, canRecheck }) {
+  const verifying = state.verificationPending.has(run.id);
+  const observation = (label, sha, result) => result ? h("li", {},
+    h("strong", { text: label }), " ", h("code", { title: sha, text: sha.slice(0, 12) }),
+    h("div", { text: `${result.detail} (exit ${result.exitCode})` }),
+  ) : null;
+  return h("section", { class: "block", "aria-label": "Bug verification" },
+    h("h3", { text: `Bug verification · ${status}` }),
+    reason ? h("p", { text: reason }) : null,
+    evidence?.actual ? h("p", {}, h("strong", { text: "Reported behavior" }), ` · ${evidence.actual}`) : null,
+    evidence?.expected ? h("p", {}, h("strong", { text: evidence.approved ? "Approved behavior" : "Proposed behavior" }), ` · ${evidence.expected}`) : null,
+    evidence?.testName && evidence.testFile ? h("p", {}, "Regression test ", h("code", { text: evidence.testName }), " in ", h("code", { text: evidence.testFile })) : null,
+    evidence?.before || evidence?.after ? h("ul", { class: "handoff-list" },
+      observation("Before", evidence.baseSha, evidence.before), observation("After", evidence.head, evidence.after),
+    ) : null,
+    patch ? details(`${run.id}:bug-diff`, "Fix diff", h("div", {},
+      renderDiff(patch), patchTruncated ? h("p", { text: "Showing the beginning of the diff. The full diff is in Git." }) : null,
+    )) : null,
+    canRecheck ? h("button", { type: "button", class: "btn btn-sm", disabled: verifying,
+      text: verifying ? "Rechecking regression…" : "Recheck regression", onclick: () => verifyRunResult(run.id, true),
+    }) : null,
   );
 }
 
@@ -1238,7 +1265,7 @@ async function checkRunBrowser(runId) {
   }
 }
 
-async function verifyRunResult(runId) {
+async function verifyRunResult(runId, regression = false) {
   if (state.verificationPending.has(runId)) return;
   state.verificationPending.add(runId);
   schedule("detail");
@@ -1248,7 +1275,7 @@ async function verifyRunResult(runId) {
     if (run) run.verification = verification;
     state.results.delete(runId);
     const ok = verification.checks.every(gateOk);
-    toast(ok ? "Project checks passed" : "A project check failed. See the handoff.", !ok);
+    toast(ok ? regression ? "Regression recheck complete. See the handoff." : "Project checks passed" : "A project check failed. See the handoff.", !ok);
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -1695,13 +1722,14 @@ function checkpointBody(item, send) {
         : c.stage === "security"
           ? c.outcome === "passed" ? "The security audit passed" : "The security audit requires fixes"
           : c.stage === "triage"
-            ? c.outcome === "passed" ? "The bug is reproduced" : "The bug isn't reproduced yet"
+            ? c.outcome === "passed" ? "Review the expected behavior" : "The bug isn't reproduced yet"
         : c.outcome === "passed" ? `${c.stage} passed its gates` : c.noChanges ? `${c.stage} made no changes` : `${c.stage} is still failing`;
   const body = h("div", { class: "card-body" }, h("div", { class: "card-title", text: `${title} (attempt ${c.attempt})` }));
 
   const key = `checkpoint:${item.id}`;
   const section = (name, title, ...children) =>
     details(`${key}:${name}`, title, h("div", { class: "checkpoint-section-body" }, children), false, "checkpoint-section");
+  if (c.expectedBehavior) body.append(h("p", {}, h("strong", { text: "Expected behavior" }), ` · ${c.expectedBehavior}`));
   if (c.summary?.trim()) body.append(checkpointSummary(c.summary.trim(), key));
 
   if (!readOnly) {
@@ -1744,7 +1772,7 @@ function checkpointBody(item, send) {
       h(
         "button",
         { type: "button", class: "btn btn-primary btn-sm", onclick: () => send({ kind: "checkpoint", action: "continue" }) },
-        c.outcome === "passed" ? (c.stage === "plan" ? "Approve the plan" : "Approve") : c.stage === "review" || c.stage === "security" ? "Send findings to the implementer" : "Send failure to the implementer",
+        c.outcome === "passed" ? ({ plan: "Approve the plan", triage: "Approve expected behavior" }[c.stage] ?? "Approve") : c.stage === "review" || c.stage === "security" ? "Send findings to the implementer" : "Send failure to the implementer",
       ),
     );
   }
@@ -1894,7 +1922,7 @@ const modelLabel = (id) => MODEL_NAMES[id] ?? id ?? "Codex CLI default";
 
 /** The crew, in pipeline order. */
 const CREW = [
-  { stage: "triage", role: "bug-triager", title: "bug-triager", what: "Proves the bug with a failing test before anyone fixes it", on: true, only: "bug" },
+  { stage: "triage", role: "bug-triager", title: "bug-triager", what: "Reproduces the bug and proposes the expected behavior", on: true, pause: true, only: "bug" },
   { stage: "plan", role: "planner", title: "planner", what: "Studies the repo, asks you questions, writes the plan", on: true, pause: true, not: "deps" },
   { stage: "implement", role: "implementer", title: "implementer", what: "Builds the change and its unit tests", required: true, pause: true },
   { stage: "design", role: "ui-ux", title: "UI/UX specialist", what: "Refines the interface, interaction, accessibility, and motion after implementation", on: false, pause: true, not: "deps" },
@@ -2772,9 +2800,10 @@ async function loadDraftReview(view, publication) {
   const facts = $("draft-pr-facts");
   const conflicts = $("draft-pr-conflicts");
   const description = $("draft-pr-description");
+  const regression = $("draft-pr-regression");
   view.review = null;
   submit.disabled = true;
-  error.hidden = facts.hidden = conflicts.hidden = true;
+  error.hidden = facts.hidden = conflicts.hidden = regression.hidden = true;
   $("draft-pr-description-field").hidden = true;
   description.disabled = true;
   status.textContent = "Checking the branch and GitHub destination…";
@@ -2798,7 +2827,12 @@ async function loadDraftReview(view, publication) {
     if (!dialog.open || state.draftReview !== view) return;
     view.review = review;
     description.value = view.description ?? review.description;
+    description.maxLength = review.descriptionMaxLength;
     description.disabled = false;
+    if (review.regressionNotes) {
+      regression.replaceChildren(h("p", { class: "field-help", text: "Shipyard adds this evidence to the draft description." }), md(review.regressionNotes));
+      regression.hidden = false;
+    }
     $("draft-pr-description-field").hidden = false;
     facts.replaceChildren(...[
       ["Repository", new URL(review.repository).pathname.slice(1)], ["Base", `${review.base.branch} · ${review.base.head.slice(0, 12)}`], ["Branch", review.branch],
@@ -3336,6 +3370,21 @@ function tick() {
   }
 }
 
+async function refreshRegressionHead() {
+  const id = state.selected;
+  const result = state.results.get(id);
+  if (document.hidden || !result?.handoff?.regression || result.latestRevisionId || state.verificationPending.has(id)) return;
+  try {
+    const { head } = await api(`/api/runs/${id}/result?head=1`);
+    if (state.results.get(id) === result && head !== result.handoff.head) {
+      state.results.delete(id);
+      schedule("detail");
+    }
+  } catch {
+    // A normal result refresh will surface any persistent errors.
+  }
+}
+
 async function main() {
   $("new-run").addEventListener("click", openNewRun);
   $("inbox-toggle").addEventListener("click", () => ($("inbox").classList.contains("open") ? closeInboxDrawer() : openInboxDrawer()));
@@ -3373,6 +3422,7 @@ async function main() {
   }
   connect();
   setInterval(tick, 1000);
+  setInterval(refreshRegressionHead, 5000);
   setInterval(() => schedule("runs"), 30_000);
 }
 

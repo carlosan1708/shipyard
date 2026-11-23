@@ -34,6 +34,7 @@ import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
 import { closedPullRequest, createRunPullRequest, draftBase, fetchDraftBase, githubOrigin, inspectLinkedPullRequest, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit, reopenRunPullRequest } from "./publication.ts";
 import { checkFirebaseHosting, requestedDeploymentProviders, runQuestionKind, type DeployAction, type RunAnswer } from "./run-question.ts";
 import { describePullRequest, markdownCode, MAX_PULL_REQUEST_DESCRIPTION, reviewDraftBranch, type DraftReview } from "./draft-pr.ts";
+import { bugEvidence, verifyBugFix } from "../bug-verification.ts";
 import { CloudRunReleases } from "./cloud-release.ts";
 import { FirebaseHostingReleases } from "./firebase-release.ts";
 import { WorkflowDeployments } from "./workflow-deployment.ts";
@@ -658,12 +659,13 @@ export class RunManager {
     const [remotes, preview, head] = await Promise.all([
       git(["remote"], run.repo).catch(() => undefined),
       this.previews.get(runId)?.catch(() => undefined),
-      historical ? run.stages.findLast((stage) => stage.commit)?.commit ?? run.baseSha :
-        git(["rev-parse", "--verify", `refs/heads/${run.branch}`], run.repo).catch(() => undefined),
+      handoffHead(run, historical),
     ]);
-    const [committed, uncommitted] = await Promise.all([
+    const regression = bugEvidence(run, head);
+    const [committed, uncommitted, regressionPatch] = await Promise.all([
       head ? git(["diff", "--name-status", "-z", "--no-renames", `${run.baseSha}..${head}`, "--"], run.repo, { raw: true }).catch(() => undefined) : undefined,
       !run.cleanedUp && !historical ? changedFiles(run.worktree).catch(() => undefined) : undefined,
+      head && regression ? bugFixPatch(run, head) : undefined,
     ]);
     const files: Array<{ status: string; path: string }> = [];
     const changes = committed?.split("\0") ?? [];
@@ -712,11 +714,24 @@ export class RunManager {
       localApp: localApp ? { url: localApp.url, starting: !localApp.url } : undefined,
       handoff: {
         head, fileCount: committed === undefined ? undefined : files.length, files: files.slice(0, 40),
+        regression: regression && {
+          ...regression,
+          patch: regressionPatch?.slice(0, 32_000),
+          patchTruncated: Boolean(regressionPatch && regressionPatch.length > 32_000),
+          canRecheck: Boolean(!historical && run.status === "passed" && run.finishedAt && target && head &&
+            uncommitted?.length === 0 && regression.evidence?.approved && regression.status !== "Verified"),
+        },
         uncommittedCount: uncommitted?.length,
         uncommittedFiles: uncommitted?.slice(0, 40),
         configuredChecks: [target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined].filter(Boolean),
       },
     };
+  }
+
+  async resultHead(runId: string) {
+    const run = this.store.get(runId);
+    if (!run?.finishedAt || run.kind === "deployment") throw new UserError("Open a finished run first");
+    return handoffHead(run, this.latestBranchRun(run).id !== runId);
   }
 
   async answerRunQuestion(runId: string, input: unknown): Promise<RunAnswer> {
@@ -1066,8 +1081,8 @@ export class RunManager {
           publication.pullRequestUrl, this.stopResultChecks.signal) !== "closed") return;
         let pullRequestUrl: string;
         try {
-          const description = review?.description ?? await describePullRequest(run.repo, run.branchBaseSha ?? run.baseSha,
-            head, describeRunChecks(saved, head));
+          const description = review?.description ?? withRegressionNotes(await describePullRequest(run.repo, run.branchBaseSha ?? run.baseSha,
+            head, describeRunChecks(saved, head)), describeBugEvidence(saved, head));
           pullRequestUrl = await createRunPullRequest(run.repo, destination.repository, run.branch, head,
             this.stopResultChecks.signal, { draft: input.draft === true, description, reviewedBase: review?.base });
         } catch (error) {
@@ -1109,7 +1124,8 @@ export class RunManager {
     if (input.action === "create" && (!review || input.token !== review.token)) {
       throw new UserError("Reopen the review to confirm the current branch and destination");
     }
-    const description = typeof input.description === "string" ? input.description : input.description === undefined ? review?.description ?? "" : "";
+    const editedDescription = typeof input.description === "string" ? input.description : input.description === undefined ? review?.description ?? "" : "";
+    const description = withRegressionNotes(editedDescription, review?.regressionNotes);
     if (review && (!description.trim() || description.length > MAX_PULL_REQUEST_DESCRIPTION)) {
       throw new UserError("Enter a pull request description between 1 and 32,000 characters");
     }
@@ -1144,15 +1160,20 @@ export class RunManager {
             .filter((check): check is string => Boolean(check)).map((check) => `- ${markdownCode(check)} required before publication.`)
           : describeRunChecks(run, head);
         const diffBase = branch.transplant ? base.head : await git(["merge-base", base.head, head], run.repo);
-        const description = closed?.body.trim() && closed.body.length <= MAX_PULL_REQUEST_DESCRIPTION ? closed.body :
+        const description = closed?.body.trim() && closed.body.length <= MAX_PULL_REQUEST_DESCRIPTION ? withoutRegressionNotes(closed.body) :
           await describePullRequest(run.repo, diffBase, branch.transplant?.tree ?? head, checkLines);
-        const details = { ...branch, base, head, description, repository: destination.repository,
+        const regressionNotes = describeBugEvidence(run, branch.transplant ? undefined : head);
+        const descriptionMaxLength = MAX_PULL_REQUEST_DESCRIPTION - regressionFooter(regressionNotes).length;
+        const details = { ...branch, base, head, description, regressionNotes, descriptionMaxLength, repository: destination.repository,
           destination: destination.key, token: randomBytes(24).toString("hex"), reopen: closed ? { url: closed.link, number: closed.number } : undefined };
         this.draftReviews.set(runId, details);
         return { review: details };
       }
       if (review.base.branch !== base.branch || review.base.head !== base.head) {
         throw new UserError("GitHub’s base branch moved. Reopen the review to approve the current commit");
+      }
+      if (review.regressionNotes !== describeBugEvidence(run, review.transplant ? undefined : head)) {
+        throw new UserError("The regression evidence changed. Reopen the draft review to see the current results.");
       }
       let draftHead = head;
       if (review.transplant) {
@@ -1336,6 +1357,9 @@ export class RunManager {
       const digest = recovery ? await editsDigest(run.worktree) : undefined;
       const hadBrowserFailure = recovery?.attempts.some(({ gates }) => gates.some(({ command }) => command === BROWSER_CHECK));
       const checks = await this.runProjectChecks(target, run.worktree, Boolean(target.browserCheck && (includeBrowser || hadBrowserFailure || run.status === "stopped")));
+      const bugVerification = run.status === "passed" && run.bugVerification?.approved && !dirty
+        ? await verifyBugFix(run, head, this.opts.config.worktreeRoot, undefined, this.stopResultChecks.signal)
+        : undefined;
       if (await git(["rev-parse", "HEAD"], run.worktree) !== head ||
           await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "") !== branch ||
           (digest ? await editsDigest(run.worktree).catch(() => undefined) !== digest : (await changedFiles(run.worktree)).length > 0)) {
@@ -1344,6 +1368,12 @@ export class RunManager {
       const saved = this.store.get(runId);
       if (this.shuttingDown || !saved || saved.finishedAt !== run.finishedAt) throw new UserError("The run changed during verification");
       saved.verification = { head, checks, ...(digest ? { editsDigest: digest } : {}) };
+      if (bugVerification) {
+        const previous = run.bugVerification;
+        saved.bugVerification = previous && (previous.before || previous.after) && previous.head !== head && bugVerification.gap
+          ? { ...previous, recheck: { head, gap: bugVerification.gap } }
+          : bugVerification;
+      }
       this.store.save(saved);
       return saved.verification;
     })().finally(() => this.verifications.delete(runId));
@@ -1599,6 +1629,50 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 /** An error caused by the request, shown to the user as-is (HTTP 400). */
 export class UserError extends Error {}
+
+const regressionStart = "<!-- shipyard-regression-evidence -->";
+const regressionEnd = "<!-- /shipyard-regression-evidence -->";
+
+function withoutRegressionNotes(description: string): string {
+  const start = description.lastIndexOf(`\n\n${regressionStart}\n## Bug verification\n`);
+  const end = description.indexOf(`\n${regressionEnd}`, start);
+  if (start < 0 || end < 0) return description;
+  return description.slice(0, start) + description.slice(end + regressionEnd.length + 1);
+}
+
+function regressionFooter(notes?: string): string {
+  return notes ? `\n\n${regressionStart}\n${notes}\n${regressionEnd}` : "";
+}
+
+function withRegressionNotes(description: string, notes?: string): string {
+  return notes && description.trim() ? withoutRegressionNotes(description).trimEnd() + regressionFooter(notes) : description;
+}
+
+function describeBugEvidence(run: RunRecord, head?: string): string | undefined {
+  const summary = bugEvidence(run, head);
+  if (!summary) return;
+  const { evidence, reason, status } = summary;
+  const commit = status === "Verified" && evidence ? ` at ${markdownCode(evidence.head)}` : "";
+  return ["## Bug verification", `- **${status}**${commit}${reason ? ` · ${reason}` : ""}`,
+    evidence?.actual ? `- Reported behavior: ${markdownCode(evidence.actual)}` : "",
+    evidence?.expected ? `- ${evidence.approved ? "Approved" : "Proposed"} behavior: ${markdownCode(evidence.expected, 500)}` : "",
+    evidence?.testName && evidence.testFile ? `- Regression: ${markdownCode(evidence.testName)} in ${markdownCode(evidence.testFile)}.` : "",
+    evidence?.before ? `- Before (${markdownCode(evidence.baseSha)}): ${markdownCode(evidence.before.detail)}` : "",
+    evidence?.after ? `- After (${markdownCode(evidence.head)}): ${markdownCode(evidence.after.detail)}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+function handoffHead(run: RunRecord, historical: boolean): Promise<string | undefined> {
+  return historical ? Promise.resolve(run.stages.findLast((stage) => stage.commit)?.commit ?? run.baseSha) :
+    git(["rev-parse", "--verify", `refs/heads/${run.branch}`], run.repo).catch(() => undefined);
+}
+
+async function bugFixPatch(run: RunRecord, head: string): Promise<string | undefined> {
+  const original = run.bugVerification?.baseSha ?? run.baseSha;
+  const basedOnOriginal = await git(["merge-base", "--is-ancestor", original, head], run.repo).then(() => true, () => false);
+  const base = basedOnOriginal ? original : run.branchBaseSha ?? run.baseSha;
+  return git(["diff", "--no-ext-diff", "--no-textconv", base, head, "--"], run.repo, { raw: true }).catch(() => undefined);
+}
 
 function describeRunChecks(run: RunRecord, head: string): string[] {
   const verified = run.verification?.head === head && !run.verification.editsDigest ? run.verification.checks : undefined;
