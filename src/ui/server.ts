@@ -184,9 +184,23 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, await opts.manager.cloudRelease(cloudReleaseMatch[1]!, body ?? {}));
       }
 
+      const deploymentMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(deployment|firebase-release)$/);
+      if (req.method === "POST" && deploymentMatch) {
+        if (opts.demo) throw new UserError("Deployment is unavailable in demo mode");
+        const body = await readJson(req, 4_000) as Record<string, unknown> | null;
+        return json(res, 200, opts.manager.deployment(deploymentMatch[1]!,
+          deploymentMatch[2] === "firebase-release" ? { ...body, provider: "firebase" } : body ?? {}));
+      }
+
       const browserMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/browser-check$/);
       if (req.method === "POST" && browserMatch) {
         return json(res, 200, { check: await opts.manager.checkLocalBrowser(browserMatch[1]!) });
+      }
+
+      const questionMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/question$/);
+      if (req.method === "POST" && questionMatch) {
+        const body = await readJson(req, 4_000) as { question?: unknown } | null;
+        return json(res, 200, await opts.manager.answerRunQuestion(questionMatch[1]!, body?.question));
       }
 
       const verifyMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/verify$/);
@@ -245,7 +259,8 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
 
       const resumeMatch = url.pathname.match(/^\/api\/runs\/([\w-]+)\/(resume|recheck|fix)$/);
       if (req.method === "POST" && resumeMatch) {
-        opts.manager.resume(resumeMatch[1]!, resumeMatch[2] as "resume" | "recheck" | "fix");
+        const body = await readJson(req) as { budgetUsd?: unknown } | null;
+        opts.manager.resume(resumeMatch[1]!, resumeMatch[2] as "resume" | "recheck" | "fix", body?.budgetUsd);
         return json(res, 202, { accepted: true });
       }
 

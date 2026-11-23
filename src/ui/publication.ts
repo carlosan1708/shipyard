@@ -21,6 +21,12 @@ export async function pushDestination(repo: string, remotes: string): Promise<De
   const remote = names.includes("origin") ? "origin" : names.length === 1 ? names[0] : undefined;
   if (!remote || !/^[a-zA-Z0-9][a-zA-Z0-9_.\/-]*$/.test(remote)) return;
   const urls = await git(["remote", "get-url", "--push", "--all", remote], repo);
+  const location = describeRemote(urls);
+  if (!location) return;
+  return { remote, ...location, key: createHash("sha256").update(`${remote}\0${urls}`).digest("hex"), url: urls };
+}
+
+function describeRemote(urls: string): Pick<Destination, "label" | "repository"> | undefined {
   if (!urls || urls.includes("\n")) return;
   const scp = urls.match(/^(?:[\w.-]+@)?([\w.-]+):([^\s].*)$/);
   const url = URL.canParse(urls) ? new URL(urls) : undefined;
@@ -41,12 +47,13 @@ export async function pushDestination(repo: string, remotes: string): Promise<De
   const safeRepo = cleanPath && /^[\w.-]+(?:\/[\w.-]+)+$/.test(cleanPath) ? cleanPath : undefined;
   const github = host === "github.com" && safeRepo && /^[a-z\d][a-z\d-]*\/(?!\.{1,2}$)[\w.-]+$/i.test(safeRepo)
     ? `https://github.com/${safeRepo}` : undefined;
-  return { remote, label: safeRepo ? `${host}/${safeRepo}` : host, key: createHash("sha256").update(`${remote}\0${urls}`).digest("hex"), url: urls, repository: github };
+  return { label: safeRepo ? `${host}/${safeRepo}` : host, repository: github };
 }
 
 export async function pushRunCommit(repo: string, destination: Destination, branch: string, head: string, signal: AbortSignal): Promise<void> {
   try {
     await exec("git", [
+      "-c", "core.hooksPath=/dev/null",
       "-c", `remote.${destination.remote}.mirror=false`,
       "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
       "-c", "protocol.ssh.allow=always", "-c", "protocol.file.allow=always",
@@ -73,7 +80,7 @@ class PullRequestComparisonError extends Error {
   constructor(readonly reason: "unrelated" | "no-changes", message: string) { super(message); }
 }
 
-function githubApi(repo: string, signal: AbortSignal, timeout: number) {
+export function githubApi(repo: string, signal: AbortSignal, timeout: number) {
   return async (...args: string[]) => (await exec("gh", ["api", "--hostname", "github.com", ...args], {
     cwd: repo, signal, timeout, maxBuffer: 1024 * 1024,
     env: { ...process.env, GH_PROMPT_DISABLED: "1" },
@@ -85,6 +92,38 @@ function githubHead(api: ReturnType<typeof githubApi>, path: string, branch: str
   return api(`${path}/git/ref/heads/${ref}`, "--jq", ".object.sha");
 }
 
+export async function githubOrigin(repo: string): Promise<string | undefined> {
+  const url = await git(["remote", "get-url", "--all", "origin"], repo).catch(() => "");
+  return describeRemote(url)?.repository;
+}
+
+/** Use the host's GitHub sign-in only for GETs scoped to the run's configured origin. */
+export async function readGitHubOrigin(repo: string, repository: string, branch: string | undefined,
+  file: string | undefined, signal: AbortSignal): Promise<string> {
+  const ownerAndName = new URL(repository).pathname.slice(1);
+  const endpoint = `repos/${ownerAndName}`;
+  const api = githubApi(repo, signal, 12_000);
+  try {
+    const ref = branch ?? await api(endpoint, "--method", "GET", "--jq", ".default_branch");
+    if (!ref) throw new Error("Missing GitHub branch");
+    const head = await githubHead(api, endpoint, ref);
+    if (!/^[a-f0-9]{40}$/.test(head)) throw new Error("Missing GitHub commit");
+    const heading = `${repository}\nBranch: ${ref}\nCommit: ${head}`;
+    if (!file) return heading;
+    const path = file.split("/").map(encodeURIComponent).join("/");
+    const content = await api(`${endpoint}/contents/${path}?ref=${head}`, "--method", "GET", "--header", "Accept: application/vnd.github.raw+json");
+    if (content.includes("\0")) throw new Error("The file is not text");
+    return `${heading}\nFile: ${file}\n\n${content.slice(0, 20_000)}`;
+  } catch (error) {
+    signal.throwIfAborted();
+    const failure = error as { code?: string; stderr?: string };
+    if (failure.code === "ENOENT" || /HTTP 401|gh auth login|bad credentials/i.test(failure.stderr ?? "")) {
+      throw new Error("Reading a private GitHub origin requires signing in with gh on the Shipyard host.");
+    }
+    throw new Error("Could not read the requested GitHub branch or text file. Check that it exists and the host account has access.");
+  }
+}
+
 function linkedPullRequestNumber(repository: string, link: string): string | undefined {
   const url = URL.canParse(link) ? new URL(link) : undefined;
   const number = url?.pathname.split("/").at(-1);
@@ -92,12 +131,28 @@ function linkedPullRequestNumber(repository: string, link: string): string | und
   return number;
 }
 
-export async function linkedPullRequestState(repo: string, repository: string, link: string, signal: AbortSignal): Promise<"open" | "closed" | undefined> {
+export async function inspectLinkedPullRequest(repo: string, repository: string, link: string, signal: AbortSignal, includeFiles = false) {
+  const number = linkedPullRequestNumber(repository, link);
+  if (!number) return;
+  const path = `repos/${new URL(repository).pathname.slice(1)}/pulls/${number}`;
+  const api = githubApi(repo, signal, 8_000);
+  try {
+    const [details, files] = await Promise.all([
+      api(path, "--method", "GET").then((json) => JSON.parse(json) as { state?: string; merged?: boolean; draft?: boolean; base?: { ref?: string }; merge_commit_sha?: string }),
+      includeFiles ? api(`${path}/files?per_page=100`, "--method", "GET").then((json) => JSON.parse(json) as Array<{ filename: string; status: string }>).catch(() => []) : [],
+    ]);
+    if (details.state !== "open" && details.state !== "closed") return;
+    const state = details.merged ? "merged" : details.draft && details.state === "open" ? "draft" : details.state;
+    return { state, base: details.base?.ref, mergeCommit: details.merge_commit_sha, link, files: files.filter(({ status }) => status !== "removed").map(({ filename }) => filename) };
+  } catch { return; }
+}
+
+export async function linkedPullRequestState(repo: string, repository: string, link: string, signal: AbortSignal): Promise<"open" | "closed" | "merged" | undefined> {
   const number = linkedPullRequestNumber(repository, link);
   if (!number) return;
   const path = `repos/${new URL(repository).pathname.slice(1)}/pulls/${number}`;
   const state = await githubApi(repo, signal, 3000)(path, "--jq", 'if .merged then "merged" else .state end').catch(() => undefined);
-  return state === "open" || state === "closed" ? state : undefined;
+  return state === "open" || state === "closed" || state === "merged" ? state : undefined;
 }
 
 export async function closedPullRequest(repo: string, repository: string, link: string, branch: string, signal: AbortSignal) {
@@ -155,7 +210,7 @@ async function writePullRequest(api: ReturnType<typeof githubApi>, path: string,
   }
 }
 
-export async function fetchDraftBase(repo: string, destination: Destination, head: string, signal: AbortSignal): Promise<void> {
+export async function fetchDraftBase(repo: string, destination: Pick<Destination, "url">, head: string, signal: AbortSignal): Promise<void> {
   if (await git(["cat-file", "-e", `${head}^{commit}`], repo).then(() => true, () => false)) return;
   try {
     await exec("git", ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always",

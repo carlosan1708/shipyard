@@ -9,6 +9,15 @@ import type { AuthMode } from "./auth.ts";
 /** The shipyard repository root (works from `npm run` and from bin/shipyard.mjs). */
 export const SHIPYARD_ROOT = process.env.SHIPYARD_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
+export const WORKFLOW_DEPLOYMENT_PROVIDERS = ["aws", "azure"] as const;
+export type WorkflowDeploymentProvider = (typeof WORKFLOW_DEPLOYMENT_PROVIDERS)[number];
+export type DeploymentProvider = "firebase" | WorkflowDeploymentProvider;
+export const DEPLOYMENT_LABELS = { firebase: "Firebase Hosting", aws: "AWS", azure: "Azure" } as const;
+export interface DeploymentWorkflow {
+  workflow: string;
+  environment: string;
+}
+
 export interface Target {
   name: string;
   /** Absolute path to the target git repository. */
@@ -21,6 +30,27 @@ export interface Target {
   browserCheck?: boolean;
   /** Default browser-tool permission for new runs against this target. */
   browserAccess?: boolean;
+  deployments?: Partial<Record<WorkflowDeploymentProvider, DeploymentWorkflow>>;
+}
+
+function deploymentWorkflows(value: unknown, target: string): Target["deployments"] {
+  if (value === undefined) return;
+  const field = `targets.${target}.deployments`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must map cloud providers to workflows`);
+  const deployments: NonNullable<Target["deployments"]> = {};
+  for (const [provider, settings] of Object.entries(value)) {
+    if (provider !== "aws" && provider !== "azure") throw new Error(`${field}.${provider} is unsupported`);
+    const { workflow, environment } = settings ?? {};
+    if (typeof workflow !== "string" || !/^[a-z0-9][a-z0-9._-]*\.ya?ml$/i.test(workflow)) {
+      throw new Error(`${field}.${provider}.workflow must be a filename in .github/workflows`);
+    }
+    if (typeof environment !== "string" || !environment.trim() || environment !== environment.trim() ||
+      environment.length > 255 || /[\x00-\x1f\x7f]/.test(environment)) {
+      throw new Error(`${field}.${provider}.environment must be a GitHub Actions environment name`);
+    }
+    deployments[provider] = { workflow, environment };
+  }
+  return deployments;
 }
 
 export const PROVIDERS = ["claude", "codex"] as const;
@@ -151,6 +181,7 @@ export function parseConfig(raw: Record<string, unknown>, baseDir: string): Ship
     if (typeof t.test !== "string") throw new Error(`targets.${name}.test is required`);
     if (t.browserCheck !== undefined && typeof t.browserCheck !== "boolean") throw new Error(`targets.${name}.browserCheck must be true or false`);
     if (t.browserAccess !== undefined && typeof t.browserAccess !== "boolean") throw new Error(`targets.${name}.browserAccess must be true or false`);
+    const deployments = deploymentWorkflows(t.deployments, name);
     targets[name] = {
       name,
       path: expandPath(t.path, baseDir),
@@ -158,6 +189,7 @@ export function parseConfig(raw: Record<string, unknown>, baseDir: string): Ship
       e2e: typeof t.e2e === "string" ? t.e2e : undefined,
       ...(t.browserCheck === undefined ? {} : { browserCheck: t.browserCheck }),
       ...(t.browserAccess === undefined ? {} : { browserAccess: t.browserAccess }),
+      ...(deployments === undefined ? {} : { deployments }),
     };
   }
 

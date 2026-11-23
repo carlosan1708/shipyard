@@ -424,6 +424,55 @@ code,
 
 /* ── Run list ────────────────────────────────────────── */
 
+.runs-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: inherit;
+}
+
+.runs-header .col-head {
+  position: static;
+}
+
+.run-search {
+  display: grid;
+  gap: 6px;
+  padding: 0 16px 10px;
+}
+
+.run-filters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.run-filters select {
+  min-width: 0;
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.repo-context {
+  overflow-wrap: anywhere;
+}
+
+#run-question-answer {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  overflow-wrap: anywhere;
+}
+
+.run-repository {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.card > .run-repository {
+  margin: 0 12px;
+}
+
 .run-list {
   list-style: none;
   margin: 0;
@@ -1610,6 +1659,7 @@ code,
 
 textarea,
 input[type="text"],
+input[type="search"],
 select {
   width: 100%;
   padding: 8px 10px;

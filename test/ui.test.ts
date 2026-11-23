@@ -53,6 +53,42 @@ const imageAttachment = (name: string) => ({
 const e2e: Step = (req) =>
   writeFiles(req.cwd, { "e2e/add.e2e.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("e2e", () => assert.equal(add(2, 2), 4));\n' });
 
+test("an explicit higher budget resumes an exhausted run on its saved worktree", async () => {
+  const { manager, config, runner } = await makeManager([
+    (req) => { fix(req); return { costUsd: 0.95 }; },
+    (req) => { assert.ok(Math.abs(req.maxBudgetUsd! - 0.55) < 1e-9); return { costUsd: 0.2 }; },
+  ]);
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  try {
+    const id = manager.start({ target: "t0", kind: "feature", request: "Update addition", crew: ["docs"], checkpoints: [], budgetUsd: 1 });
+    const paused = (await manager.whenDone(id))!;
+    assert.equal(paused.status, "failed");
+    assert.equal(paused.budgetBlockedStage, "docs");
+    // Existing histories only had the text of the budget error.
+    manager.store.save({ ...paused, budgetBlockedStage: undefined });
+    const result = JSON.parse((await request(server.port, `/api/runs/${id}/result`, { headers })).body);
+    assert.deepEqual(result.budgetPause, { stage: "docs", current: 1, spent: 0.95, minimum: 1.05 });
+    const resume = (body?: object) => request(server.port, `/api/runs/${id}/resume`, { method: "POST", headers, body });
+    for (const value of [undefined, { budgetUsd: null }, { budgetUsd: "2" }, { budgetUsd: 1.04 }]) assert.equal((await resume(value)).status, 400);
+    assert.equal((runner as FakeRunner).calls.length, 1);
+    assert.equal((await resume({ budgetUsd: 1.5 })).status, 202);
+    const resumed = (await manager.whenDone(id))!;
+    assert.equal(resumed.status, "passed");
+    assert.equal(resumed.worktree, paused.worktree);
+    assert.equal(resumed.branch, paused.branch);
+    assert.equal(resumed.budgetUsd, 1.5);
+    assert.equal(resumed.budgetBlockedStage, undefined);
+    assert.equal(resumed.stages[0]?.commit, paused.stages[0]?.commit);
+    assert.deepEqual((runner as FakeRunner).calls.map(({ role }) => role.name), ["backend", "docs-writer"]);
+    assert.equal(config.maxBudgetUsdPerRun, 10);
+    assert.equal(manager.store.events(id).filter(({ type }) => type === "budget_increased").length, 1);
+    assert.equal((await resume({ budgetUsd: 2 })).status, 400);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
 test("checkpoints from the UI: an inbox item per stage, answered over the manager", async () => {
   const { manager } = await makeManager([fix, e2e]);
   const id = manager.start({ target: "t0", kind: "bug", request: "add() subtracts", checkpoints: ["implement", "e2e"] });
@@ -1204,6 +1240,241 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
   }
 });
 
+test("a follow-up can review a merged Firebase release and deploy only the approved commit and site", async () => {
+  const { git } = await import("../src/exec.ts");
+  const { commitAll } = await import("../src/worktree.ts");
+  const { manager, config, runner } = await makeManager([fix]);
+  const repo = config.targets.t0!.path;
+  const repository = "https://github.com/octo/fixture";
+  const link = `${repository}/pull/3`;
+  writeFiles(repo, { "firebase.json": JSON.stringify({ hosting: { site: "example-site", public: "public" } }),
+    ".firebaserc": JSON.stringify({ projects: { default: "example-project" } }), "public/index.html": "<h1>Release</h1>" });
+  const head = (await commitAll(repo, "Configure Hosting"))!;
+  await git(["remote", "add", "origin", `${repository}.git`], repo);
+  const id = manager.start({ target: "t0", kind: "feature", request: "Update code", crew: [], checkpoints: [] });
+  const server = await startUiServer({ manager, config });
+  const fake = tempDir("sy-firebase-");
+  const ref = join(fake, "ref");
+  const deployed = join(fake, "deployed");
+  const originalPath = process.env.PATH;
+  const headers = { "x-shipyard-token": server.token };
+  const post = (action: string, body: object) => request(server.port, `/api/runs/${id}/${action}`, { method: "POST", headers, body });
+  try {
+    const run = (await manager.whenDone(id))!;
+    assert.equal(run.status, "passed");
+    const { pushDestination } = await import("../src/ui/publication.ts");
+    const destination = (await pushDestination(repo, "origin"))!;
+    manager.store.save({ ...run, publication: { head: run.stages[0]!.commit!, destination: destination.key, pullRequestUrl: link, pushedAt: new Date().toISOString() } });
+    writeFileSync(ref, head);
+    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args.includes(".default_branch")) console.log("main");
+else if (args.includes(".object.sha")) console.log(require("node:fs").readFileSync(${JSON.stringify(ref)}, "utf8"));
+else if (args.includes("--jq")) console.log("merged");
+else console.log(JSON.stringify({ state: "closed", merged: true, base: { ref: "main" }, merge_commit_sha: ${JSON.stringify(head)} }));
+`, { mode: 0o755 });
+    writeFileSync(join(fake, "firebase"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+let result;
+if (args[0] === "login:list") result = [{ user: { email: "operator@example.test" } }];
+else if (args[0] === "hosting:sites:list") result = { sites: [{ name: "projects/example-project/sites/example-site" }, { name: "projects/example-project/sites/another-site" }] };
+else if (args[0] === "deploy") fs.appendFileSync(${JSON.stringify(deployed)}, JSON.stringify({ args, config: JSON.parse(fs.readFileSync("firebase.json", "utf8")), head: require("node:child_process").execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim() }) + "\\n");
+else process.exit(1);
+console.log(JSON.stringify({ status: "success", result }));
+`, { mode: 0o755 });
+    process.env.PATH = `${fake}:${originalPath}`;
+    const question = await post("question", { question: "I merged the PR. Deploy it now." });
+    assert.equal(JSON.parse(question.body).review, "firebase-release");
+    assert.equal(existsSync(deployed), false);
+    const start = await post("firebase-release", { action: "review" });
+    assert.equal(start.status, 200, start.body);
+    const deploymentId = JSON.parse(start.body).run.id as string;
+    assert.notEqual(deploymentId, id);
+    assert.equal(JSON.parse(start.body).run.deployment.phase, "verifying");
+    const release = (body: object) => request(server.port, `/api/runs/${deploymentId}/firebase-release`, { method: "POST", headers, body });
+    const review = async () => {
+      const response = await release({ action: "review" });
+      assert.equal(response.status, 200, response.body);
+      const waiting = (await manager.whenDone(deploymentId))!;
+      assert.equal(waiting.deployment?.phase, "approval");
+      return waiting.deployment!.review!;
+    };
+    const waiting = (await manager.whenDone(deploymentId))!;
+    assert.equal(waiting.kind, "deployment");
+    assert.equal(waiting.deployment?.phase, "approval");
+    const plan = waiting.deployment!.review!;
+    assert.deepEqual([plan.head, plan.project, plan.site, plan.account], [head, "example-project", "example-site", "operator@example.test"]);
+    assert.equal(JSON.parse((await post("firebase-release", { action: "review" })).body).run.id, deploymentId);
+    assert.equal(existsSync(deployed), false);
+    const deploy = (token: string, confirm: boolean) => release({ action: "deploy", token, confirm, site: "another-site" });
+    assert.equal((await deploy(plan.token, false)).status, 400);
+    assert.equal((await deploy("wrong-token", true)).status, 400);
+    assert.equal((await post("firebase-release", { action: "deploy", token: plan.token, confirm: true })).status, 400);
+    writeFileSync(ref, "f".repeat(40));
+    const moved = await deploy(plan.token, true);
+    assert.equal(moved.status, 200);
+    assert.match((await manager.whenDone(deploymentId))?.error ?? "", /default branch changed/);
+    assert.equal(existsSync(deployed), false);
+    writeFileSync(ref, head);
+    const approved = await review();
+    const restarted = new RunManager({ config, roles: loadRoles(), runner });
+    try {
+      assert.equal(restarted.store.get(deploymentId)?.deployment?.phase, "approval");
+      assert.deepEqual(restarted.activeRunIds(), []);
+      const { run: publishing } = restarted.deployment(deploymentId, { action: "deploy", token: approved.token, confirm: true });
+      assert.equal(publishing.deployment?.phase, "publishing");
+      assert.equal((await restarted.whenDone(deploymentId))?.deployment?.phase, "published");
+    } finally { await restarted.shutdown(); }
+    assert.equal((await deploy(approved.token, true)).status, 400);
+    const calls = readFileSync(deployed, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].head, head);
+    assert.ok(calls[0].args.includes("--only=hosting:example-site"));
+    assert.ok(calls[0].args.includes("--project=example-project"));
+    assert.ok(calls[0].args.includes("--account=operator@example.test"));
+    assert.equal(calls[0].config.hosting.site, "example-site");
+    assert.equal(manager.store.get(deploymentId)?.firebaseRelease?.head, head);
+    assert.equal(manager.store.get(id)?.firebaseRelease, undefined);
+    assert.equal((runner as FakeRunner).calls.length, 1);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    await Promise.all([manager.shutdown(), server.close()]);
+  }
+});
+
+test("AWS and Azure follow-ups dispatch only the reviewed workflow after approval", async () => {
+  const { git } = await import("../src/exec.ts");
+  const { commitAll } = await import("../src/worktree.ts");
+  const { manager, config, runner } = await makeManager([fix]);
+  const target = config.targets.t0!;
+  const repo = target.path;
+  const repository = "https://github.com/octo/deploy-fixture";
+  const pullRequestUrl = `${repository}/pull/5`;
+  const fake = tempDir("sy-workflow-");
+  const ref = join(fake, "ref");
+  const calls = join(fake, "dispatches");
+  const complete = join(fake, "complete");
+  const originalPath = process.env.PATH;
+  const workflow = `on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        type: string
+        required: true
+      environment:
+        type: environment
+        required: true
+jobs:
+  deploy:
+    if: \${{ github.sha == inputs.commit_sha }}
+    environment: \${{ inputs.environment }}
+`;
+  const providers = ["aws", "azure"] as const;
+  for (const provider of providers) {
+    writeFiles(repo, { [`.github/workflows/${provider}.yml`]: workflow });
+  }
+  const head = (await commitAll(repo, "Configure deployment"))!;
+  await git(["remote", "add", "origin", `${repository}.git`], repo);
+  const sourceId = manager.start({ target: "t0", kind: "feature", request: "Update code", crew: [], checkpoints: [] });
+  const server = await startUiServer({ manager, config });
+  const post = (id: string, path: string, body: object) => request(server.port, `/api/runs/${id}/${path}`, {
+    method: "POST", headers: { "x-shipyard-token": server.token }, body,
+  });
+  let restarted: RunManager | undefined;
+  try {
+    const source = (await manager.whenDone(sourceId))!;
+    assert.equal(source.status, "passed");
+    const { pushDestination } = await import("../src/ui/publication.ts");
+    const destination = (await pushDestination(repo, "origin"))!;
+    manager.store.save({ ...source, publication: { head: source.stages[0]!.commit!, destination: destination.key, pullRequestUrl, pushedAt: new Date().toISOString() } });
+    writeFileSync(ref, head);
+    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const endpoint = args[3];
+const head = ${JSON.stringify(head)};
+if (args.includes(".default_branch")) console.log("main");
+else if (args.includes(".object.sha")) console.log(fs.readFileSync(${JSON.stringify(ref)}, "utf8"));
+else if (endpoint.endsWith("/pulls/5")) console.log(JSON.stringify({ state: "closed", merged: true, base: { ref: "main" }, merge_commit_sha: head }));
+else if (endpoint.includes("/contents/.github/workflows/")) console.log(${JSON.stringify(workflow)});
+else if (endpoint.includes("/environments/")) console.log(endpoint.split("/").at(-1));
+else if (endpoint.endsWith("/actions/workflows/aws.yml")) console.log("101");
+else if (endpoint.endsWith("/actions/workflows/azure.yml")) console.log("102");
+else if (endpoint.endsWith("/dispatches") && args.includes("POST")) {
+  fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");
+  console.log(JSON.stringify({ workflow_run_id: 1000 + Number(endpoint.split("/").at(-2)) }));
+} else if (endpoint.includes("/actions/runs/") && args.includes("GET")) {
+  const completed = fs.existsSync(${JSON.stringify(complete)});
+  console.log(JSON.stringify({ head_sha: head, head_branch: "main", workflow_id: Number(endpoint.split("/").at(-1)) - 1000,
+    event: "workflow_dispatch", status: completed ? "completed" : "in_progress", conclusion: completed ? "success" : null }));
+} else process.exit(1);
+`, { mode: 0o755 });
+    process.env.PATH = `${fake}:${originalPath}`;
+    const question = async (question: string) => JSON.parse((await post(sourceId, "question", { question })).body);
+    const unconfigured = await question("Deploy to Azure.");
+    assert.equal(unconfigured.review, undefined);
+    assert.match(unconfigured.details.join(" "), /Configure the Azure workflow/);
+    target.deployments = { aws: { workflow: "aws.yml", environment: "aws-prod" }, azure: { workflow: "azure.yml", environment: "azure-prod" } };
+    const generic = await question("I merged the PR. Deploy it now.");
+    assert.equal(generic.review, undefined);
+    assert.deepEqual(generic.actions.slice(0, 2).map(({ action }: { action: string }) => action), ["aws-release", "azure-release"]);
+    const ids: string[] = [];
+    for (const [index, provider] of providers.entries()) {
+      assert.equal((await question(`I merged the PR. Deploy to ${provider}.`)).review, `${provider}-release`);
+      const start = await post(sourceId, "deployment", { action: "review", provider });
+      assert.equal(start.status, 200, start.body);
+      const id = JSON.parse(start.body).run.id as string;
+      ids.push(id);
+      assert.notEqual(id, sourceId);
+      const waiting = (await manager.whenDone(id))!;
+      assert.equal(waiting.deployment?.phase, "approval", waiting.error ?? "");
+      assert.deepEqual([waiting.deployment.provider, waiting.deployment.workflowReview?.head,
+        waiting.deployment.workflowReview?.workflowId, waiting.deployment.workflowReview?.environment],
+      [provider, head, 101 + index, `${provider}-prod`]);
+      assert.equal((await post(id, "deployment", { action: "deploy", confirm: true, token: "wrong" })).status, 400);
+      assert.equal(existsSync(calls), false);
+    }
+    const stale = ids[0]!;
+    const staleToken = manager.store.get(stale)?.deployment?.workflowReview?.token;
+    writeFileSync(ref, "f".repeat(40));
+    assert.equal((await post(stale, "deployment", { action: "deploy", confirm: true, token: staleToken })).status, 200);
+    assert.match((await manager.whenDone(stale))?.error ?? "", /default branch moved/);
+    assert.equal(existsSync(calls), false);
+    writeFileSync(ref, head);
+    assert.equal((await post(stale, "deployment", { action: "review" })).status, 200);
+    assert.equal((await manager.whenDone(stale))?.deployment?.phase, "approval");
+    for (const [index, id] of ids.entries()) {
+      const token = manager.store.get(id)?.deployment?.workflowReview?.token;
+      const response = await post(id, "deployment", { action: "deploy", confirm: true, token });
+      assert.equal(response.status, 200, response.body);
+      const dispatched = await manager.whenDone(id);
+      assert.equal(dispatched?.deployment?.workflowRun?.id, 1101 + index, dispatched?.error ?? "");
+      assert.equal(dispatched?.finishedAt, undefined);
+      assert.equal((await post(id, "deployment", { action: "deploy", confirm: true, token })).status, 400);
+    }
+    await manager.shutdown();
+    writeFileSync(complete, "");
+    restarted = new RunManager({ config, roles: loadRoles(), runner });
+    for (let attempt = 0; attempt < 100 && ids.some((id) => !restarted!.store.get(id)?.finishedAt); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    for (const id of ids) assert.equal(restarted.store.get(id)?.deployment?.phase, "published");
+    const requests = readFileSync(calls, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    assert.equal(requests.length, 2);
+    for (const [index, args] of requests.entries()) {
+      assert.ok(args.includes(`inputs[commit_sha]=${head}`));
+      assert.ok(args.includes(`inputs[environment]=${providers[index]}-prod`));
+    }
+    assert.equal((runner as FakeRunner).calls.length, 1);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    await Promise.all([manager.shutdown(), restarted?.shutdown(), server.close()]);
+  }
+});
+
 test("a Cloud Run release requires approval of the exact service and image before updating it", async () => {
   const { manager, config, runner } = await makeManager([fix, () => ({ summary: "Review the Cloud Run service and verify the image digest." })]);
   const server = await startUiServer({ manager, config });
@@ -1381,7 +1652,7 @@ test("the handoff can verify a finished worktree and approve references without 
   const server = await startUiServer({ manager, config, token: "q".repeat(48) });
   const auth = { "x-shipyard-token": server.token };
   const requested = "Use https://github.com/example";
-  const id = manager.start({ target: "t0", kind: "feature", request: requested, crew: [], checkpoints: [] });
+  const id = manager.start({ target: "t0", kind: "feature", request: requested, referenceUrls: [], crew: [], checkpoints: [] });
   const send = (path: string, body?: object) => request(server.port, `/api/runs/${id}/${path}`, { method: "POST", headers: auth, body });
   try {
     const run = await manager.whenDone(id);
@@ -1394,7 +1665,12 @@ test("the handoff can verify a finished worktree and approve references without 
     assert.deepEqual(saved.verification?.checks.map((check) => check.code), [0, 0]);
     assert.match(saved.verification!.checks[1]!.outputTail, /host E2E passed/);
     assert.equal(saved.stages[0]?.attempts[0]?.gates.length, 1);
+    manager.store.save({ ...saved, status: "stopped" });
+    assert.equal((await manager.result(id)).canVerifyStoppedRun, true);
+    assert.equal((await send("verify")).status, 200);
+    assert.equal(manager.store.get(id)?.status, "stopped");
     writeFiles(saved.worktree, { "later.txt": "Unsaved work" });
+    assert.equal((await manager.result(id)).canVerifyStoppedRun, false);
     assert.equal((await send("verify")).status, 400);
     assert.equal((await send("references", { referenceUrls: ["https://127.0.0.1/secret"] })).status, 400);
     t.mock.method(globalThis, "fetch", async (input: string) => {

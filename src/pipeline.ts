@@ -48,7 +48,7 @@ import {
 } from "./prompts.ts";
 import { requireRole, type Role } from "./roles.ts";
 import type { RunControl } from "./run-control.ts";
-import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, sharedReference, type ReferenceCheck, type ReferenceReview } from "./references.ts";
+import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, type ReferenceCheck, type ReferenceReview } from "./references.ts";
 import { canRepairRevisionRole, gateOk, type AttemptRecord, type GateRecord, type RunFollowUp, type RunKind, type RunRecord, type RunStatus, type RunStore, type StageRecord } from "./store.ts";
 import { changedFiles, commitAll, createWorktree, removeWorktree, repoRoot, revertFiles, worktreeSnapshot } from "./worktree.ts";
 
@@ -59,7 +59,9 @@ const LIMIT_ERRORS = new Set(["error_max_turns", "error_max_budget_usd"]);
 const MIN_ATTEMPT_BUDGET_USD = 0.1;
 
 /** The run spent its budget. It ends as failed, keeping whatever earlier stages committed. */
-class BudgetReachedError extends Error {}
+class BudgetReachedError extends Error {
+  constructor(readonly stage: StageName, message: string) { super(message); }
+}
 class RunStoppedError extends Error {}
 
 /** Every stage, in the order a run goes through them. */
@@ -263,7 +265,8 @@ interface StageOutcome {
 export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Promise<RunRecord> {
   const log = deps.log ?? (() => {});
   const { target, kind, request, resume, continueBranch } = req;
-  const referenceUrls = resume ? resume.referenceUrls ?? [] : parseReferencePermissions(req.referenceUrls);
+  const referenceUrls = resume ? resume.referenceUrls ?? []
+    : parseReferencePermissions(req.referenceUrls ?? referenceLinks(request).slice(0, MAX_PUBLIC_REFERENCES));
   const followUp = resume?.followUp ?? req.followUp;
   const orchestrator = followUp?.orchestrated ? requireRole(deps.roles, "orchestrator") : undefined;
   const crew = new Set<OptionalStage>(req.crew ?? DEFAULT_CREW);
@@ -309,7 +312,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     if (continueBranch && (await changedFiles(worktree)).length) throw new Error("There are saved edits in this branch’s worktree. Feedback was not started.");
   }
 
-  const run: RunRecord = resume ? { ...resume, status: "running", ownerPid: process.pid, finishedAt: undefined, archivedAt: undefined, error: undefined } : {
+  const run: RunRecord = resume ? { ...resume, status: "running", ownerPid: process.pid, finishedAt: undefined, archivedAt: undefined, error: undefined, budgetBlockedStage: undefined } : {
     id,
     kind,
     target: target.name,
@@ -738,6 +741,8 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
             browserCheck: target.browserCheck,
             maxAttempts,
             resumeSession: implementerSession,
+            // Re-run all checks even when a host or browser failure needs no source change.
+            allowNoChanges: true,
           },
           run,
           deps,
@@ -794,6 +799,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     if (deps.control?.stopped || err instanceof RunStoppedError) return finish("stopped");
     run.error = err instanceof Error ? err.message : String(err);
     if (err instanceof BudgetReachedError) {
+      run.budgetBlockedStage = err.stage;
       log(`  ${run.error}`);
       return finish("failed");
     }
@@ -834,15 +840,24 @@ function budgetLeft(run: RunRecord): number | undefined {
 
 const outOfBudget = (run: RunRecord): boolean => {
   const left = budgetLeft(run);
-  return left !== undefined && left < MIN_ATTEMPT_BUDGET_USD;
+  return left !== undefined && left + 1e-9 < MIN_ATTEMPT_BUDGET_USD;
 };
+
+export function budgetPause(run: RunRecord) {
+  if (run.status !== "failed" || run.provider === "codex" || run.budgetUsd === undefined || run.totals.costUsd === null) return;
+  // Older histories recorded the stage only in this pipeline-generated error.
+  const stage = run.budgetBlockedStage ?? run.error?.match(/^Stopped before ([\w-]+): the run used ~\$/)?.[1];
+  if (!stage) return;
+  const current = run.budgetUsd;
+  const spent = run.totals.costUsd;
+  const minimum = Math.max(Math.floor(current * 100 + 1e-9) + 1, Math.ceil((spent + MIN_ATTEMPT_BUDGET_USD) * 100 - 1e-9)) / 100;
+  return { stage, current, spent, minimum };
+}
 
 function budgetReached(run: RunRecord, stage: StageName): BudgetReachedError {
   const spent = sumAttempts(run).costUsd ?? 0;
-  return new BudgetReachedError(
-    `Stopped before ${stage}: the run used ~$${spent.toFixed(2)} of its ~$${run.budgetUsd} budget (est.). ` +
-      `Start it again with a higher budget, or raise maxBudgetUsdPerRun in shipyard.config.yaml.`,
-  );
+  return new BudgetReachedError(stage, `Stopped before ${stage}: the run used ~$${spent.toFixed(2)} of its ~$${run.budgetUsd} budget (est.). ` +
+    `Approve a higher limit in the dashboard to continue this run.`);
 }
 
 async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Promise<StageOutcome> {

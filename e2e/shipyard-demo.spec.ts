@@ -1,4 +1,4 @@
-import { cp, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -57,6 +57,7 @@ test("ships a health endpoint from request to verified handoff", async ({ demo, 
     await header.getByRole("button", { name: "New run" }).click();
     const form = page.getByRole("dialog", { name: "New run" });
     await expect(form.getByLabel("Target repo")).toHaveValue("demo-shop");
+    await expect(form.getByText(demo.repo, { exact: true })).toBeVisible();
     await form.getByLabel("Feature request").fill('Add a GET /health endpoint that returns {"status": "ok"}.');
     await holdForRecording(1600);
     const startRun = form.getByRole("button", { name: "Start run" });
@@ -116,5 +117,34 @@ test("ships a health endpoint from request to verified handoff", async ({ demo, 
     expect(await git(["rev-parse", "HEAD"], demo.repo)).toBe(demo.baseCommit);
     expect(await git(["status", "--porcelain"], demo.repo)).toBe("");
     await holdForRecording(3300);
+  });
+
+  await test.step("Find the completed run by repository and status", async () => {
+    const runs = page.getByRole("complementary", { name: "Runs" });
+    const repoFilter = runs.getByRole("combobox", { name: "Filter runs by repository" });
+    const statusFilter = runs.getByRole("combobox", { name: "Filter runs by status" });
+    await repoFilter.selectOption({ label: "demo-shop" });
+    await statusFilter.selectOption("failed");
+    await expect(runs.getByText("No matching runs.")).toBeVisible();
+    await statusFilter.selectOption("passed");
+    await runs.getByRole("searchbox").fill("/health");
+    await expect(runs.getByRole("listitem")).toContainText("Add a GET /health endpoint");
+    await expect(page.getByRole("main").getByText(await realpath(demo.repo), { exact: true })).toBeVisible();
+  });
+
+  await test.step("Ask about the saved run without starting a revision", async () => {
+    const result = page.getByRole("region", { name: "Run result", exact: true });
+    await result.getByRole("button", { name: "Check live deployment" }).click();
+    const dialog = page.getByRole("dialog", { name: "Ask about this run" });
+    await expect(dialog.getByRole("heading", { name: "Deployment could not be verified" })).toBeVisible();
+    await dialog.getByRole("button", { name: "Which checks passed?" }).click();
+    await expect(dialog.getByText("Passed · npm run e2e", { exact: true })).toBeVisible();
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await result.getByRole("button", { name: "Request code changes" }).click();
+    const revision = page.getByRole("dialog", { name: "Request code changes" });
+    await revision.getByRole("textbox", { name: "What should change?" }).fill("It´s deployed ?");
+    await revision.getByRole("button", { name: "Start revision" }).click();
+    await expect(dialog.getByRole("heading", { name: "Deployment could not be verified" })).toBeVisible();
+    await expect(page.getByRole("complementary", { name: "Runs" }).getByRole("listitem")).toHaveCount(1);
   });
 });

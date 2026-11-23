@@ -1,0 +1,3 @@
+#!/bin/sh
+# macOS rejects Chrome's nested sandbox. The gate already runs inside Seatbelt.
+exec "${SHIPYARD_GATE_CHROME:?This launcher requires a Shipyard project gate}" --no-sandbox --disable-background-networking "$@"

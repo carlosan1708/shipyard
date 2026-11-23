@@ -17,8 +17,16 @@ export const PUBLISH_RULES = [
   { pattern: /\byarn\s+(?:npm\s+)?publish\b/, reason: "package publish" },
   { pattern: /\b(?:twine\s+upload|cargo\s+publish|gem\s+push)\b/, reason: "package publish" },
   { pattern: /\bgh\s+(?:pr\s+(?:create|merge)|release\s+create|repo\s+create)\b/, reason: "GitHub write" },
-  { pattern: /\b(?:vercel|netlify|fly|firebase)\b.*\bdeploy\b|\bvercel\s+--prod\b/, reason: "deploy" },
-  { pattern: /\bgcloud\b[^\n;|&]*\b(?:deploy|submit|update-traffic|services\s+(?:update|replace|delete|add-iam-policy-binding|set-iam-policy))\b/, reason: "Google Cloud release" },
+];
+
+const DEPLOYMENT_RULES = [
+  { pattern: /\b(?:gcloud|aws|az|azd|gsutil|bq)\s+/, reason: "cloud CLI operation" },
+  { pattern: /\bfirebase\s+[^\n;|&]*\b(?:deploy|[\w:-]+:(?:create|delete|update|clone|deploy|enable|disable|set|unset|import|export))\b/, reason: "Firebase resource change" },
+  { pattern: /\b(?:vercel|netlify|fly|flyctl|wrangler|sls|serverless|cdk|sam)\s+[^\n;|&]*\b(?:deploy|publish|release|launch)\b|\bvercel\s+--prod\b/, reason: "deployment" },
+  { pattern: /\b(?:terraform|tofu|pulumi|kubectl|helm)\s+[^\n;|&]*\b(?:apply|up|destroy|create|delete|patch|replace|scale|rollout|install|upgrade|uninstall)\b/, reason: "infrastructure change" },
+  { pattern: /\b(?:npm|pnpm|yarn|bun|make|just)\s+(?:run\s+)?(?:[\w-]+:)*deploy(?:-[\w-]+|:[\w:-]+)?\b/, reason: "deployment script" },
+  { pattern: /\bgh\s+workflow\s+run\b/, reason: "remote workflow dispatch" },
+  { pattern: /\bgh\s+api\s+[^\n;|&]*\/dispatches\b/, reason: "remote workflow dispatch" },
 ];
 
 /** Always blocked, even with SHIPYARD_ALLOW_PUBLISH=1. */
@@ -37,6 +45,14 @@ export function checkCommand(command, env = process.env) {
   for (const rule of DESTRUCTIVE_RULES) {
     if (rule.pattern.test(command)) {
       return { blocked: true, reason: `Blocked by shipyard guard: ${rule.reason} is never allowed for agents.` };
+    }
+  }
+  for (const rule of DEPLOYMENT_RULES) {
+    if (rule.pattern.test(command)) {
+      return {
+        blocked: true,
+        reason: `Blocked by shipyard guard: ${rule.reason} needs human approval through a dedicated release action. Report the intended account, target, and change in the handoff.`,
+      };
     }
   }
   if (env.SHIPYARD_ALLOW_PUBLISH === "1") return { blocked: false };

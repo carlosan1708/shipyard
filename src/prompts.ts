@@ -357,7 +357,7 @@ export function repairPrompt(gate: ExecResult, testerSummary: string): string {
     `Their notes:\n<summary>\n${testerSummary.trim() || "(no notes)"}\n</summary>`,
     `Command: \`${gate.command}\` (exit code ${gate.code}${gate.timedOut ? ", timed out" : ""})`,
     `<output>\n${tail(gate.output)}\n</output>`,
-    `Fix the application code so the E2E tests pass. Do not edit the E2E tests. If you believe a test is wrong, explain why in your summary instead.`,
+    `Fix application code when a test exposes a product defect. Do not edit the E2E tests. If the failure is in the test environment, explain the evidence and leave application code alone. Shipyard reruns the configured checks. If your shell cannot launch a browser or bind a local test server, leave that check to the host gate.`,
   ].join("\n\n");
 }
 
@@ -366,7 +366,7 @@ export function humanAvailableNote(): string {
   return [
     "A human is available while you work.",
     "If the task is ambiguous in a way that changes the result, ask with the AskUserQuestion tool instead of guessing. Don't ask about things you can find out from the code.",
-    "Some tools, such as web access, need the human's approval each time you use them.",
+    "Public web reads are available without approval. Use the run handoff for publishing or deployment approval.",
   ].join(" ");
 }
 

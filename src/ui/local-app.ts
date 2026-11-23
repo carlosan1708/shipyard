@@ -4,6 +4,7 @@ import { realpath, stat } from "node:fs/promises";
 import { createServer, type AddressInfo } from "node:net";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { localProcess } from "../exec.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 
 const HOST = "::1";
@@ -76,7 +77,8 @@ export async function launchLocalApp(worktree: string, repo: string, plan: unkno
   signal.throwIfAborted();
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  const child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  const [executable, sandboxArgs] = localProcess(command, args, true);
+  const child = spawn(executable, sandboxArgs, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   let output = "";
   let ended = false;
   let ready = false;

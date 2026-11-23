@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { startBrowserTool } from "../src/browser-tool.ts";
+import { startAgentWebTools } from "../src/browser-tool.ts";
 import { runPipeline } from "../src/pipeline.ts";
 import { missingReferencePermissions, parseReferencePermissions, readPublicReference } from "../src/references.ts";
 import { loadRoles } from "../src/roles.ts";
@@ -51,14 +51,21 @@ test("only approved public source material is returned and LinkedIn sign-in is s
 });
 
 test("the browser MCP endpoint requires its attempt token and accepts only scoped browser inputs", async () => {
-  const tool = await startBrowserTool(tempDir());
+  const tool = await startAgentWebTools(tempDir(), true);
   const client = new Client({ name: "test-client", version: "1.0.0" });
   const headers = { authorization: `Bearer ${tool.token}` };
   try {
     assert.equal((await fetch(tool.url, { method: "POST" })).status, 401);
     assert.equal((await fetch(tool.url, { method: "POST", headers: { ...headers, origin: "https://example.test" } })).status, 403);
     await client.connect(new StreamableHTTPClientTransport(new URL(tool.url), { requestInit: { headers } }));
-    assert.deepEqual((await client.listTools()).tools.map(({ name }) => name), ["inspect_preview"]);
+    assert.deepEqual((await client.listTools()).tools.map(({ name }) => name), ["read_public_page", "inspect_preview"]);
+    for (const url of ["http://127.0.0.1/", "http://[::ffff:169.254.169.254]/", "http://169.254.169.254/", "https://example.org/?token=secret"]) {
+      const result = await client.callTool({ name: "read_public_page", arguments: { url } });
+      assert.equal(result.isError, true);
+      assert.match(JSON.stringify(result.content), /private, and reserved|without credentials/);
+    }
+    const write = await client.callTool({ name: "read_public_page", arguments: { url: "https://example.org", method: "POST" } });
+    assert.equal(write.isError, true);
     const external = await client.callTool({ name: "inspect_preview", arguments: { viewport: "phone", url: "https://example.test" } });
     assert.equal(external.isError, true);
     const local = await client.callTool({ name: "inspect_preview", arguments: { viewport: "phone" } });
@@ -92,4 +99,24 @@ test("a run delivers approved references and records warnings for links outside 
   assert.equal(fetched.mock.callCount(), 3);
   assert.deepEqual(run.references?.map(({ status }) => status), ["permission-required", "read"]);
   assert.deepEqual(store.events(run.id).filter((event) => event.type === "reference").map((event) => event.status), ["permission-required", "read"]);
+});
+
+test("public links in a run request are read by default without approval", async (t) => {
+  const url = "https://github.com/example/project";
+  t.mock.method(globalThis, "fetch", async (input: string) => {
+    assert.match(input, /^https:\/\/api.github.com\/repos\/example\/project/);
+    return input.endsWith("/readme") ? new Response("Public source text") : Response.json({ full_name: "example/project" });
+  });
+  const runner = new FakeRunner([(req) => {
+    assert.match(req.prompt, /Public source text/);
+    writeFiles(req.cwd, { "README.md": "Updated the project." });
+  }]);
+  const run = await runPipeline({ target: { name: "fixture", path: await makeTargetRepo(), test: "true" },
+    kind: "feature", request: `Use ${url}`, crew: [], browserReferenceHelp: true }, {
+    config: { model: "test", maxGateRetries: 0, worktreeRoot: tempDir() }, runner, store: new RunStore(tempDir()), roles: loadRoles(),
+    approveReference: async () => assert.fail("Public reads should not ask for approval"),
+  });
+  assert.equal(run.status, "passed");
+  assert.deepEqual(run.referenceUrls, [url]);
+  assert.equal(run.references?.[0]?.status, "read");
 });

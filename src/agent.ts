@@ -5,7 +5,7 @@ import { agentEnv, type AuthMode } from "./auth.ts";
 import { checkToolUse, type Lane } from "./guards.ts";
 import { EFFORTS, type RunEffort } from "./config.ts";
 import type { Role } from "./roles.ts";
-import { BROWSER_SERVER, BROWSER_TOOL, startBrowserTool } from "./browser-tool.ts";
+import { BROWSER_SERVER, PUBLIC_WEB_NOTE, startAgentWebTools } from "./browser-tool.ts";
 
 export type AgentEvent =
   | { type: "session"; sessionId: string }
@@ -161,7 +161,9 @@ export class ClaudeAgentRunner implements AgentRunner {
     // With a human available, the agent also gets AskUserQuestion and the ask-only tools; every
     // call outside the role's allowlist goes to the human. Headless, the role's tools are all it has.
     const ask = req.ask;
-    const tools = ask ? [...new Set([...req.role.tools, "AskUserQuestion", ...(this.opts.askTools ?? [])])] : req.role.tools;
+    const allowedTools = [...new Set([...req.role.tools, "WebSearch"])];
+    const askTools = (this.opts.askTools ?? []).filter((tool) => tool !== "WebFetch" && tool !== "WebSearch");
+    const tools = ask ? [...new Set([...allowedTools, "AskUserQuestion", ...askTools])] : allowedTools;
     const toolNotes = new Map<string, string>();
     const canUseTool: CanUseTool | undefined = ask
       ? async (toolName, input, options) => {
@@ -187,10 +189,10 @@ export class ClaudeAgentRunner implements AgentRunner {
     const controller = new AbortController();
     const abort = () => controller.abort();
     req.signal?.addEventListener("abort", abort, { once: true });
-    let browser: Awaited<ReturnType<typeof startBrowserTool>> | undefined;
+    let browser: Awaited<ReturnType<typeof startAgentWebTools>> | undefined;
     try {
       req.signal?.throwIfAborted();
-      if (req.browserAccess) browser = await startBrowserTool(req.cwd, controller.signal,
+      browser = await startAgentWebTools(req.cwd, Boolean(req.browserAccess), controller.signal,
         (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }));
       const session = query({
         prompt: req.images?.length ? imagePrompt(req) : req.prompt,
@@ -201,19 +203,23 @@ export class ClaudeAgentRunner implements AgentRunner {
           model: req.model ?? req.role.model ?? this.opts.model,
           effort: EFFORTS.find((effort) => effort === req.effort) ?? this.opts.effort,
           // Keep Claude Code's own coding prompt and add the role on top.
-          systemPrompt: { type: "preset", preset: "claude_code", append: req.role.prompt },
+          systemPrompt: { type: "preset", preset: "claude_code", append: `${req.role.prompt}\n\nRead and follow the target repository’s project instructions. ${PUBLIC_WEB_NOTE} Report any proposed deployment or cloud resource change in the handoff for separate approval.` },
           // The role's tools run without prompting. Anything else is denied headless, or asked of the human.
           tools,
-          allowedTools: browser ? [...req.role.tools, `mcp__${BROWSER_SERVER}__${BROWSER_TOOL}`] : req.role.tools,
-          ...(browser ? {
-            mcpServersDelivery: "initialize",
-            mcpServers: { [BROWSER_SERVER]: { type: "http", url: browser.url, headers: { Authorization: `Bearer ${browser.token}` }, alwaysLoad: true } },
-          } : {}),
+          allowedTools: [...allowedTools, ...browser.names.map((name) => `mcp__${BROWSER_SERVER}__${name}`)],
+          mcpServersDelivery: "initialize",
+          mcpServers: { [BROWSER_SERVER]: { type: "http", url: browser.url, headers: { Authorization: `Bearer ${browser.token}` }, alwaysLoad: true } },
           permissionMode: ask ? "default" : "dontAsk",
           canUseTool,
-          // Load only the target repo's CLAUDE.md and project settings, not this machine's user settings,
-          // so runs are reproducible.
-          settingSources: ["project"],
+          // Repo settings can register hooks that execute outside the Bash sandbox.
+          settingSources: [],
+          strictMcpConfig: true,
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            network: { strictAllowlist: true, allowedDomains: [] },
+          },
           maxBudgetUsd: Math.min(this.opts.maxBudgetUsd, req.maxBudgetUsd ?? Infinity),
           maxTurns: this.opts.maxTurns,
           resume: req.resumeSessionId,

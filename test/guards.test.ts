@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { checkCommand, checkToolUse } from "../src/guards.ts";
 import { SHIPYARD_ROOT } from "../src/config.ts";
+import { sh } from "../src/exec.ts";
 
 test("publishing commands are blocked by default", () => {
   for (const cmd of [
@@ -26,6 +27,47 @@ test("ordinary development commands are allowed", () => {
   for (const cmd of ["npm test", "git status", "git commit -m wip", "git diff HEAD~1", "rm -rf node_modules", "gh pr view 12"]) {
     assert.equal(checkCommand(cmd, {}).blocked, false, cmd);
   }
+});
+
+test("deployment and cloud resource commands require a dedicated approval", () => {
+  for (const command of [
+    "npm run deploy -- --non-interactive",
+    "pnpm run deploy:production",
+    "firebase hosting:sites:create portfolio --project example",
+    "gcloud projects create example",
+    "aws cloudformation deploy --stack-name example",
+    "az webapp deploy --name example",
+    "azd up",
+    "terraform apply -auto-approve",
+    "gh workflow run deploy.yml",
+    "gh api repos/octo/example/actions/workflows/deploy.yml/dispatches -f ref=main",
+  ]) {
+    assert.equal(checkCommand(command, { SHIPYARD_ALLOW_PUBLISH: "1" }).blocked, true, command);
+    assert.equal(checkToolUse("Bash", { command }, { root: "/w", lane: "any" }).allowed, false, command);
+  }
+});
+
+test("project checks block explicit deploys and prevent nested programs from reaching external addresses", async () => {
+  await assert.rejects(sh("npm run deploy", SHIPYARD_ROOT), /needs human approval/);
+  const program = `
+const net = require('node:net');
+const server = net.createServer(socket => socket.end('local'));
+server.listen(0, '127.0.0.1', () => {
+  const local = net.connect(server.address().port, '127.0.0.1');
+  local.on('data', value => console.log(value.toString()));
+  local.on('close', () => server.close());
+});
+const external = net.connect(443, '192.0.2.1');
+external.on('connect', () => process.exit(1));
+external.on('error', error => {
+  if (!['EPERM', 'EACCES', 'ENETUNREACH'].includes(error.code)) process.exitCode = 1;
+  console.log('external blocked');
+});`;
+  const scriptArg = `'${program.replaceAll("'", "'\\''")}'`;
+  const result = await sh(`sh -c 'node -e "$1"' shipyard ${scriptArg}`, SHIPYARD_ROOT, 5_000);
+  assert.equal(result.code, 0, result.output);
+  assert.match(result.output, /local/);
+  assert.match(result.output, /external blocked/);
 });
 
 test("SHIPYARD_ALLOW_PUBLISH unlocks publishing but never destructive commands", () => {

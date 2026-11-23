@@ -193,7 +193,8 @@ async function main(argv: string[]): Promise<number> {
       stopCodexOnExit(runner);
       const pipelineDeps = deps(config, runner);
       if (checkpointStages) pipelineDeps.checkpoints = { stages: checkpointStages, review: terminalReviewer() };
-      const run = await runPipeline({ target, kind, request, provider, model, effort, crew, implementer, budgetUsd, browserAccess, referenceUrls }, pipelineDeps);
+      const run = await runPipeline({ target, kind, request, provider, model, effort, crew, implementer, budgetUsd, browserAccess,
+        referenceUrls: referenceUrls.length ? referenceUrls : undefined }, pipelineDeps);
       if (run.status === "stopped") {
         console.log(`\nStopped. The worktree is kept as it was, uncommitted work included: ${run.worktree}`);
       }

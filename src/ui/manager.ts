@@ -2,15 +2,17 @@ import { EventEmitter } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { AgentAnswer, AgentAsk, AgentQuestion, AgentRunner } from "../agent.ts";
 import { attachmentContext, parseFeedbackAttachments, resolveAttachments, writeFeedbackAttachments, type FeedbackAttachment } from "../attachments.ts";
 import { BROWSER_CHECK, checkBrowser } from "../browser-check.ts";
-import { SHIPYARD_ROOT, resolveProvider, validateRunOptions, type Provider, type RunEffort, type ShipyardConfig, type Target } from "../config.ts";
+import { DEPLOYMENT_LABELS, SHIPYARD_ROOT, WORKFLOW_DEPLOYMENT_PROVIDERS, isBudget, resolveProvider, validateRunOptions, type DeploymentProvider, type Provider, type RunEffort, type ShipyardConfig, type Target } from "../config.ts";
 import { addTargetToConfigFile, cloneRepo, defaultRepoRoots, findLocalRepos, inspectRepo, validateTargetName, type RepoInspection } from "../targets.ts";
 import { DEFAULT_DEPS_REQUEST } from "../prompts.ts";
 import {
   DEFAULT_CREW,
   IMPLEMENTERS,
+  budgetPause,
   makeRunId,
   OPTIONAL_STAGES,
   runPipeline,
@@ -29,9 +31,12 @@ import { git, sh } from "../exec.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, validReferenceText, type ReviewedReference } from "../references.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
-import { closedPullRequest, createRunPullRequest, draftBase, fetchDraftBase, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit, reopenRunPullRequest } from "./publication.ts";
+import { closedPullRequest, createRunPullRequest, draftBase, fetchDraftBase, githubOrigin, inspectLinkedPullRequest, linkedPullRequestState, pullRequestOptions, pushDestination, pushRunCommit, reopenRunPullRequest } from "./publication.ts";
+import { checkFirebaseHosting, requestedDeploymentProviders, runQuestionKind, type DeployAction, type RunAnswer } from "./run-question.ts";
 import { describePullRequest, markdownCode, MAX_PULL_REQUEST_DESCRIPTION, reviewDraftBranch, type DraftReview } from "./draft-pr.ts";
 import { CloudRunReleases } from "./cloud-release.ts";
+import { FirebaseHostingReleases } from "./firebase-release.ts";
+import { WorkflowDeployments } from "./workflow-deployment.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
 import { gateOk, recoverableStage, repairableRevisionStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
 import { changedFiles, commitTree, createWorktree, detachedWorktree, diffSinceHead, repoRoot, squashCommit, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
@@ -161,10 +166,28 @@ export class RunManager {
   private readonly clones = new Map<string, Promise<RepoInspection>>();
   private readonly stopResultChecks = new AbortController();
   private readonly cloudReleases = new CloudRunReleases(this.stopResultChecks.signal);
+  private readonly workflowDeployments = new WorkflowDeployments(this.stopResultChecks.signal);
+  private readonly deploymentPolls = new Map<string, Promise<void>>();
+  private get firebaseReleases() { return this.firebaseHosting ??= new FirebaseHostingReleases(this.opts.config.worktreeRoot, this.stopResultChecks.signal); }
+  private firebaseHosting?: FirebaseHostingReleases;
 
   constructor(private readonly opts: ManagerOptions) {
     this.bus.setMaxListeners(100);
     this.store = new LiveRunStore(opts.runsDir ?? opts.config.runsDir, (m) => this.emit(m));
+    for (const source of this.store.list()) {
+      if (source.deployment?.phase === "publishing" && source.deployment.workflowRun) this.trackDeployment(source.id);
+      const receipt = source.kind !== "deployment" ? source.firebaseRelease : undefined;
+      if (!receipt) continue;
+      const id = `${source.id}-firebase-release`;
+      if (!this.store.get(id)) {
+        const deployment = this.newDeploymentRun(source, "firebase", id);
+        this.store.save({ ...deployment, branch: receipt.branch, baseSha: receipt.head, status: "passed", completionRead: true,
+          createdAt: receipt.deployedAt, finishedAt: receipt.deployedAt, firebaseRelease: receipt,
+          deployment: { ...deployment.deployment!, phase: "published" } });
+      }
+      delete source.firebaseRelease;
+      this.store.save(source);
+    }
   }
 
   targets(): Target[] {
@@ -259,7 +282,7 @@ export class RunManager {
     let referenceUrls: string[];
     try {
       provider = resolveProvider(req.provider ?? this.opts.config.defaultProvider);
-      referenceUrls = parseReferencePermissions(req.referenceUrls);
+      referenceUrls = parseReferencePermissions(req.referenceUrls ?? referenceLinks(request).slice(0, MAX_PUBLIC_REFERENCES));
       validateRunOptions(this.opts.config, provider, req);
       if (provider === "codex" && !this.opts.codexRunner) throw new Error("Codex runs are unavailable in this UI session");
     } catch (error) {
@@ -292,13 +315,20 @@ export class RunManager {
     }, req.checkpoints, id);
   }
 
-  resume(runId: string, mode: "resume" | "recheck" | "fix" = "resume"): void {
+  resume(runId: string, mode: "resume" | "recheck" | "fix" = "resume", budgetUsd?: unknown): void {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveBranchRun(runId);
+    const pause = budgetPause(run);
+    if (budgetUsd !== undefined) {
+      if (mode !== "resume" || !pause) throw new UserError("A higher limit can only be approved for a run that reached its budget");
+      if (!isBudget(budgetUsd) || budgetUsd < pause.minimum) throw new UserError(`Enter a new total limit of at least $${pause.minimum.toFixed(2)}`);
+    }
     const stage = mode === "recheck" ? recoverableStage(run) : mode === "fix" ? repairableRevisionStage(run) : undefined;
     if (mode === "fix" && !stage) throw new UserError("There is no failed revision stage the crew can repair here");
     if (mode === "recheck" && !stage) throw new UserError("This run has no failed check that can be rechecked on the saved edits");
-    if (mode === "resume" && run.status !== "running" && run.status !== "stopped") throw new UserError("Only stopped or interrupted runs can be resumed");
+    if (mode === "resume" && run.status !== "running" && run.status !== "stopped" && !(pause && budgetUsd !== undefined)) {
+      throw new UserError(pause ? "Approve a higher budget to continue this run" : "Only stopped or interrupted runs can be resumed");
+    }
     if (this.verifications.has(runId)) throw new UserError("Wait for the current project checks to finish");
     if (run.cleanedUp || !existsSync(run.worktree)) throw new UserError("The original worktree is unavailable");
     const target = this.opts.config.targets[run.target];
@@ -307,6 +337,10 @@ export class RunManager {
     if (provider === "codex" && !this.opts.codexRunner) throw new UserError("Codex runs are unavailable in this UI session");
     // Older records predate saved checkpoint settings. Review each remaining stage on resume.
     const checkpoints = STAGES.filter((stage) => run.checkpointStages?.includes(stage) ?? true);
+    if (pause && isBudget(budgetUsd)) {
+      run.budgetUsd = budgetUsd;
+      this.store.event(run.id, { type: "budget_increased", previousBudgetUsd: pause.current, budgetUsd });
+    }
     run.ownerPid = process.pid;
     this.store.save(run);
     this.startPipeline({
@@ -506,13 +540,14 @@ export class RunManager {
   }
 
   private latestBranchRun(run: RunRecord): RunRecord {
-    return this.store.list().find((entry) => entry.repo === run.repo && entry.branch === run.branch) ?? run;
+    return this.store.list().find((entry) => entry.kind !== "deployment" && entry.repo === run.repo && entry.branch === run.branch) ?? run;
   }
 
-  private inactiveBranchRun(runId: string): RunRecord {
+  private inactiveBranchRun(runId: string): RunRecord & { kind: RunKind } {
     const run = this.inactiveRun(runId);
+    if (run.kind === "deployment") throw new UserError("Use the deployment run’s release actions");
     if (this.latestBranchRun(run).id !== runId) throw new UserError("Open the latest revision to continue working on this branch");
-    return run;
+    return run as RunRecord & { kind: RunKind };
   }
 
   private canGiveFeedback(run: RunRecord): boolean {
@@ -617,6 +652,7 @@ export class RunManager {
   async result(runId: string) {
     const run = this.store.get(runId);
     if (!run) throw new UserError("No such run");
+    if (run.kind === "deployment") throw new UserError("Open the deployment run for its release status");
     const latest = this.latestBranchRun(run);
     const historical = latest.id !== runId;
     const [remotes, preview, head] = await Promise.all([
@@ -638,8 +674,9 @@ export class RunManager {
       Boolean(head && head !== (run.branchBaseSha ?? run.baseSha)) && run.branch.startsWith("shipyard/");
     const pushed = Boolean(destination && run.publication?.head === head && run.publication?.destination === destination.key);
     const linkedUrl = destination && run.publication?.destination === destination.key ? run.publication.pullRequestUrl : undefined;
-    const closedUrl = canPush && destination?.repository && linkedUrl &&
-      await linkedPullRequestState(run.repo, destination.repository, linkedUrl, this.stopResultChecks.signal) === "closed" ? linkedUrl : undefined;
+    const pullRequestState = canPush && destination?.repository && linkedUrl
+      ? await linkedPullRequestState(run.repo, destination.repository, linkedUrl, this.stopResultChecks.signal) : undefined;
+    const closedUrl = pullRequestState === "closed" ? linkedUrl : undefined;
     const pullRequestUrl = closedUrl ? undefined : linkedUrl;
     const pullRequest = pushed && destination?.repository && head && !pullRequestUrl
       ? await pullRequestOptions(run.repo, destination.repository, head, this.stopResultChecks.signal)
@@ -650,19 +687,22 @@ export class RunManager {
       run.verification.editsDigest === await editsDigest(run.worktree).catch(() => undefined);
     return {
       latestRevisionId: historical ? latest.id : undefined,
+      budgetPause: !historical && !run.cleanedUp && target && uncommitted !== undefined ? budgetPause(run) : undefined,
       canGiveFeedback: !historical && uncommitted?.length === 0 && this.canGiveFeedback(run),
       canPrepareBranch: !historical && uncommitted?.length === 0 && this.canPrepareBranch(run),
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,
         pushed, canDraftPullRequest: Boolean(destination.repository && pullRequest.pullRequestBlocked !== "no-changes"),
-        pullRequestUrl, closedPullRequestUrl: closedUrl, ...pullRequest,
+        pullRequestUrl, pullRequestState, closedPullRequestUrl: closedUrl, ...pullRequest,
       } : undefined,
       publishUnavailable: remotes && canPush && !destination ? "Choose one push destination by configuring origin with a single supported Git URL." : undefined,
       canReleaseToCloudRun: Boolean(!historical && head && run.status === "passed" && run.finishedAt &&
         run.stages.some((stage) => stage.name === "cloud-release" && stage.status === "passed")),
       cloudRelease: run.cloudRelease,
+      deploymentIds: this.store.list().filter((entry) => entry.deployment?.sourceRunId === runId && !entry.archivedAt).map(({ id }) => id),
       hasRemote: remotes === undefined ? undefined : Boolean(remotes),
       canPreview: !historical && Boolean(run.finishedAt) && ["passed", "failed"].includes(run.status) && !run.cleanedUp && canPreview(run.worktree),
+      canVerifyStoppedRun: !historical && Boolean(target && head && run.finishedAt && uncommitted?.length === 0) && run.status === "stopped",
       recheckStage: stage?.name,
       canFixRevision: Boolean(target && uncommitted && repairableRevisionStage(run)),
       savedEditsCheck: stage ? this.verifications.has(runId) ? "checking" : verifiedEdits ?
@@ -677,6 +717,276 @@ export class RunManager {
         configuredChecks: [target?.test, target?.e2e, target?.browserCheck ? BROWSER_CHECK : undefined].filter(Boolean),
       },
     };
+  }
+
+  async answerRunQuestion(runId: string, input: unknown): Promise<RunAnswer> {
+    if (typeof input !== "string" || !input.trim() || input.length > 500) throw new UserError("Enter a question of up to 500 characters");
+    const run = this.store.get(runId);
+    if (!run?.finishedAt) throw new UserError("Open a run with a saved handoff first");
+    const result = await this.result(runId);
+    const kind = runQuestionKind(input);
+    const signal = this.stopResultChecks.signal;
+    const actions: NonNullable<RunAnswer["actions"]> = [];
+    if (result.budgetPause) actions.push({ label: "Review a higher budget", action: "budget" });
+    if (result.canVerifyStoppedRun || result.recheckStage || run.status === "passed" && !result.latestRevisionId && result.handoff.uncommittedCount === 0) {
+      actions.push({ label: "Run project checks", action: "checks" });
+    }
+    if (result.canPreview) actions.push({ label: "Open local preview", action: "preview" });
+    const links: NonNullable<RunAnswer["links"]> = [];
+    const publication = result.publish;
+    const prLink = publication?.pullRequestUrl ?? run.publication?.pullRequestUrl;
+    const repository = prLink && ["deploy-request", "deployment", "publication", "next"].includes(kind) ? await githubOrigin(run.repo) : undefined;
+    const pr = repository && prLink ? await inspectLinkedPullRequest(run.repo, repository, prLink, signal, kind === "deployment") : undefined;
+    if (pr) links.push({ label: pr.state === "merged" ? "View merged PR" : "View pull request", url: pr.link });
+    else if (publication?.pullRequestUrl) links.push({ label: "View linked PR", url: publication.pullRequestUrl });
+    if (publication?.canDraftPullRequest && !prLink) actions.push({ label: "Review draft PR", action: "draft-pr" });
+    if (result.canReleaseToCloudRun) actions.push({ label: "Review Cloud Run release", action: "cloud-release" });
+    const requested = requestedDeploymentProviders(input);
+    const otherDestination = /\b(?:cloud run|netlify|vercel|staging|preview channel)\b/i.test(input);
+    const target = this.opts.config.targets[run.target];
+    const ready = run.status === "passed" && !result.latestRevisionId && pr?.state === "merged";
+    const firebaseEligible = !otherDestination && (!requested.length || requested.includes("firebase")) &&
+      ready && result.handoff.head && ["deploy-request", "deployment", "next"].includes(kind);
+    const canReviewFirebase = firebaseEligible &&
+      await git(["cat-file", "-e", `${result.handoff.head}:firebase.json`], run.repo).then(() => true, () => false);
+    const configured = WORKFLOW_DEPLOYMENT_PROVIDERS.filter((provider) => target?.deployments?.[provider] &&
+      (!requested.length || requested.includes(provider)));
+    const providers: DeploymentProvider[] = ready && !otherDestination ? [...configured, ...(canReviewFirebase ? ["firebase" as const] : [])] : [];
+    if (["deploy-request", "deployment", "next"].includes(kind)) {
+      actions.unshift(...providers.map((provider) => {
+        const env = provider === "firebase" ? undefined : target?.deployments?.[provider]?.environment;
+        return { label: `Start ${DEPLOYMENT_LABELS[provider]} deployment${env ? ` · ${env}` : ""}`, action: `${provider}-release` as DeployAction };
+      }));
+    }
+    if (kind === "deploy-request") {
+      const provider = providers.length === 1 ? providers[0] : undefined;
+      const missing = requested.filter((provider) => provider !== "firebase" && !target?.deployments?.[provider]);
+      if (provider && requested.length <= 1 && !otherDestination) return {
+        heading: `Start deployment to ${DEPLOYMENT_LABELS[provider]}`,
+        details: [`The linked PR is merged into ${pr?.base ?? "its base branch"}. The deployment run will verify the target and commit and wait for your approval.`],
+        links, actions, review: `${provider}-release`,
+      };
+      return { heading: providers.length ? "Choose a deployment provider" : "Deployment setup needed", details: [
+        ...missing.map((provider) => `Configure the ${DEPLOYMENT_LABELS[provider]} workflow and environment for ${run.target} in shipyard.config.yaml.`),
+        ...(!ready ? ["Start from a completed run with a linked, merged pull request."] : []),
+        ...(providers.length ? ["Pick a provider to start a separate deployment run for review."] :
+          !missing.length && ready ? [result.canReleaseToCloudRun ? "Review the Cloud Run service and image before approving a release." :
+            (otherDestination ? "This destination needs its own deployment workflow." : `Configure a deployment provider for ${run.target}.`)] : []),
+      ], links, actions };
+    }
+
+    if (kind === "deployment") {
+      const related = result.deploymentIds.map((id) => this.store.get(id)?.deployment)
+        .find((deployment) => deployment && (requested.length ? requested.includes(deployment.provider) : deployment.provider !== "firebase"));
+      if (related && related.provider !== "firebase") {
+        const provider = DEPLOYMENT_LABELS[related.provider];
+        const phase = { verifying: "Verifying deployment", approval: "Deployment awaits approval", publishing: "Deployment workflow started",
+          published: "Deployment workflow succeeded", failed: "Deployment failed", cancelled: "Deployment cancelled" }[related.phase];
+        if (related.workflowRun) links.unshift({ label: "View GitHub Actions run", url: related.workflowRun.url });
+        return { heading: phase, details: [
+          `${provider} · ${related.workflowReview?.environment ?? "configured environment"}`,
+          ...(related.phase === "published" ? ["GitHub Actions reported success for the reviewed commit."] : []),
+        ], links, actions };
+      }
+      const head = result.handoff.head;
+      const firebase = head && (!requested.length || requested.includes("firebase")) && !otherDestination ?
+        await checkFirebaseHosting(run.repo, head, [...(pr?.files ?? []), ...result.handoff.files.map(({ path }) => path)], signal) : undefined;
+      const merged = pr?.state === "merged" ? `The linked PR is merged into ${pr.base ?? "its base branch"}.` : undefined;
+      if (firebase) {
+        links.unshift({ label: "Open live site", url: firebase.url });
+        const different = firebase.checks.filter(({ status }) => status === "different").map(({ path }) => path);
+        const matched = firebase.checks.filter(({ status }) => status === "matches").map(({ path }) => path);
+        if (different.length) return { heading: "The live site differs from this run", details: [
+          `Firebase Hosting serves different content or a missing page for ${different.join(", ")}.`,
+          ...(merged ? [merged, canReviewFirebase ? "Start a deployment run to verify and review the current commit." :
+            `To publish the site changes, deploy from ${pr?.base ?? "the merged branch"} through your approved Firebase Hosting workflow.`]
+            : ["Review the branch or pull request, then use your approved Firebase Hosting workflow when the changes are ready."]),
+        ], links, actions };
+        if (matched.length) return { heading: "The checked files are live", details: [
+          `Firebase Hosting matches this run for ${matched.join(", ")}.`,
+          ...(firebase.partial || matched.length !== firebase.checks.length ? ["Some files could not be compared."] : []),
+        ], links, actions };
+        return { heading: "Deployment could not be verified", details: [
+          ...(merged ? [merged] : []), "I couldn’t compare any changed site files. Check the live site or Firebase Hosting release history.",
+        ], links, actions };
+      }
+      if (run.cloudRelease && !requested.length) return { heading: "A Cloud Run revision was created", details: [
+        `${run.cloudRelease.revision} was recorded with zero traffic. Check Cloud Run to confirm whether it now serves traffic.`,
+      ], links, actions };
+      return { heading: "Deployment could not be verified", details: [
+        ...(merged ? [merged] : []), "The handoff has no verified deployment for this result. A passing run records project checks.",
+      ], links, actions };
+    }
+    if (kind === "publication") return { heading: pr ? `Pull request ${pr.state}` : "GitHub handoff", details: [
+      ...(pr?.state === "merged" ? [`The linked pull request is merged into ${pr.base ?? "its base branch"}.`] : []),
+      ...(publication && !publication.pushed ? ["This run’s latest commit is local. Use the handoff to review publishing it if needed."] : []),
+      ...(!pr ? [publication?.pushed ? "The run’s commit is pushed to GitHub." : "There is no confirmed GitHub pull request status for this run."] : []),
+    ], links, actions };
+    if (kind === "changes") return { heading: "Changes saved by this run", details: result.handoff.files.length ?
+      result.handoff.files.map(({ status, path }) => `${status} ${path}`) : ["The handoff has no committed files to show."], links, actions };
+    const checks = new Map(run.stages.flatMap((stage) => stage.attempts.at(-1)?.gates ?? []).map((gate) => [gate.command, gate]));
+    if (run.verification?.head === result.handoff.head && result.handoff.uncommittedCount === 0) {
+      for (const gate of run.verification?.checks ?? []) checks.set(gate.command, gate);
+    }
+    if (run.browserCheck) checks.set(run.browserCheck.command, run.browserCheck);
+    const checkSummary = [...checks.values()].map((gate) => `${gateOk(gate) ? "Passed" : "Failed"} · ${gate.command}`);
+    if (kind === "checks") return { heading: "Project checks", details: checkSummary.length ? checkSummary : ["No checks were recorded."], links, actions };
+    if (kind === "next") return { heading: "Next steps for this run", details: [
+      `Run status is ${run.status}.`, ...(result.budgetPause ? [`Approve a higher limit to continue at ${result.budgetPause.stage}.`] : []),
+      ...(run.status === "stopped" ? ["Use Resume run to continue from the saved worktree."] : []),
+      ...(pr?.state === "merged" ? [`The linked PR is merged into ${pr.base ?? "its base branch"}. Check the live site to see whether it has been deployed.`] : []),
+    ], links, actions: [{ label: "Check live deployment", action: "deployment" }, ...actions] };
+    if (result.canGiveFeedback) actions.push({ label: "Request a code change", action: "revision" });
+    return { heading: "Choose how to continue", details: ["I can check deployment, GitHub, project checks, changed files, and next steps for this run."], actions };
+  }
+
+  private newDeploymentRun(source: RunRecord, provider: DeploymentProvider, id = makeRunId(`Deploy ${source.target} to ${provider}`)): RunRecord {
+    return {
+      id, kind: "deployment", target: source.target, request: `Deploy ${source.target} to ${DEPLOYMENT_LABELS[provider]}`, status: "running", tags: [],
+      repo: source.repo, branch: source.branch, baseSha: source.baseSha, worktree: "", createdAt: new Date().toISOString(), stages: [],
+      totals: { costUsd: null, durationMs: 0, turns: 0, attempts: 0, reviewWaitMs: 0 },
+      deployment: { provider, sourceRunId: source.id, pullRequest: source.publication?.pullRequestUrl, phase: "verifying" },
+    };
+  }
+
+  private trackDeployment(runId: string) {
+    if (this.deploymentPolls.has(runId) || this.shuttingDown) return;
+    const signal = this.stopResultChecks.signal;
+    const track = async () => {
+      while (!signal.aborted) {
+        const saved = this.store.get(runId);
+        const { phase, workflowReview, workflowRun } = saved?.deployment ?? {};
+        if (!saved || phase !== "publishing" || !workflowReview || !workflowRun) return;
+        const result = await this.workflowDeployments.status(saved.repo, workflowReview, workflowRun).catch(() => workflowRun);
+        if (signal.aborted) return;
+        if (result.status !== workflowRun.status || result.conclusion !== workflowRun.conclusion) {
+          const current = this.store.get(runId);
+          if (current?.deployment?.phase !== "publishing" || current.deployment.workflowRun?.id !== result.id) return;
+          current.deployment.workflowRun = result;
+          if (result.status === "completed") {
+            const passed = result.conclusion === "success";
+            current.deployment.phase = passed ? "published" : "failed";
+            current.status = passed ? "passed" : "failed";
+            current.finishedAt = new Date().toISOString();
+            current.completionRead = false;
+            if (!passed) current.error = `GitHub Actions deployment result: ${result.conclusion ?? "unknown"}.`;
+          }
+          this.store.save(current);
+          if (current.finishedAt) return;
+        }
+        await delay(8_000, undefined, { signal, ref: false }).catch(() => undefined);
+      }
+    };
+    const done = track().catch((error: unknown) => {
+      this.opts.log?.(`Could not track deployment ${runId}: ${error instanceof Error ? error.message : String(error)}`);
+    }).finally(() => this.deploymentPolls.delete(runId));
+    this.deploymentPolls.set(runId, done);
+  }
+
+  private startDeploymentTask(run: RunRecord, phase: "verifying" | "publishing", task: () => Promise<void>) {
+    const deployment = run.deployment!;
+    const releaseBranch = this.store.claimBranch(run);
+    if (!releaseBranch) throw new UserError("Another operation is running on this branch");
+    deployment.phase = phase;
+    run.ownerPid = process.pid;
+    run.status = "running";
+    delete run.finishedAt;
+    delete run.error;
+    this.store.save(run);
+    const started = Date.now();
+    const done = task().catch((error: unknown) => {
+      deployment.phase = "failed";
+      run.status = "failed";
+      run.error = error instanceof Error ? error.message : String(error);
+    }).then(() => {
+      delete run.ownerPid;
+      if (deployment.phase !== "approval" && !(deployment.phase === "publishing" && deployment.workflowRun)) {
+        run.finishedAt = new Date().toISOString();
+        run.completionRead = false;
+      }
+      run.totals.durationMs += Date.now() - started;
+      this.store.save(run);
+      return run;
+    }).finally(() => {
+      releaseBranch();
+      this.active.delete(run.id);
+      this.emit({ type: "active", runIds: this.activeRunIds() });
+      if (deployment.phase === "publishing" && deployment.workflowRun) this.trackDeployment(run.id);
+    });
+    this.active.set(run.id, done);
+    this.emit({ type: "active", runIds: this.activeRunIds() });
+    return { run };
+  }
+
+  deployment(runId: string, input: Record<string, unknown>) {
+    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    let run = this.inactiveRun(runId);
+    const target = this.opts.config.targets[run.target];
+    if (!target) throw new UserError("Configure the run’s original repository first");
+    if (run.kind !== "deployment") {
+      if (input.action !== "review" || run.status !== "passed" || !run.finishedAt || this.latestBranchRun(run).id !== runId || !run.publication?.pullRequestUrl) {
+        throw new UserError("Start a deployment from the completed run with a linked pull request");
+      }
+      const provider = input.provider;
+      if (provider !== "firebase" && provider !== "aws" && provider !== "azure") throw new UserError("Choose a deployment provider");
+      if (provider !== "firebase" && !target.deployments?.[provider]) {
+        throw new UserError(`Configure the ${DEPLOYMENT_LABELS[provider]} deployment workflow for ${target.name}`);
+      }
+      const pending = this.store.list().find((entry) => entry.deployment?.sourceRunId === runId && entry.deployment.provider === provider &&
+        (!entry.finishedAt || entry.deployment.dispatchStarted && !entry.deployment.workflowRun));
+      if (pending) return { run: pending };
+      run = this.newDeploymentRun(run, provider);
+    }
+    const deployment = run.deployment;
+    if (!deployment) throw new UserError("Deployment details are unavailable");
+    const provider = deployment.provider;
+    const config = provider === "firebase" ? undefined : target.deployments?.[provider];
+    if (input.action === "cancel" && !run.finishedAt && !deployment.dispatchStarted) {
+      deployment.phase = "cancelled";
+      delete deployment.review;
+      delete deployment.workflowReview;
+      delete run.ownerPid;
+      run.status = "stopped";
+      run.finishedAt = new Date().toISOString();
+      this.store.save(run);
+      return { run };
+    }
+    if (input.action === "review" && !["published", "cancelled"].includes(deployment.phase) && !deployment.dispatchStarted) {
+      if (deployment.phase === "approval") return { run };
+      if (provider !== "firebase" && !config) throw new UserError(`Configure the ${DEPLOYMENT_LABELS[provider]} workflow for ${target.name}`);
+      delete deployment.review;
+      delete deployment.workflowReview;
+      return this.startDeploymentTask(run, "verifying", async () => {
+        if (await repoRoot(target.path) !== run.repo) throw new Error("Configure the run’s original repository first.");
+        const review = provider === "firebase" ?
+          deployment.review = await this.firebaseReleases.prepare({ id: run.id, repo: run.repo, pullRequest: deployment.pullRequest }, (worktree) =>
+            this.runProjectChecks(target, worktree, Boolean(target.browserCheck))) :
+          deployment.workflowReview = await this.workflowDeployments.prepare(run.repo, deployment.pullRequest, provider, config!);
+        deployment.phase = "approval";
+        run.branch = review.branch;
+        run.baseSha = review.head;
+      });
+    }
+    const review = deployment.review ?? deployment.workflowReview;
+    if (input.action !== "deploy" || input.confirm !== true || deployment.phase !== "approval" || !review || input.token !== review.token) {
+      throw new UserError("Review and approve the exact deployment first");
+    }
+    return this.startDeploymentTask(run, "publishing", async () => {
+      if (await repoRoot(target.path) !== run.repo) throw new Error("Configure the run’s original repository first.");
+      if ("workflowId" in review) {
+        deployment.workflowRun = await this.workflowDeployments.dispatch(run.repo, review, config, () => {
+          deployment.dispatchStarted = true;
+          this.store.save(run);
+        });
+        this.store.save(run);
+        return;
+      }
+      const receipt = await this.firebaseReleases.deploy(run.repo, review);
+      run.firebaseRelease = receipt;
+      deployment.phase = "published";
+      run.status = "passed";
+      this.store.event(run.id, { type: "firebase-release-deployed", ...receipt });
+    });
   }
 
   async cloudRelease(runId: string, input: Record<string, unknown>) {
@@ -706,7 +1016,7 @@ export class RunManager {
   async connectRemote(runId: string, input: unknown): Promise<void> {
     const url = gitRemoteUrl(input);
     const run = this.inactiveRun(runId);
-    if (!run.finishedAt || run.cleanedUp || await repoRoot(run.repo).catch(() => undefined) !== run.repo) {
+    if (run.kind === "deployment" || !run.finishedAt || run.cleanedUp || await repoRoot(run.repo).catch(() => undefined) !== run.repo) {
       throw new UserError("The run’s repository is unavailable");
     }
     await withRepoLock(run.repo, async () => {
@@ -1009,7 +1319,7 @@ export class RunManager {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveBranchRun(runId);
     const target = this.opts.config.targets[run.target];
-    if (!run.finishedAt || run.status === "stopped" || run.cleanedUp || !target || !existsSync(run.worktree)) {
+    if (!run.finishedAt || run.cleanedUp || !target || !existsSync(run.worktree)) {
       throw new UserError("Verification needs a finished run with its configured repository and worktree");
     }
     const pending = this.verifications.get(runId);
@@ -1019,13 +1329,13 @@ export class RunManager {
       const head = await git(["rev-parse", "HEAD"], run.worktree);
       const branch = await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "");
       const dirty = (await changedFiles(run.worktree)).length > 0;
-      const recovery = dirty ? recoverableStage(run) : undefined;
+      const recovery = dirty && run.status !== "stopped" ? recoverableStage(run) : undefined;
       if (branch !== `refs/heads/${run.branch}` || (dirty && !recovery)) {
         throw new UserError("Verification needs the original branch and a clean worktree");
       }
       const digest = recovery ? await editsDigest(run.worktree) : undefined;
       const hadBrowserFailure = recovery?.attempts.some(({ gates }) => gates.some(({ command }) => command === BROWSER_CHECK));
-      const checks = await this.runProjectChecks(target, run.worktree, Boolean(target.browserCheck && (includeBrowser || hadBrowserFailure)));
+      const checks = await this.runProjectChecks(target, run.worktree, Boolean(target.browserCheck && (includeBrowser || hadBrowserFailure || run.status === "stopped")));
       if (await git(["rev-parse", "HEAD"], run.worktree) !== head ||
           await git(["symbolic-ref", "HEAD"], run.worktree).catch(() => "") !== branch ||
           (digest ? await editsDigest(run.worktree).catch(() => undefined) !== digest : (await changedFiles(run.worktree)).length > 0)) {
@@ -1199,8 +1509,9 @@ export class RunManager {
     this.shuttingDown = true;
     this.stopResultChecks.abort();
     for (const control of this.controls.values()) control.stop();
-    await Promise.allSettled([...this.active.values(), ...this.browserChecks.values(), ...this.verifications.values(), ...this.referenceChecks.values(), ...this.publications.values(), ...this.clones.values(), ...[...this.previews.keys()].map((id) => this.stopLocalPreview(id)), ...[...this.localApps.keys()].map((id) => this.stopLocalApp(id))]);
+    await Promise.allSettled([...this.active.values(), ...this.deploymentPolls.values(), ...this.browserChecks.values(), ...this.verifications.values(), ...this.referenceChecks.values(), ...this.publications.values(), ...this.clones.values(), ...[...this.previews.keys()].map((id) => this.stopLocalPreview(id)), ...[...this.localApps.keys()].map((id) => this.stopLocalApp(id))]);
     await this.cloudReleases.shutdown();
+    await this.firebaseHosting?.shutdown();
   }
 
   /** Answer one inbox item. Other items, and other agents, are unaffected. */

@@ -1,7 +1,15 @@
 import { execFile, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { promisify } from "node:util";
+import { checkCommand } from "./guards.ts";
+import { SHIPYARD_ROOT } from "./config.ts";
 
 const execFileAsync = promisify(execFile);
+const MAC_GATE_BROWSERS = [
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+];
 
 export interface ExecResult {
   command: string;
@@ -11,18 +19,52 @@ export interface ExecResult {
   timedOut: boolean;
 }
 
+/** Run worktree code with local networking only. The approval controllers run on the host. */
+export function localProcess(command: string, args: string[], hostLoopback = false): [string, string[]] {
+  if (process.platform === "darwin") {
+    const dashboardToken = JSON.stringify(join(SHIPYARD_ROOT, ".shipyard", "ui-token"));
+    const profile = [
+      "(version 1)",
+      "(allow default)",
+      "(deny network*)",
+      "(allow network-bind)",
+      '(allow network-inbound (local ip "localhost:*"))',
+      '(allow network-outbound (remote ip "localhost:*"))',
+      `(deny file-read* file-write* (literal ${dashboardToken}))`,
+    ].join("\n");
+    return ["/usr/bin/sandbox-exec", ["-p", profile, command, ...args]];
+  }
+  if (process.platform === "linux" && !hostLoopback) {
+    return ["bwrap", ["--unshare-net", "--unshare-pid", "--bind", "/", "/", "--tmpfs", "/run", "--proc", "/proc", "--", command, ...args]];
+  }
+  throw new Error(hostLoopback ? "This host cannot sandbox a process-backed local preview. Static previews are available." :
+    "Shipyard needs the macOS network sandbox or Linux bubblewrap to run project checks.");
+}
+
 /**
  * Run a shell command (a gate) and capture stdout+stderr together.
  * Runs in its own process group so a hung test server is killed on timeout.
  */
-export function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, signal?: AbortSignal): Promise<ExecResult> {
+export async function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, signal?: AbortSignal): Promise<ExecResult> {
   const started = Date.now();
-  if (signal?.aborted) return Promise.resolve({ command, code: 130, output: "", durationMs: 0, timedOut: false });
-  return new Promise((resolvePromise) => {
+  if (signal?.aborted) return { command, code: 130, output: "", durationMs: 0, timedOut: false };
+  const verdict = checkCommand(command, {});
+  if (verdict.blocked) throw new Error(verdict.reason);
+  const ready = "[shipyard: sandbox ready]\n";
+  const [executable, args] = localProcess("/bin/sh", ["-c", 'printf "%s\\n" "$1"; exec /bin/sh -c "$2"', "shipyard", ready.trimEnd(), command]);
+  return new Promise((resolvePromise, reject) => {
     // Gates must see a clean environment. NODE_TEST_CONTEXT in particular makes a nested
     // `node --test` report to its parent instead of exiting non-zero on failure.
     const { NODE_TEST_CONTEXT: _ignored, ...env } = process.env;
-    const child = spawn("sh", ["-c", command], {
+    if (process.platform === "darwin" && !env.CHROME_PATH) {
+      const chrome = MAC_GATE_BROWSERS.find(existsSync);
+      if (chrome) {
+        // Only checks that use CHROME_PATH opt in to this launcher. The outer network policy still applies.
+        env.CHROME_PATH = join(SHIPYARD_ROOT, "bin", "shipyard-gate-chrome");
+        env.SHIPYARD_GATE_CHROME = chrome;
+      }
+    }
+    const child = spawn(executable, args, {
       cwd,
       detached: true,
       env: { ...env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" },
@@ -50,6 +92,11 @@ export function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, signal
     child.on("close", (code) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", kill);
+      if (!output.includes(ready) && !signal?.aborted && !timedOut) {
+        reject(new Error(`Could not start the project check in its network sandbox: ${output.trim() || executable}`));
+        return;
+      }
+      output = output.replace(ready, "");
       resolvePromise({ command, code: signal?.aborted ? 130 : timedOut ? 124 : (code ?? 1), output, durationMs: Date.now() - started, timedOut });
     });
   });

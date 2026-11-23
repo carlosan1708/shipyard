@@ -3,13 +3,24 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, readl
 import { join } from "node:path";
 import type { TokenUsage } from "./agent.ts";
 import type { FeedbackAttachment } from "./attachments.ts";
-import type { Provider, RunEffort } from "./config.ts";
+import type { DeploymentProvider, Provider, RunEffort } from "./config.ts";
 import type { ReferenceCheck } from "./references.ts";
 
 /** feature: ship something new · bug: fix a reported problem · deps: update dependencies. */
 export type RunKind = "feature" | "bug" | "deps";
 /** Stopping a run preserves its branch and worktree. */
 export type RunStatus = "running" | "passed" | "failed" | "error" | "stopped";
+
+export interface DeploymentRecord {
+  provider: DeploymentProvider;
+  sourceRunId: string;
+  pullRequest?: string;
+  phase: "verifying" | "approval" | "publishing" | "published" | "failed" | "cancelled";
+  review?: import("./ui/firebase-release.ts").FirebaseHostingReview;
+  workflowReview?: import("./ui/workflow-deployment.ts").WorkflowDeploymentReview;
+  dispatchStarted?: boolean;
+  workflowRun?: import("./ui/workflow-deployment.ts").DeploymentWorkflowRun;
+}
 
 /** What a human decided at a checkpoint. */
 export type ReviewAction = "continue" | "feedback" | "stop";
@@ -102,7 +113,7 @@ export interface RunFollowUp {
 
 export interface RunRecord {
   id: string;
-  kind: RunKind;
+  kind: RunKind | "deployment";
   target: string;
   request: string;
   tags: string[];
@@ -112,6 +123,8 @@ export interface RunRecord {
   completionRead?: boolean;
   publication?: { head: string; destination: string; pushedAt: string; pullRequestUrl?: string };
   cloudRelease?: import("./ui/cloud-release.ts").CloudRunRelease;
+  firebaseRelease?: import("./ui/firebase-release.ts").FirebaseHostingRelease;
+  deployment?: DeploymentRecord;
   archivedAt?: string;
   ownerPid?: number;
   checkpointStages?: string[];
@@ -132,6 +145,8 @@ export interface RunRecord {
   implementer?: string;
   /** Estimated cost limit for the whole run. Stages stop starting once it is spent. */
   budgetUsd?: number;
+  /** Stage that was blocked by the estimated run budget. */
+  budgetBlockedStage?: string;
   stages: StageRecord[];
   /** durationMs is wall-clock time; reviewWaitMs is the part spent waiting for a human (checkpoints, questions, permissions). */
   totals: { costUsd: number | null; usage?: TokenUsage; durationMs: number; turns: number; attempts: number; reviewWaitMs: number };
@@ -213,7 +228,11 @@ export class RunStore {
   get(runId: string): RunRecord | null {
     const file = join(this.dir(runId), "run.json");
     if (!existsSync(file)) return null;
-    const { designFollowUp, ...run } = JSON.parse(readFileSync(file, "utf8")) as RunRecord & { designFollowUp?: RunFollowUp };
+    const { designFollowUp, firebaseDeployment, ...run } = JSON.parse(readFileSync(file, "utf8")) as RunRecord & {
+      designFollowUp?: RunFollowUp;
+      firebaseDeployment?: Omit<DeploymentRecord, "provider">;
+    };
+    if (firebaseDeployment) run.deployment ??= { ...firebaseDeployment, provider: "firebase" };
     run.provider ??= "claude";
     run.followUp ??= designFollowUp;
     for (const reference of run.references ?? []) {

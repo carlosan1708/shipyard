@@ -36,7 +36,7 @@ export async function diffSinceHead(cwd: string): Promise<WorktreeDiff> {
 }
 
 /** Commits made by shipyard are authored by a bot identity, so provenance is obvious in `git log`. */
-const BOT = ["-c", "user.name=shipyard", "-c", "user.email=shipyard@localhost"];
+const BOT = ["-c", "user.name=shipyard", "-c", "user.email=shipyard@localhost", "-c", "core.hooksPath=/dev/null"];
 
 /** Write one commit with the exact final tree and the requested base as its parent. */
 export function squashCommit(repo: string, head: string, base: string, message: string): Promise<string> {
@@ -88,7 +88,7 @@ export async function createWorktree(repo: string, dir: string, branch: string, 
       throw new Error(`Target repository has no commits yet: ${repo}`);
     });
     mkdirSync(dirname(dir), { recursive: true });
-    await git(["worktree", "add", "-b", branch, dir, baseSha], repo);
+    await git(["-c", "core.hooksPath=/dev/null", "worktree", "add", "-b", branch, dir, baseSha], repo);
     return baseSha;
   });
 }

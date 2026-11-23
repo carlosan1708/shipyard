@@ -139,6 +139,21 @@ test("continuing past an E2E failure hands it to the implementer for repair", as
   assert.equal(runner.calls[2]!.lane, "no-e2e");
 });
 
+test("repair reruns the gates without requiring an unrelated code change after a transient failure", async () => {
+  const markerDir = tempDir("sy-browser-ready-");
+  const { deps, target } = await setup(
+    [fix(), e2e("assert.equal(add(2, 3), 5);"), () => writeFiles(markerDir, { ready: "" })],
+    [{ action: "continue" }, { action: "continue" }, { action: "continue" }],
+  );
+  target.e2e = `test -f '${join(markerDir, "ready").replaceAll("'", "'\\''")}' && npm run e2e`;
+  const run = await runPipeline({ target, kind: "feature", request: "Check the browser test" }, deps);
+  assert.equal(run.status, "passed");
+  assert.equal(run.stages.find(({ name }) => name === "e2e")?.status, "failed");
+  const repair = run.stages.find(({ name }) => name === "repair");
+  assert.equal(repair?.commit, undefined);
+  assert.deepEqual(repair?.attempts.at(-1)?.gates.map(({ code }) => code), [0, 0]);
+});
+
 test("time spent waiting at checkpoints is reported apart from working time", async () => {
   const { deps, target } = await setup([fix(), e2e("assert.ok(true);")], [], ["implement"]);
   deps.checkpoints!.review = async () => {

@@ -29,10 +29,19 @@
 
     <div class="layout">
       <aside class="col runs-col" aria-label="Runs">
-        <div class="col-head">
-          <h2>Runs</h2>
-          <span class="col-sub" id="runs-sub"></span>
-          <button type="button" class="btn btn-ghost btn-sm" id="archive-toggle" aria-pressed="false">Archived</button>
+        <div class="runs-header">
+          <div class="col-head">
+            <h2>Runs</h2>
+            <span class="col-sub" id="runs-sub" role="status"></span>
+            <button type="button" class="btn btn-ghost btn-sm" id="archive-toggle" aria-pressed="false">Archived</button>
+          </div>
+          <div class="run-search">
+            <input type="search" id="run-search" aria-label="Search runs" aria-controls="run-list" placeholder="Search runs…" autocomplete="off" />
+            <div class="run-filters">
+              <select id="run-repo-filter" aria-label="Filter runs by repository" aria-controls="run-list"><option value="">All repos</option></select>
+              <select id="run-status-filter" aria-label="Filter runs by status" aria-controls="run-list"><option value="">All statuses</option></select>
+            </div>
+          </div>
         </div>
         <ul class="run-list" id="run-list"></ul>
       </aside>
@@ -71,9 +80,27 @@
       </form>
     </dialog>
 
+    <dialog class="dialog" id="run-budget-dialog" aria-labelledby="run-budget-title">
+      <form class="dialog-body" id="run-budget-form">
+        <h2 id="run-budget-title">Increase run budget</h2>
+        <p class="field-help" id="run-budget-context"></p>
+        <label class="field">
+          <span class="field-label">New total limit (USD)</span>
+          <input type="number" id="run-budget-amount" step="any" inputmode="decimal" aria-describedby="run-budget-minimum" required />
+          <span class="field-help" id="run-budget-minimum"></span>
+        </label>
+        <p id="run-budget-error" class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="run-budget-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="run-budget-submit">Approve and resume</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="dialog" id="cloud-release-dialog" aria-labelledby="cloud-release-title">
       <form method="dialog" class="dialog-body" id="cloud-release-form">
         <h2 id="cloud-release-title">Release to Cloud Run</h2>
+        <p class="field-help repo-context" id="cloud-release-repo"></p>
         <p class="field-help">Prepare a revision for an existing service with an image built for this release. The new revision receives no traffic.</p>
         <p class="field-help">Sign in with <code>gcloud auth login</code>. The deploying account typically needs Cloud Run Developer, Service Account User on the runtime identity, and Artifact Registry Reader on the image repository. <a href="https://docs.cloud.google.com/run/docs/deploying#required-roles" target="_blank" rel="noopener noreferrer">Required permissions</a></p>
         <fieldset class="field" id="cloud-release-target">
@@ -123,6 +150,7 @@
     <dialog class="dialog" id="draft-pr-dialog" aria-labelledby="draft-pr-title">
       <form class="dialog-body" id="draft-pr-form">
         <h2 id="draft-pr-title">Create draft pull request</h2>
+        <p class="field-help">Approval may push this branch. A push or pull request can trigger deployments configured in the destination repository.</p>
         <p class="field-help" id="draft-pr-status" role="status"></p>
         <dl class="run-result-facts" id="draft-pr-facts" hidden></dl>
         <div id="draft-pr-conflicts" hidden>
@@ -145,7 +173,7 @@
     <dialog class="dialog" id="publish-dialog" aria-labelledby="publish-title">
       <form method="dialog" class="dialog-body" id="publish-form">
         <h2 id="publish-title">Push branch</h2>
-        <p class="field-help">Send the committed result from this run to the Git remote below.</p>
+        <p class="field-help">Send the committed result to the Git remote below. This can trigger deployments configured in that repository.</p>
         <dl class="run-result-facts">
           <dt>Destination</dt><dd id="publish-destination"></dd>
           <dt>Branch</dt><dd class="mono" id="publish-branch"></dd>
@@ -205,10 +233,34 @@
       </form>
     </dialog>
 
+    <dialog class="dialog" id="run-question-dialog" aria-labelledby="run-question-title">
+      <form class="dialog-body" id="run-question-form">
+        <h2 id="run-question-title">Ask about this run</h2>
+        <p class="field-help repo-context" id="run-question-repo"></p>
+        <div class="actions" id="run-question-examples">
+          <button type="button" class="btn btn-sm" data-question="Is it deployed?">Is it deployed?</button>
+          <button type="button" class="btn btn-sm" data-question="What should I do next?">What’s next?</button>
+          <button type="button" class="btn btn-sm" data-question="Which checks passed?">Which checks passed?</button>
+        </div>
+        <label class="field">
+          <span class="field-label">Question or follow-up request</span>
+          <input id="run-question-input" type="text" maxlength="500" required placeholder="For example, I merged the PR. Deploy it now." />
+        </label>
+        <p class="field-help" id="run-question-status" role="status" hidden></p>
+        <section id="run-question-answer" aria-label="Run answer" aria-live="polite" hidden></section>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-ghost" id="run-question-close">Close</button>
+          <button type="submit" class="btn btn-primary" id="run-question-submit">Ask</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog class="dialog" id="feedback-dialog" aria-labelledby="feedback-title">
       <form method="dialog" class="dialog-body" id="feedback-form">
-        <h2 id="feedback-title">Give feedback</h2>
-        <p class="field-help" id="feedback-context">The crew starts from the latest commit and keeps working on this branch. Push the verified changes to update any open pull request.</p>
+        <h2 id="feedback-title">Request code changes</h2>
+        <p class="field-help" id="feedback-context">The crew starts a code revision on this branch. Use the run handoff for publishing and supported cloud releases.</p>
+        <p class="field-help repo-context" id="feedback-repo"></p>
+        <div class="actions"><button type="button" class="btn btn-sm" id="feedback-ask">Ask about the run instead</button></div>
         <label class="field">
           <span class="field-label">What should change?</span>
           <textarea id="feedback-message" rows="6" maxlength="8000" required aria-describedby="feedback-context" placeholder="Describe what to change, what to keep, and how you’ll know it’s right."></textarea>
@@ -222,7 +274,7 @@
           <span class="field-label">Provider</span>
           <select id="feedback-provider"><option value="claude">Claude</option><option value="codex">Codex</option></select>
         </label>
-        <label class="browser-permission"><input type="checkbox" id="feedback-browser"><span><strong>Allow local browser access</strong><small>Agents can inspect and test the static app in this run’s worktree.</small></span></label>
+        <label class="browser-permission"><input type="checkbox" id="feedback-browser"><span><strong>Allow local browser access</strong><small>Lets agents inspect the worktree’s static app. Public web reading is already enabled.</small></span></label>
         <p class="form-error" id="feedback-error" role="alert" hidden></p>
         <div class="dialog-actions">
           <button type="button" class="btn btn-ghost" id="feedback-cancel">Cancel</button>
@@ -239,9 +291,10 @@
         <div class="field">
           <label class="field-label" for="nr-target">Target repo</label>
           <div class="field-row">
-            <select name="target" id="nr-target" required></select>
+            <select name="target" id="nr-target" aria-describedby="nr-target-path" required></select>
             <button type="button" class="btn" id="nr-add-repo">+ Add repo</button>
           </div>
+          <p class="field-help repo-context" id="nr-target-path"></p>
         </div>
 
         <fieldset class="field">
@@ -270,7 +323,7 @@
             <option value="codex">Codex</option>
           </select>
         </label>
-        <label class="browser-permission"><input type="checkbox" id="nr-browser"><span><strong>Allow local browser access</strong><small>Agents can inspect and test the static app in this run’s worktree.</small></span></label>
+        <label class="browser-permission"><input type="checkbox" id="nr-browser"><span><strong>Allow local browser access</strong><small>Lets agents inspect the worktree’s static app. Public web reading is already enabled.</small></span></label>
 
         <div class="field">
           <div class="field-grid field-grid-3">

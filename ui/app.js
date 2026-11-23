@@ -19,6 +19,10 @@ const PIPELINE_ORDER = ["triage", "plan", "implement", "design", "review", "revi
 const roleLabel = (role) => ({ orchestrator: "Orchestrator", "ui-ux": "UI/UX specialist", "dependency-updater": "Dependency updater", "docs-writer": "Docs writer", "e2e-tester": "E2E tester" })[role] ?? role;
 const KIND_LABEL = { feature: "Feature", bug: "Bug fix", deps: "Dependency update" };
 const KIND_SHORT = { feature: "ship", bug: "fix", deps: "deps" };
+const DEPLOYMENT_PHASE_LABEL = { verifying: "Checking deployment", approval: "Awaiting approval", publishing: "Publishing", published: "Published", failed: "Deployment failed", cancelled: "Cancelled" };
+const DEPLOYMENT_PROVIDERS = { firebase: "Firebase Hosting", aws: "AWS", azure: "Azure" };
+const DEPLOYMENT_ACTIONS = { "firebase-release": "firebase", "aws-release": "aws", "azure-release": "azure" };
+const deploymentPending = new Set();
 
 /** Did a gate go the way it should? For a bug triage the tests must fail: that proves the bug. */
 const gateOk = (g) => (g.expectFailure ? g.code !== 0 && !g.timedOut : g.code === 0);
@@ -51,7 +55,7 @@ const state = {
   events: new Map(), // runId -> events, once loaded
   buffers: new Map(), // runId -> events that arrived while its history was loading
   lastActivity: new Map(), // runId -> last tool/text event
-  starting: new Map(), // runId -> request, until its first record arrives
+  starting: new Map(), // runId -> request and repository, until its first record arrives
   open: new Map(), // <details> open state, so re-renders keep what you expanded
   selected: null,
   focusHandoff: null,
@@ -349,6 +353,8 @@ const avatar = (role, small) => h("span", { class: `avatar role-${role}${small ?
 const inboxFor = (runId, stage) => [...state.inbox.values()].filter((i) => i.runId === runId && (!stage || i.stage === stage));
 
 function runStatus(run) {
+  if (run.deployment?.phase === "approval") return "waiting";
+  if (run.deployment?.phase === "publishing" && run.deployment.workflowRun) return "running";
   if (run.status === "running") {
     if (inboxFor(run.id).length) return "waiting";
     return state.active.has(run.id) ? "running" : "interrupted";
@@ -378,7 +384,12 @@ function targetHasE2E(run) {
 }
 
 function completionLabel(run) {
+  if (run.deployment) return run.finishedAt ? DEPLOYMENT_PHASE_LABEL[run.deployment.phase] : undefined;
   return { passed: "Run completed", failed: "Run failed", stopped: "Run stopped", error: "Run ended with an error" }[run.status];
+}
+
+function pendingDeployments() {
+  return [...state.runs.values()].filter((run) => run.deployment?.phase === "approval" && !run.archivedAt);
 }
 
 function unreadResults() {
@@ -527,6 +538,7 @@ function connect() {
   on("run", ({ run }) => {
     const previous = state.runs.get(run.id);
     state.runs.set(run.id, run);
+    if (run.deployment && !previous) state.results.delete(run.deployment.sourceRunId);
     if (run.followUp && (!previous || previous.branch !== run.branch)) {
       for (const other of state.runs.values()) {
         if (other.repo === run.repo && (other.branch === run.branch || other.branch === previous?.branch)) state.results.delete(other.id);
@@ -704,7 +716,7 @@ function renderMeta() {
     const cap = state.config.maxBudgetUsdPerRun ? ` · up to ${dollars(state.config.maxBudgetUsdPerRun)} a run` : "";
     meta.append(h("span", { text: `Default Claude · ${state.config.model} · effort ${state.config.effort} · runs on ${auth}${cap}` }));
   }
-  const n = state.inbox.size + unreadResults().length + activeReferenceAlerts().length;
+  const n = state.inbox.size + unreadResults().length + activeReferenceAlerts().length + pendingDeployments().length;
   for (const el of [$("inbox-count"), $("inbox-toggle-count")]) {
     el.textContent = String(n);
     el.classList.toggle("has", n > 0);
@@ -716,16 +728,44 @@ function renderMeta() {
 
 // ── Runs column ──────────────────────────────────────────
 
+function updateRunFilters() {
+  const select = $("run-repo-filter");
+  const repositories = new Map();
+  for (const { repo, target } of [...state.runs.values(), ...state.starting.values()]) {
+    if (repo) repositories.set(repo, target);
+  }
+  const entries = [...repositories].sort(([aPath, aName], [bPath, bName]) => aName.localeCompare(bName) || aPath.localeCompare(bPath));
+  const names = new Map();
+  for (const [, name] of entries) names.set(name, (names.get(name) ?? 0) + 1);
+  const options = entries.map(([path, name]) => [path, names.get(name) === 1 ? name : `${name} (${path})`]);
+  const current = [...select.options].slice(1);
+  if (current.length === options.length && options.every(([path, label], index) => current[index].value === path && current[index].text === label)) return;
+  const selected = select.value;
+  select.replaceChildren(h("option", { value: "", text: "All repos" }), ...options.map(([path, label]) => h("option", { value: path, title: path, text: label })));
+  select.value = repositories.has(selected) ? selected : "";
+}
+
 function renderRuns() {
   const list = $("run-list");
+  updateRunFilters();
+  const repo = $("run-repo-filter").value;
+  const statusFilter = $("run-status-filter").value;
+  const query = $("run-search").value.trim().toLowerCase();
+  const terms = query ? query.split(/\s+/) : [];
+  const matches = (run, status) => {
+    if ((repo && run.repo !== repo) || (statusFilter && status !== statusFilter)) return false;
+    const fields = [run.request, run.target, run.repo, run.branch, run.id, providerLabel(run.provider), run.followUp?.brief];
+    return terms.every((term) => fields.some((field) => field?.toLowerCase().includes(term)));
+  };
   const items = [];
-  for (const [id, request] of state.showArchived ? [] : state.starting) {
-    if (state.runs.has(id)) continue;
-    items.push(runItem({ id, title: firstLine(request), status: "starting", meta: "starting…" }));
+  for (const [id, run] of state.showArchived ? [] : state.starting) {
+    if (state.runs.has(id) || !matches({ ...run, id }, "starting")) continue;
+    items.push(runItem({ id, title: firstLine(run.request), status: "starting", meta: `${run.target} · starting…` }));
   }
   const runs = visibleRuns();
   for (const run of runs) {
     const status = runStatus(run);
+    if (!matches(run, status)) continue;
     const waiting = inboxFor(run.id).length;
     const live = state.active.has(run.id) ? state.lastActivity.get(run.id) : null;
     items.push(
@@ -734,15 +774,19 @@ function renderRuns() {
         title: firstLine(run.request),
         status,
         badge: waiting ? waiting : null,
-        meta: `${run.target} · ${KIND_SHORT[run.kind] ?? run.kind} · ${providerLabel(run.provider)} · ${ago(run.createdAt)} · ${usageLabel(run.totals)}`,
+        meta: run.deployment ? `${run.target} · ${DEPLOYMENT_PROVIDERS[run.deployment.provider]} · ${status === "interrupted" ? "Interrupted" : DEPLOYMENT_PHASE_LABEL[run.deployment.phase]}` :
+          `${run.target} · ${KIND_SHORT[run.kind] ?? run.kind} · ${providerLabel(run.provider)} · ${ago(run.createdAt)} · ${usageLabel(run.totals)}`,
         live: live ? (live.type === "tool" ? `${live.tool} ${live.detail}` : live.text) : null,
       }),
     );
   }
-  const empty = state.showArchived ? "No archived runs." : "No runs yet. Start one with New run.";
+  const filtered = Boolean(query || repo || statusFilter);
+  const empty = filtered ? "No matching runs." : state.showArchived ? "No archived runs." : "No runs yet. Start one with New run.";
   list.replaceChildren(...(items.length ? items : [h("li", { class: "list-empty", text: empty })]));
   const running = state.active.size;
-  $("runs-sub").textContent = !state.showArchived && running ? `${running} running` : runs.length ? `${runs.length} total` : "";
+  const summary = filtered ? `${items.length} ${items.length === 1 ? "match" : "matches"}`
+    : !state.showArchived && running ? `${running} running` : runs.length ? `${runs.length} total` : "";
+  if ($("runs-sub").textContent !== summary) $("runs-sub").textContent = summary;
   $("archive-toggle").setAttribute("aria-pressed", String(state.showArchived));
   $("archive-toggle").textContent = state.showArchived ? "Back to runs" : "Archived";
 }
@@ -765,6 +809,7 @@ function runItem({ id, title, status, meta, badge, live }) {
 
 function select(id) {
   if (state.focusHandoff !== id) state.focusHandoff = null;
+  if (id !== state.selected && state.runs.get(id)?.deployment) $("detail").scrollTop = 0;
   state.selected = id;
   if (id) {
     state.showArchived = Boolean(state.runs.get(id)?.archivedAt);
@@ -785,13 +830,18 @@ function viewResult(run) {
 
 // ── Detail column ────────────────────────────────────────
 
+function runRepository(run) {
+  return h("p", { class: "run-repository repo-context" }, "Repository ", h("strong", { text: run.target }), run.repo ? [" · ", h("code", { text: run.repo })] : null);
+}
+
 function renderDetail() {
   const root = $("detail");
   const run = state.selected ? state.runs.get(state.selected) : null;
 
   if (!run && state.selected && state.starting.has(state.selected)) {
+    const pending = state.starting.get(state.selected);
     root.replaceChildren(
-      h("div", { class: "detail-inner" }, h("div", { class: "run-head" }, h("h1", { text: firstLine(state.starting.get(state.selected)) }), h("div", { class: "working" }, h("span", { class: "spinner" }), "Creating the worktree…"), runActions({ id: state.selected, status: "running" }))),
+      h("div", { class: "detail-inner" }, h("div", { class: "run-head" }, h("h1", { text: firstLine(pending.request) }), runRepository(pending), h("div", { class: "working" }, h("span", { class: "spinner" }), "Creating the worktree…"), runActions({ id: state.selected, status: "running" }))),
     );
     return;
   }
@@ -808,6 +858,11 @@ function renderDetail() {
         state.targets.length === 0 && !state.config?.canAddTargets ? h("p", { class: "field-help", text: "Add a target repo to shipyard.config.yaml first." }) : null,
       ),
     );
+    return;
+  }
+
+  if (run.deployment) {
+    root.replaceChildren(renderDeployment(run));
     return;
   }
 
@@ -835,6 +890,7 @@ function renderDetail() {
       "section",
       { class: "run-head" },
       h("div", { class: "run-head-top" }, h("h1", { text: run.followUp ? "Revision" : run.request }), h("span", { class: `pill s-${recovery ? "waiting" : status}`, text: badge })),
+      runRepository(run),
       recovery ? recoveryHandoff(run, result, checking) : null,
       repairing ? h("p", { class: "banner", role: "status" },
         lastStage.autoRepair ? `The crew is repairing the ${lastStage.autoRepair.command} failure in this revision.` : "The crew is repairing the failed check in this revision.",
@@ -848,7 +904,6 @@ function renderDetail() {
       h(
         "div",
         { class: "run-facts" },
-        h("span", { class: "chip", text: run.target }),
         h("span", { class: "chip", text: KIND_LABEL[run.kind] ?? run.kind }),
         h("span", { class: "chip", text: providerLabel(run.provider) }),
         h("span", { class: "chip", title: run.model, text: `${modelLabel(run.model)}${run.effort ? ` · ${run.effort}` : ""}` }),
@@ -926,6 +981,7 @@ function runResult(run, result, recovery) {
   const publication = result.publish;
   const gitStatus = result.loading ? "Checking Git remotes…" :
     result.hasRemote === false ? "Local branch awaiting a remote." :
+    publication?.pullRequestState === "merged" ? (publication.pushed ? "Pull request merged." : "Pull request merged. This run has a local update.") :
     publication?.pushed ? `Branch pushed to ${publication.label}.` :
     publication ? `Ready to push to ${publication.label}.` :
     result.publishUnavailable ?? (result.hasRemote ? "No completed branch changes to push." : "Git remote status unavailable.");
@@ -964,9 +1020,9 @@ function runResult(run, result, recovery) {
         }) : null,
         publication?.closedPullRequestUrl ? h("a", { class: "btn btn-sm", href: publication.closedPullRequestUrl,
           target: "_blank", rel: "noopener noreferrer", text: "View closed PR" }) : null,
-        publication && !publication.pushed ? button(publication.pullRequestUrl ? "Push updates" : "Push branch", () => openPublish(run, publication)) : null,
+        publication && !publication.pushed ? button(publication.pullRequestState === "merged" ? "Review local update" : publication.pullRequestUrl ? "Push updates" : "Push branch", () => openPublish(run, publication)) : null,
         publication?.pullRequestUrl ? h("a", {
-          class: "btn btn-primary btn-sm", href: publication.pullRequestUrl, target: "_blank", rel: "noopener noreferrer", text: "Open PR on GitHub",
+          class: "btn btn-primary btn-sm", href: publication.pullRequestUrl, target: "_blank", rel: "noopener noreferrer", text: publication.pullRequestState === "merged" ? "View merged PR" : "Open PR on GitHub",
         }) : publication?.canCreatePullRequest ? [
           !publication.canDraftPullRequest ? h("button", { type: "button", class: "btn btn-primary btn-sm", disabled: pendingPullRequest !== undefined,
             text: pendingPullRequest === true ? "Creating draft PR…" : "Create draft PR", onclick: () => createPullRequest(run.id, publication, true) }) : null,
@@ -974,14 +1030,23 @@ function runResult(run, result, recovery) {
             () => createPullRequest(run.id, publication, false), pendingPullRequest !== undefined),
         ] : publication?.pullRequestUnavailable ? h("span", { text: publication.pullRequestUnavailable }) : null,
       )] : null,
+      h("dt", { text: "Deployment" }), h("dd", { class: "git-remote-status" },
+        (result.deploymentIds ?? []).map((id) => state.runs.get(id)).filter((deployment) => deployment?.deployment && !deployment.archivedAt)
+          .map((deployment) => button(`View ${DEPLOYMENT_PROVIDERS[deployment.deployment.provider]} deployment`, () => select(deployment.id))),
+        !state.config?.demo && publication?.pullRequestState === "merged" ?
+          button("Start deployment", () => openRunQuestion(run, "Deploy from this run.")) : null,
+        button("Check live deployment", () => openRunQuestion(run, "Is it deployed?"))),
     ) : null,
     result.error ? h("p", { class: "run-result-error", text: result.error }) : null,
     result.cloudRelease ? h("p", { class: "field-help", text: `Cloud Run recorded revision ${result.cloudRelease.revision} for run commit ${result.cloudRelease.head.slice(0, 12)}. It had no traffic when verified.` }) : null,
     h("div", { class: "run-result-actions" },
+      button("Ask about this run", () => openRunQuestion(run)),
+      result.canVerifyStoppedRun ? button(state.verificationPending.has(run.id) ? "Running project checks…" : "Run project checks",
+        () => verifyRunResult(run.id), state.verificationPending.has(run.id)) : null,
       result.canReleaseToCloudRun && !state.config?.demo ? button("Review Cloud Run release", () => openCloudRelease(run.id)) : null,
       result.latestRevisionId ? button("View latest revision", () => select(result.latestRevisionId)) : null,
       (result.canGiveFeedback ?? (run.status === "passed" && !run.cleanedUp && !result.loading)) && !recovery
-        ? button("Give feedback", () => openFeedback(run)) : null,
+        ? button("Request code changes", () => openFeedback(run)) : null,
       !recovery && !run.cleanedUp ? button("Copy worktree path", () => copy(run.worktree, "Worktree path")) : null,
       result.localApp?.url ? [
         h("a", { class: "btn btn-primary btn-sm", href: result.localApp.url, target: "_blank", rel: "noopener noreferrer", text: "Open local app" }),
@@ -1007,6 +1072,18 @@ function runResult(run, result, recovery) {
 }
 
 function recoveryHandoff(run, result, checking) {
+  if (result.budgetPause) {
+    const pause = result.budgetPause;
+    const stage = pause.stage === "docs" ? "documentation" : pause.stage;
+    const busy = state.resuming.has(run.id);
+    return h("section", { class: "run-recovery", "aria-label": "Next step" },
+      h("h2", { id: "run-handoff", tabindex: "-1", text: "Run budget reached" }),
+      h("p", { text: `Shipyard stopped before ${stage} after using an estimated ${dollars(pause.spent)} of the ${dollars(pause.current)} limit.` }),
+      h("p", { text: "Approve a higher limit to continue from the saved worktree." }),
+      h("div", { class: "run-result-actions" }, h("button", { type: "button", class: "btn btn-sm btn-primary", disabled: busy,
+        onclick: () => openBudgetIncrease(run, pause), text: busy ? "Resuming…" : "Increase budget" })),
+    );
+  }
   const stage = run.stages.findLast((entry) => entry.status === "failed" || entry.status === "stopped");
   const attempt = stage?.attempts.findLast((entry) => !entry.interrupted);
   const ready = result.savedEditsCheck === "passed";
@@ -1044,7 +1121,7 @@ function recoveryHandoff(run, result, checking) {
     h("div", { class: "run-result-actions" },
       canFix && !checking ? choose(busy ? "Starting repair…" : stage?.repairRole ? "Retry repair" : "Ask the crew to fix it", () => resumeRun(run.id, "fix"), true, busy) : null,
       result.canPrepareBranch && !checking ? choose("Review branch cleanup", () => openBranchPreparation(run), true, busy) : null,
-      result.canGiveFeedback && !canFix && !checking ? choose("Give feedback", () => openFeedback(run), !result.canPrepareBranch, busy) : null,
+      result.canGiveFeedback && !canFix && !checking ? choose("Request code changes", () => openFeedback(run), !result.canPrepareBranch, busy) : null,
       result.recheckStage && !checking ? ready
         ? choose(busy ? "Continuing…" : "Continue this run", () => resumeRun(run.id, "recheck"), true, busy)
         : choose(recentFailure ? "Check saved edits again" : "Check saved edits", () => verifyRunResult(run.id), !canFix, busy)
@@ -1134,7 +1211,9 @@ function renderHandoff(run, result, checks) {
           text: state.referenceDrafts.has(referenceKey(run.id, check.url)) ? "Review reference" : "Retry in browser",
           onclick: () => openReferenceHandoff(run.id, check.url) }) : null,
       )),
-      agentPending.map(({ stage, text }) => h("div", { class: "handoff-report md" }, h("strong", { text: `From ${roleLabel(stage.role)}` }), md(text))),
+      agentPending.length && run.status === "passed" && !needsProjectChecks ? details(`${run.id}:previous-handoff-notes`, "Earlier agent notes",
+        agentPending.map(({ stage, text }) => h("div", { class: "handoff-report md" }, h("strong", { text: `From ${roleLabel(stage.role)}` }), md(text)))) :
+        agentPending.map(({ stage, text }) => h("div", { class: "handoff-report md" }, h("strong", { text: `From ${roleLabel(stage.role)}` }), md(text))),
       !pending.length && !agentPending.length && !referenceGaps.length ? h("p", { class: "muted", text: "No additional items." }) : null,
       needsProjectChecks && !run.cleanedUp && run.status === "passed" ? h("button", { type: "button", class: "btn btn-sm handoff-action", onclick: () => verifyRunResult(run.id), disabled: verifying, text: verifying ? "Running project checks…" : "Run project checks" }) : null,
     ),
@@ -1417,17 +1496,30 @@ function renderInbox() {
   const items = [...state.inbox.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const outcomes = unreadResults();
   const references = activeReferenceAlerts();
+  const deployments = pendingDeployments();
   const oldOutcomes = list.querySelector(".inbox-results");
   const oldReferences = list.querySelector(".inbox-references");
+  const oldDeployments = list.querySelector(".inbox-deployments");
 
   for (const el of [...list.children]) {
-    if (el === oldOutcomes || el === oldReferences) continue;
+    if (el === oldOutcomes || el === oldReferences || el === oldDeployments) continue;
     if (!el.dataset.id || !state.inbox.has(el.dataset.id)) el.remove();
   }
-  if (!items.length && !outcomes.length && !references.length) {
+  if (!items.length && !outcomes.length && !references.length && !deployments.length) {
     list.replaceChildren(h("p", { class: "inbox-empty", text: "You're caught up. Questions and results will appear here." }));
     return;
   }
+  if (deployments.length) {
+    const approvals = h("section", { class: "inbox-deployments", "aria-label": "Deployment approvals" },
+      h("h3", { class: "section-label", text: "Deployment approvals" }),
+      deployments.map((run) => h("article", { class: "card completion-card" }, h("div", { class: "card-body" },
+        h("strong", { text: run.request }), h("p", { text: run.deployment.review?.site ?? run.deployment.workflowReview?.environment }),
+        h("button", { type: "button", class: "btn btn-sm btn-primary", onclick: () => select(run.id) }, "Review deployment"),
+      ))),
+    );
+    if (oldDeployments) oldDeployments.replaceWith(approvals);
+    else list.prepend(approvals);
+  } else oldDeployments?.remove();
   if (references.length) {
     const alerts = h("section", { class: "inbox-references", "aria-label": "Reference access" },
       h("h3", { class: "section-label", text: "Reference access" }),
@@ -1506,6 +1598,7 @@ function card(item) {
       h("span", { class: "card-time", "data-time": item.createdAt, text: ago(item.createdAt) }),
     ),
     h("button", { type: "button", class: "card-run", onclick: () => select(item.runId), title: "Open this run" }, run ? firstLine(run.request) : item.runId),
+    run ? runRepository(run) : null,
   );
 
   const send = async (answer, files) => {
@@ -1967,6 +2060,7 @@ function fillTargets(selected) {
   const select = $("nr-target");
   const keep = selected ?? select.value;
   select.replaceChildren(...state.targets.map((t) => h("option", { value: t.name, text: t.name, selected: t.name === keep })));
+  $("nr-target-path").textContent = state.targets.find((target) => target.name === select.value)?.path ?? "";
 }
 
 function openNewRun(selected) {
@@ -2217,7 +2311,9 @@ function wireNewRun() {
   $("nr-cancel").addEventListener("click", () => dialog.close());
   $("nr-crew").addEventListener("change", updateCrew);
   $("nr-target").addEventListener("change", () => {
-    $("nr-browser").checked = Boolean(state.targets.find((t) => t.name === $("nr-target").value)?.browserAccess);
+    const target = state.targets.find((t) => t.name === $("nr-target").value);
+    $("nr-target-path").textContent = target?.path ?? "";
+    $("nr-browser").checked = Boolean(target?.browserAccess);
     updateCrew();
   });
   form.addEventListener("submit", async (e) => {
@@ -2254,7 +2350,8 @@ function wireNewRun() {
     try {
       body.attachments = await readAttachments($("nr-attachments"));
       const { id } = await api("/api/runs", { method: "POST", body });
-      state.starting.set(id, body.request);
+      if (!state.runs.has(id)) state.starting.set(id, { request: body.request, target: body.target, provider: body.provider,
+        repo: state.targets.find((t) => t.name === body.target)?.path });
       dialog.close();
       $("nr-request").value = "";
       $("nr-attachments").value = "";
@@ -2381,6 +2478,12 @@ function openRunControl(id, provider) {
 }
 
 function wireRunControls() {
+  $("run-search").addEventListener("input", () => schedule("runs"));
+  $("run-repo-filter").addEventListener("change", () => schedule("runs"));
+  const statusFilter = $("run-status-filter");
+  const runStatuses = ["starting", "running", "waiting", "passed", "failed", "error", "stopped", "interrupted"];
+  statusFilter.append(...runStatuses.map((value) => h("option", { value, text: STATUS_LABEL[value] })));
+  statusFilter.addEventListener("change", () => schedule("runs"));
   $("archive-toggle").addEventListener("click", () => {
     state.showArchived = !state.showArchived;
     select(visibleRuns()[0]?.id ?? null);
@@ -2411,13 +2514,57 @@ function wireRunControls() {
   });
 }
 
-function openFeedback(run) {
+function openBudgetIncrease(run, pause) {
+  const form = $("run-budget-form");
+  const input = $("run-budget-amount");
+  form.dataset.runId = run.id;
+  input.value = "";
+  input.min = String(pause.minimum);
+  $("run-budget-context").textContent = `Repository ${run.target} · estimated ${dollars(pause.spent)} used of ${dollars(pause.current)}.`;
+  $("run-budget-minimum").textContent = `Enter at least ${dollars(pause.minimum)} to resume this run.`;
+  $("run-budget-error").hidden = true;
+  $("run-budget-dialog").showModal();
+  input.focus();
+}
+
+function wireBudgetIncrease() {
+  const dialog = $("run-budget-dialog");
+  const submit = $("run-budget-submit");
+  const cancel = $("run-budget-cancel");
+  const error = $("run-budget-error");
+  cancel.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("cancel", (event) => { if (submit.disabled) event.preventDefault(); });
+  $("run-budget-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    const { runId } = event.currentTarget.dataset;
+    const budgetUsd = $("run-budget-amount").valueAsNumber;
+    submit.disabled = cancel.disabled = true;
+    state.resuming.add(runId);
+    error.hidden = true;
+    try {
+      await api(`/api/runs/${runId}/resume`, { method: "POST", body: { budgetUsd } });
+      dialog.close();
+      toast("Budget increased. Resuming run.");
+    } catch (failure) {
+      error.textContent = failure.message;
+      error.hidden = false;
+    } finally {
+      state.resuming.delete(runId);
+      submit.disabled = cancel.disabled = false;
+      schedule("runs", "detail");
+    }
+  });
+}
+
+function openFeedback(run, message = "") {
   if (!state.feedbackReusesBranch) {
     toast("Open the current Shipyard dashboard to revise this branch.", true);
     return;
   }
   $("feedback-form").dataset.runId = run.id;
-  $("feedback-message").value = "";
+  $("feedback-repo").textContent = `Repository ${run.target} · ${run.repo}`;
+  $("feedback-message").value = message;
   $("feedback-attachments").value = "";
   $("feedback-provider").value = run.provider ?? "claude";
   $("feedback-browser").checked = Boolean(run.browserAccess ?? state.targets.find((target) => target.name === run.target)?.browserAccess);
@@ -2777,6 +2924,8 @@ function openCloudRelease(runId) {
   const form = $("cloud-release-form");
   form.reset();
   form.dataset.runId = runId;
+  const run = state.runs.get(runId);
+  $("cloud-release-repo").textContent = run ? `Repository ${run.target} · ${run.repo}` : "";
   $("cloud-release-cancel").textContent = "Cancel";
   $("cloud-release-submit").hidden = false;
   $("cloud-release-status").textContent = "";
@@ -2953,18 +3102,183 @@ function wireBranchPreparation() {
   });
 }
 
+let runQuestionRequest = 0;
+
+function openRunQuestion(run, question = "") {
+  const dialog = $("run-question-dialog");
+  $("run-question-form").dataset.runId = run.id;
+  $("run-question-repo").textContent = `Repository ${run.target} · ${run.repo}`;
+  $("run-question-input").value = question;
+  $("run-question-status").hidden = true;
+  $("run-question-answer").hidden = true;
+  $("run-question-submit").disabled = false;
+  dialog.showModal();
+  if (question) void askRunQuestion(question);
+  else $("run-question-input").focus();
+}
+
+async function askRunQuestion(question) {
+  const dialog = $("run-question-dialog");
+  const request = ++runQuestionRequest;
+  const { runId } = $("run-question-form").dataset;
+  const status = $("run-question-status");
+  const output = $("run-question-answer");
+  const submit = $("run-question-submit");
+  submit.disabled = true;
+  status.hidden = false;
+  status.textContent = "Checking this run…";
+  output.hidden = true;
+  $("run-question-input").value = question;
+  try {
+    const answer = await api(`/api/runs/${runId}/question`, { method: "POST", body: { question } });
+    if (request !== runQuestionRequest || !dialog.open) return;
+    if (DEPLOYMENT_ACTIONS[answer.review]) {
+      dialog.close();
+      void updateDeploymentRun(runId, "review", DEPLOYMENT_ACTIONS[answer.review]);
+      return;
+    }
+    const links = (answer.links ?? []).filter(({ url }) => /^https:\/\//.test(url)).map(({ label, url }) =>
+      h("a", { class: "btn btn-sm", href: url, target: "_blank", rel: "noopener noreferrer", text: label }));
+    const actions = (answer.actions ?? []).map(({ label, action }) => h("button", { type: "button", class: "btn btn-sm", text: label, onclick: () => {
+      if (action === "deployment") return void askRunQuestion("Is it deployed?");
+      const run = state.runs.get(runId);
+      if (!run) return;
+      dialog.close();
+      const result = state.results.get(runId);
+      if (action === "draft-pr") openDraftReview(runId, result?.publish);
+      if (action === "cloud-release") openCloudRelease(runId);
+      if (DEPLOYMENT_ACTIONS[action]) void updateDeploymentRun(runId, "review", DEPLOYMENT_ACTIONS[action]);
+      if (action === "budget" && result?.budgetPause) openBudgetIncrease(run, result.budgetPause);
+      if (action === "checks") void verifyRunResult(runId);
+      if (action === "preview") openRunPreview(runId);
+      if (action === "revision") openFeedback(run, question);
+    } }));
+    output.replaceChildren(h("h3", { text: answer.heading }), ...answer.details.map((line) => h("p", { text: line })),
+      h("div", { class: "actions" }, links, actions));
+    output.hidden = false;
+    status.hidden = true;
+  } catch (error) {
+    if (request === runQuestionRequest && dialog.open) status.textContent = error.message;
+  } finally {
+    if (request === runQuestionRequest) submit.disabled = false;
+  }
+}
+
+async function updateDeploymentRun(runId, action, provider, review) {
+  if (deploymentPending.has(runId)) return;
+  deploymentPending.add(runId);
+  schedule("detail");
+  try {
+    const { run } = await api(`/api/runs/${runId}/deployment`, {
+      method: "POST", body: action === "deploy" ? { action, token: review.token, confirm: true } : { action, provider },
+    });
+    state.runs.set(run.id, run);
+    if (run.id !== runId) {
+      state.results.delete(runId);
+      select(run.id);
+    }
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    deploymentPending.delete(runId);
+    schedule("runs", "detail", "meta", "inbox");
+  }
+}
+
+function renderDeployment(run) {
+  const deployment = run.deployment;
+  const status = runStatus(run);
+  const busy = deploymentPending.has(run.id) || state.active.has(run.id);
+  const provider = DEPLOYMENT_PROVIDERS[deployment.provider];
+  const workflow = deployment.workflowRun;
+  const usesWorkflow = deployment.provider !== "firebase";
+  const release = run.firebaseRelease;
+  const review = deployment.review ?? deployment.workflowReview;
+  const facts = release ?? review;
+  const link = (label, url) => typeof url === "string" && /^https:\/\//.test(url) ?
+    h("a", { class: "btn btn-sm", href: url, target: "_blank", rel: "noopener noreferrer", text: label }) : null;
+  const button = (label, onclick, style = "btn-sm") => h("button", { type: "button", class: `btn ${style}`, disabled: busy, text: label, onclick });
+  return h("div", { class: "detail-inner" },
+    h("section", { class: "run-head" },
+      h("div", { class: "run-head-top" }, h("h1", { text: run.request }),
+        h("span", { class: `pill s-${status}`, text: status === "interrupted" ? "Interrupted" : DEPLOYMENT_PHASE_LABEL[deployment.phase] })),
+      runRepository(run),
+    ),
+    h("section", { class: "run-result", "aria-label": "Deployment run" },
+      h("h2", { text: `${provider} deployment` }),
+      status === "interrupted" ? h("p", { text: deployment.dispatchStarted ?
+        "GitHub may have received the request. Check Actions history for the workflow before starting another deployment." :
+        "Shipyard was interrupted. Start verification again when ready." }) :
+        deployment.phase === "approval" ? h("p", { text: usesWorkflow ?
+          "Approving starts this GitHub Actions workflow for the reviewed commit and environment." :
+          "The checks passed. Approving publishes the reviewed commit to the live site below." }) :
+        deployment.phase === "verifying" ? h("p", { role: "status", text: usesWorkflow ?
+          "Checking the GitHub commit, deployment workflow, and environment…" : "Checking the GitHub commit, project tests, and Firebase site…" }) :
+        deployment.phase === "publishing" ? h("p", { role: "status", text: usesWorkflow ?
+          workflow ? `GitHub Actions status · ${workflow.status.replaceAll("_", " ")}` : "Starting the approved workflow…" :
+          "Publishing the reviewed commit to Firebase Hosting…" }) :
+        deployment.phase === "published" && usesWorkflow ? h("p", { text: "GitHub Actions reported success for the reviewed commit." }) :
+        release ? h("p", { text: `Firebase confirmed this release on ${new Date(release.deployedAt).toLocaleString()}.` }) : null,
+      run.error ? h("p", { class: "run-result-error", role: "alert", text: run.error }) : null,
+      facts ? h("dl", { class: "run-result-facts" }, [
+        ["Branch", facts.branch], ["Commit", facts.head.slice(0, 12)],
+        ...(usesWorkflow ? [["GitHub repository", new URL(facts.repository).pathname.slice(1)], ["Workflow", facts.workflow], ["Environment", facts.environment]] :
+          [["Firebase project", facts.project], ["Hosting site", facts.site], ["Account", facts.account],
+            ...(review ? [["Passed checks", review.checks.join(", ")]] : [])]),
+      ].flatMap(([label, value]) => [h("dt", { text: label }), h("dd", { class: "mono cloud-release-value", text: value })])) : null,
+      h("div", { class: "run-result-actions" },
+        deployment.phase === "approval" ? button("Approve and deploy", () => updateDeploymentRun(run.id, "deploy", deployment.provider, review), "btn-primary btn-sm") : null,
+        !deployment.dispatchStarted && (deployment.phase === "failed" || status === "interrupted") ? button("Verify again", () => updateDeploymentRun(run.id, "review")) : null,
+        !deployment.dispatchStarted && (deployment.phase === "approval" || status === "interrupted") ? button("Cancel deployment", () => updateDeploymentRun(run.id, "cancel")) : null,
+        workflow ? link("View GitHub Actions run", workflow.url) : usesWorkflow && facts ?
+          link("View GitHub workflow", `${facts.repository}/actions/workflows/${encodeURIComponent(facts.workflow)}`) : null,
+        link("Open live site", facts?.url), link("View merged PR", deployment.pullRequest),
+        state.runs.has(deployment.sourceRunId) ? button("Open source run", () => select(deployment.sourceRunId)) : null,
+        run.finishedAt ? button(run.archivedAt ? "Restore run" : "Archive run", () => archiveRun(run.id, !run.archivedAt)) : null,
+      ),
+    ),
+  );
+}
+
+function wireRunQuestions() {
+  const dialog = $("run-question-dialog");
+  $("run-question-close").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", () => { if (!dialog.open) runQuestionRequest++; });
+  $("run-question-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const question = $("run-question-input").value.trim();
+    if (question && !$("run-question-submit").disabled) void askRunQuestion(question);
+  });
+  $("run-question-examples").addEventListener("click", (event) => {
+    const question = event.target.closest("[data-question]")?.dataset.question;
+    if (question && !$("run-question-submit").disabled) void askRunQuestion(question);
+  });
+}
+
 function wireFeedback() {
   const dialog = $("feedback-dialog");
   const button = $("feedback-submit");
   const cancel = $("feedback-cancel");
   const error = $("feedback-error");
   cancel.addEventListener("click", () => dialog.close());
+  $("feedback-ask").addEventListener("click", () => {
+    const run = state.runs.get($("feedback-form").dataset.runId);
+    if (!run) return;
+    dialog.close();
+    openRunQuestion(run, $("feedback-message").value.trim());
+  });
   dialog.addEventListener("cancel", (event) => { if (button.disabled) event.preventDefault(); });
   $("feedback-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (button.disabled) return;
     const { runId } = event.currentTarget.dataset;
     const message = $("feedback-message").value.trim();
+    const run = state.runs.get(runId);
+    if (run && !$("feedback-attachments").files.length && /^(?:(?:is|was|has|did)\b.*\bdeploy\w*\b.*\?|it[’'´]?s\s+deployed\s*\?|deploy(?:\s+(?:it|this|now))*[.!]?)$/i.test(message)) {
+      dialog.close();
+      openRunQuestion(run, message);
+      return;
+    }
     const body = {
       message, provider: $("feedback-provider").value, browserAccess: $("feedback-browser").checked,
     };
@@ -2974,7 +3288,8 @@ function wireFeedback() {
     try {
       body.attachments = await readAttachments($("feedback-attachments"));
       const { id } = await api(`/api/runs/${runId}/feedback`, { method: "POST", body });
-      if (!state.runs.has(id)) state.starting.set(id, "Revision");
+      const source = state.runs.get(runId);
+      if (!state.runs.has(id) && source) state.starting.set(id, { request: message, target: source.target, repo: source.repo, provider: body.provider });
       dialog.close();
       select(id);
     } catch (err) {
@@ -3041,8 +3356,10 @@ async function main() {
   wireNewRun();
   wireAddRepo();
   wireRunControls();
+  wireBudgetIncrease();
   wireBranchPreparation();
   wireFeedback();
+  wireRunQuestions();
   wireGitRemote();
   wirePublish();
   wireDraftReview();

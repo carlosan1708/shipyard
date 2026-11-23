@@ -18,7 +18,13 @@ Set `defaultProvider` in [`shipyard.config.yaml`](../shipyard.config.yaml) to ch
 
 For Claude, `auth: subscription` uses the saved Claude Code sign-in. Shipyard removes API billing environment variables from the agent process in this mode. Use `auth: api-key` to bill an API account. `maxBudgetUsdPerStage` and `maxBudgetUsdPerRun` limit estimated usage at API prices. The UI budget field and `--budget` override the run limit.
 
-Codex agent commands run with outbound network access disabled. Prepare dependencies ahead of time or use Claude for work that needs uncached registry access. Shipyard runs your configured gates locally for both providers.
+When a Claude run reaches its estimated limit, choose **Increase budget** in that run’s dashboard, enter a new total limit, and select **Approve and resume**. The run continues in its saved worktree. Its accrued usage counts toward the new limit.
+
+Claude and Codex can search the web and read public websites without approval. The `read_public_page` tool reads public text without signing in. For a GitHub target, `read_github_origin` reads branch heads and text files from that run’s configured `origin`, using the host’s `gh` sign-in for private repositories. Git pushes, PR creation, and Cloud Run releases use the dashboard handoff for approval.
+
+Agent shells run with external networking disabled, including shell `git fetch` and package installs. Prepare dependencies ahead of time. Shipyard runs project checks with local networking on macOS and in a private network namespace on Linux. Linux requires bubblewrap for project checks and the Claude sandbox also requires its platform dependencies. Process-backed dashboard previews use the macOS sandbox. Static previews are available on Linux.
+
+macOS project checks that honor `CHROME_PATH` can use Shipyard’s launcher for an installed Chrome or Chromium. The launcher runs the browser with the gate’s existing Seatbelt profile because macOS rejects Chrome’s nested sandbox. An explicit host `CHROME_PATH` takes precedence.
 
 ## Targets
 
@@ -33,6 +39,8 @@ targets:
 ```
 
 Shipyard starts from the target's committed `HEAD`, so pending changes in the original checkout stay there. After a run, inspect the resulting `shipyard/<run-id>` branch or the diff in the dashboard. The worktree path and branch are recorded with the run.
+
+Search and filter the run list by repository and status. Each run shows the local repository path Shipyard recorded for it.
 
 ## Crew and stage order
 
@@ -79,6 +87,56 @@ Use **Open local preview** to see the static site. **Run browser check** verifie
 
 The **Run handoff** lists changes, specialist reports, recorded verification and pending items. Choose **Allow local browser access** on a run or revision to let either provider inspect screenshots and activate local controls in an isolated browser. `browserAccess: true` sets the target default, and `--browser` or `--no-browser` overrides it in the CLI. Include GitHub or LinkedIn URLs in the run request or use `--reference=<url>` in the CLI to pass public source material to the crew. Shipyard logs permission gaps, public access failures, and sign-in requirements in the run. It uses a separate connection with no account cookies or tokens.
 
+Use **Ask about this run** for deployment, GitHub, checks, changed files, or next steps. From a completed run with a linked, merged PR, choose **Start deployment** or enter a follow-up such as “I merged the PR. Deploy to AWS.” Shipyard creates a separate deployment run and puts the approval in **Needs you**. If multiple providers are available, choose one in the dashboard. Open the deployment run to approve the release or view its outcome.
+
+### AWS and Azure deployments
+
+Set the workflow filename and GitHub Actions environment under the repository’s entry in `shipyard.config.yaml`. The workflow and environment must exist on GitHub. You can configure either or both providers.
+
+```yaml
+targets:
+  example:
+    path: ~/Documents/GitHub/example
+    test: npm test
+    deployments:
+      aws:
+        workflow: deploy-aws.yml
+        environment: aws-production
+      azure:
+        workflow: deploy-azure.yml
+        environment: azure-production
+```
+
+The workflow must accept these inputs and guard every job against a moved branch. The deployment job uses the selected environment. Add the repository’s build, verification, and deployment steps to that workflow.
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: environment
+jobs:
+  deploy:
+    if: ${{ github.sha == inputs.commit_sha }}
+    environment: ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+      # Add this repository’s verification and deployment steps here.
+```
+
+Shipyard uses the local GitHub CLI session to review and dispatch the workflow. The review shows the repository, branch, commit, workflow, and environment. Keep cloud credentials and environment protections in GitHub Actions. **Approve and deploy** sends one workflow dispatch, and Shipyard tracks the returned Actions run across restarts. A successful run means the workflow reported success. Include a live verification step in the workflow if the release should depend on it. [GitHub workflow dispatch](https://docs.github.com/en/rest/actions/workflows?apiVersion=2026-03-10) · [Cloud authentication with OIDC](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-cloud-providers)
+
+### Firebase Hosting deployments
+
+For a supported static Firebase site, Shipyard verifies the GitHub default-branch commit, checks the signed-in Firebase account and site, and runs the configured project checks before approval. **Check live deployment** compares supported Firebase Hosting files or shows a recorded Cloud Run revision and its traffic status at creation.
+
 In a finished result, **Run project checks** records the configured unit and end-to-end checks against the current run branch. Under **Pull request**, choose **Connect Git remote** to save the clone URL of an existing repository as `origin`. **Create draft PR** lets you review the GitHub destination, base, branch, and editable Markdown description before approving the push and draft together. If the histories are unrelated, Shipyard applies the run’s changes to GitHub’s default branch in a separate worktree. The review lists overlapping files whose run versions will be used. Shipyard reruns the configured checks before publishing that branch. **Push branch** is also available for publishing just the branch. Shipyard uses the local GitHub CLI account (`gh auth login`) to create or find the PR. **Open PR on GitHub** opens the saved URL. Choose **Reopen PR** to review and update the description of a closed, unmerged PR on the run branch before reopening the same PR.
 
 ### Google Cloud releases
@@ -89,13 +147,15 @@ Choose **Review Cloud Run release** and supply the project ID, region, an existi
 
 The deploying account typically needs Cloud Run Developer, Service Account User on the service’s runtime identity, and Artifact Registry Reader on the image repository. Sign in with `gcloud auth login` and use a configuration with the intended account. After **Approve and create revision**, Shipyard updates the existing service with `--no-traffic` and records the ready revision after checking its traffic. Rollouts and rollbacks are managed separately in Cloud Run. [Cloud Run deployment permissions](https://docs.cloud.google.com/run/docs/deploying#required-roles) · [Cloud Run service update options](https://docs.cloud.google.com/sdk/gcloud/reference/run/services/update)
 
-**Needs you** shows a request for each explicit reference URL that needs approval or browser help. Approve or skip each link separately. When a public check returns blocked or partial access, choose **Continue in Codex** or **Continue in Claude**. Send the prefilled task in the desktop app and approve its browser prompts there. If you are already in an interactive session with the appropriate tools, use **Copy task** and send it in that session. Shipyard’s Codex skill and Claude plugin both describe the handoff.
+Agent feedback and checkpoint answers apply to code revisions. Shipyard deployment actions require dedicated dashboard approval. Firebase deployment supports one existing static site with an explicit ID and project. Sites that use build hooks, multiple Hosting configurations, or service rewrites can use their existing release workflow. Git pushes and pull requests can trigger automation on the destination, including deployments.
+
+Shipyard reads public GitHub and LinkedIn links in requests automatically. When a public check returns blocked or partial access and browser help is enabled, **Needs you** offers **Continue in Codex** or **Continue in Claude** for an interactive session. Send the prefilled task in the desktop app and review its browser prompts there. In an existing interactive session with the appropriate tools, use **Copy task**. Shipyard’s Codex skill and Claude plugin both describe the handoff.
 
 The interactive session returns draft notes and coverage to the dashboard. Select **Use reviewed text** to share your edited notes with the crew. You can answer requests in any order, and the crew starts once all pending reference requests are answered. **Cancel handoff** revokes the return code for that link. You can stop the browser task in its provider session. A return code expires after two hours or when the dashboard restarts, and a provider switch creates a fresh handoff. You can also paste notes into the review form.
 
 Attach files and images when you start a run, send feedback, steer or switch an active run, answer an inbox question or permission prompt, or share reviewed reference notes. Each submission supports up to six files, 3 MB each and 8 MB total. Shipyard saves attachments with run history outside the Git worktree. Files sent with an inbox question or permission answer are available to the agent that asked.
 
-From a completed result, choose **Give feedback** and select Claude or Codex. Include GitHub and LinkedIn URLs directly in the feedback. Shipyard reads what it can through public access and puts browser handoffs in **Needs you** before the revision starts. The run handoff keeps incomplete or blocked references visible under **Pending**, with a browser retry for approved links. The revision can reuse reviewed notes from the completed run. Shipyard bases the revision on that branch’s latest commit. A read-only orchestrator assigns work to the specialists it needs, and the dashboard shows each assignment in order. Shipyard runs the project’s configured checks after each specialist.
+From a completed result, choose **Request code changes** and select Claude or Codex. Include GitHub and LinkedIn URLs directly in the feedback. Shipyard reads what it can through public access and puts browser handoffs in **Needs you** before the revision starts. The run handoff keeps incomplete or blocked references visible under **Pending**, with a browser retry for approved links. The revision can reuse reviewed notes from the completed run. Shipyard bases the revision on that branch’s latest commit. A read-only orchestrator assigns work to the specialists it needs, and the dashboard shows each assignment in order. Shipyard runs the project’s configured checks after each specialist.
 
 **BE-FE** implements features and bug fixes started from the dashboard. Add the **UI/UX specialist** to refine the interface after implementation. From the CLI, add `design` to `--crew` or use `--implementer=ui-ux` for design-led work.
 

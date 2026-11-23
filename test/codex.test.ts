@@ -100,7 +100,8 @@ test("Codex reads JSONL events and final structured output, and resumes with the
   assert.ok(args.includes('model_reasoning_effort="xhigh"'));
   assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
   assert.ok(args.includes('approval_policy="never"'));
-  assert.ok(args.includes('web_search="disabled"'));
+  assert.ok(args.includes('web_search="live"'));
+  assert.ok(args.includes('mcp_servers.shipyard_browser.enabled_tools=["read_public_page"]'));
   assert.ok(args.includes("--ignore-user-config"));
   assert.ok(prompt.startsWith(role.prompt));
   assert.match(prompt, /Address feedback/);
