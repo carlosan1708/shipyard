@@ -47,6 +47,8 @@ The optional `install` command has outbound network access and runs before each 
 
 To try the scripted demo with Docker, run `npm run shipyard -- ui --demo --docker-checks`. It uses the `demo-shop` image from your configuration when present and defaults to `node:22-bookworm-slim`. The demo has zero package dependencies and uses scripted agents.
 
+Run `npm run test:docker` to verify the integration with a real Docker engine and Playwright Chromium. The tests exercise an uncommitted failure and its fix, then stop a run from chat and verify Docker removed its container. GitHub Actions runs the same command on pull requests and pushes to `main`.
+
 ## Targets
 
 The dashboard's **New run → Add repo** flow checks that the folder is a Git repository with commits and suggests non-interactive test commands. You can also register a target in the YAML file:

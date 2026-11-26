@@ -11,6 +11,7 @@
     "shipyard": "tsx src/cli.ts",
     "test": "node --import tsx --test \"test/**/*.test.ts\"",
     "test:e2e": "playwright test",
+    "test:docker": "playwright test --config playwright.docker.config.ts",
     "typecheck": "tsc --noEmit",
     "eval:validate": "tsx src/cli.ts eval --validate",
     "demo:init": "tsx src/cli.ts demo-init",
