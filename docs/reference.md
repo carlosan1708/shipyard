@@ -49,6 +49,14 @@ To try the scripted demo with Docker, run `npm run shipyard -- ui --demo --docke
 
 Run `npm run test:docker` to verify the integration with a real Docker engine and Playwright Chromium. The tests exercise an uncommitted failure and its fix, then stop a run from chat and verify Docker removed its container. GitHub Actions runs the same command on pull requests and pushes to `main`.
 
+For a project's own Chromium tests, build the example image from the Shipyard checkout and set its tag as the target's `checksDocker.image`.
+
+```sh
+docker build -f examples/docker/node-chromium.Dockerfile -t localhost/shipyard-node-chromium:22 examples/docker
+```
+
+The image sets `CHROME_PATH` to a Chromium launcher for Shipyard's isolated check containers.
+
 ## Targets
 
 The dashboard's **New run → Add repo** flow checks that the folder is a Git repository with commits and suggests non-interactive test commands. You can also register a target in the YAML file:
