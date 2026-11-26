@@ -50,6 +50,7 @@ export function parseFeedbackAttachments(value: unknown): Array<{ name: string; 
     }
     if (data.length > Math.ceil(MAX_FILE_BYTES / 3) * 4) throw new Error("Each attachment must be 3 MB or smaller.");
     const bytes = Buffer.from(data, "base64");
+    if (bytes.length > MAX_FILE_BYTES) throw new Error("Each attachment must be 3 MB or smaller.");
     total += bytes.length;
     if (total > MAX_FEEDBACK_BYTES) throw new Error("Attachments must be 8 MB or smaller in total.");
     return { name, bytes };

@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import YAML from "yaml";
 import { expandPath, type Target } from "./config.ts";
@@ -109,7 +109,7 @@ export async function inspectRepo(input: string, baseDir: string, targets: Recor
   const warnings: string[] = [];
   let path = expandPath(input.trim(), baseDir);
   // Compare real paths: on macOS /var is /private/var, and git always reports the real one.
-  const sameRepo = (t: Target) => realPath(t.path) === realPath(path);
+  const sameRepo = (t: Target) => pathKey(realPath(t.path)) === pathKey(realPath(path));
   const result = (): RepoInspection => {
     const existing = Object.values(targets).find(sameRepo);
     return {
@@ -145,7 +145,7 @@ export async function inspectRepo(input: string, baseDir: string, targets: Recor
     errors.push("This folder is not a git repository. Shipyard works on branches, so run `git init` and commit first.");
     return result();
   }
-  if (root !== realPath(path)) warnings.push(`Using the repository root, ${displayPath(root)}, which contains this folder.`);
+  if (pathKey(root) !== pathKey(realPath(path))) warnings.push(`Using the repository root, ${displayPath(root)}, which contains this folder.`);
   path = root;
 
   try {
@@ -219,9 +219,14 @@ function realPath(p: string): string {
   }
 }
 
+function pathKey(path: string): string {
+  const absolute = resolve(path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
+
 /** Git repositories one level inside the usual project folders, for the "Your repos" list. */
 export function findLocalRepos(roots: string[], exclude: string[]): Array<{ name: string; path: string; displayPath: string }> {
-  const seen = new Set(exclude);
+  const seen = new Set(exclude.map((path) => pathKey(realPath(path))));
   const repos: Array<{ name: string; path: string; displayPath: string; mtime: number }> = [];
   for (const root of [...new Set(roots)]) {
     let entries: string[];
@@ -233,11 +238,12 @@ export function findLocalRepos(roots: string[], exclude: string[]): Array<{ name
     for (const entry of entries) {
       if (entry.startsWith(".")) continue;
       const dir = join(root, entry);
-      if (seen.has(dir)) continue;
       try {
-        if (!statSync(dir).isDirectory() || !existsSync(join(dir, ".git"))) continue;
-        seen.add(dir);
-        repos.push({ name: entry, path: dir, displayPath: displayPath(dir), mtime: statSync(join(dir, ".git")).mtimeMs });
+        const gitDir = statSync(join(dir, ".git"));
+        const key = pathKey(realPath(dir));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        repos.push({ name: entry, path: dir, displayPath: displayPath(dir), mtime: gitDir.mtimeMs });
       } catch {
         // unreadable folder: skip
       }

@@ -16,7 +16,13 @@ const BROWSERS = [
   "/usr/bin/chromium-browser",
 ];
 
-function findChrome(): string | undefined { return BROWSERS.find(existsSync); }
+function findChrome(): string | undefined {
+  const windows = process.platform === "win32"
+    ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA]
+      .filter((root): root is string => Boolean(root)).map((root) => join(root, "Google", "Chrome", "Application", "chrome.exe"))
+    : [];
+  return [...BROWSERS, ...windows].find(existsSync);
+}
 
 export interface BrowserInspection {
   viewport: "desktop" | "phone";
@@ -65,7 +71,7 @@ async function renderPreview(executable: string, url: string, output: string[], 
     "--disable-quic", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
     `--proxy-server=http://${localAddress}`, `--proxy-bypass-list=<-loopback>;${localAddress}`,
     "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank",
-  ], { stdio: "ignore", detached: true });
+  ], { stdio: "ignore", detached: process.platform !== "win32", windowsHide: true });
   let exited = false;
   const closed = new Promise<void>((resolve) => chrome.once("close", () => { exited = true; resolve(); }));
   chrome.on("error", () => { exited = true; });

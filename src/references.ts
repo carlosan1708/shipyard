@@ -174,7 +174,7 @@ async function readLinkedIn(url: URL, signal: AbortSignal): Promise<Omit<Referen
   };
 }
 
-async function boundedText(response: Response, limit: number): Promise<string> {
+export async function boundedText(response: Response, limit: number): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   const decoder = new TextDecoder();

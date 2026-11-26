@@ -1,15 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parseConfig } from "../src/config.ts";
 import { applyEdits, formatReport, loadTasks } from "../src/eval.ts";
 import { loadRoles, parseRole } from "../src/roles.ts";
 import { tempDir, writeFiles } from "./helpers.ts";
 
 test("config resolves relative and home paths and applies defaults", () => {
-  const config = parseConfig({ targets: { a: { path: "./repo", test: "npm test" }, b: { path: "~/code/b", test: "make test", e2e: "make e2e" } } }, "/base");
-  assert.equal(config.targets.a!.path, "/base/repo");
+  const base = resolve("/base");
+  const config = parseConfig({ targets: { a: { path: "./repo", test: "npm test" }, b: { path: "~/code/b", test: "make test", e2e: "make e2e" } } }, base);
+  assert.equal(config.targets.a!.path, join(base, "repo"));
   assert.equal(config.targets.a!.e2e, undefined);
   assert.equal(config.targets.b!.path, join(homedir(), "code/b"));
   assert.equal(config.model, "claude-opus-5-5");
@@ -31,7 +32,8 @@ test("config rejects bad values", () => {
 
 test("the shipped roles load from the plugin's agent files", () => {
   const roles = loadRoles();
-  assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "google-cloud-releaser", "local-app", "orchestrator", "planner", "release-manager", "reviewer", "security-auditor", "ui-ux"]);
+  assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "chat-advisor", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "google-cloud-releaser", "local-app", "orchestrator", "planner", "release-manager", "reviewer", "security-auditor", "ui-ux"]);
+  assert.deepEqual(roles.get("chat-advisor")?.tools, []);
   // Read-only roles get no editing tools at all; the lane and post-stage revert back that up.
   for (const name of ["local-app", "orchestrator", "planner", "reviewer", "security-auditor"]) assert.ok(!roles.get(name)!.tools.some((t) => ["Edit", "Write"].includes(t)), name);
   const backend = roles.get("backend")!;

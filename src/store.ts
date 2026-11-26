@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TokenUsage } from "./agent.ts";
 import type { FeedbackAttachment } from "./attachments.ts";
@@ -117,6 +117,7 @@ export const canRepairRevisionRole = (role: string): boolean => ["frontend", "ui
 export interface StageRecord {
   name: string;
   role: string;
+  parallel?: boolean;
   repairRole?: string;
   autoRepair?: { command: string; afterAttempt: number };
   status: "running" | "passed" | "failed" | "stopped";
@@ -163,6 +164,7 @@ export interface RunRecord {
   effort?: RunEffort;
   /** The optional stages switched on for this run (implement always runs). */
   crew?: string[];
+  parallelReviews?: boolean;
   /** The role that implemented the request. */
   implementer?: string;
   /** Estimated cost limit for the whole run. Stages stop starting once it is spent. */
@@ -185,6 +187,50 @@ export interface RunRecord {
   references?: ReferenceCheck[];
 }
 
+function lockOwner(path: string): string | undefined {
+  try {
+    // Older builds recorded the PID as a symlink target.
+    return lstatSync(path).isSymbolicLink() ? readlinkSync(path) : readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+function claimLock(path: string, candidate: string, owner: string, lockDir: string): (() => void) | undefined {
+  const tryClaim = () => {
+    try {
+      // Publish a fully written owner atomically, with no Windows symlink privilege required.
+      linkSync(candidate, path);
+      return () => { if (lockOwner(path) === owner) rmSync(path, { force: true }); };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  };
+  const acquired = tryClaim();
+  if (acquired) return acquired;
+  const previous = lockOwner(path);
+  if (previous === undefined) return tryClaim();
+  const pid = Number(/^(\d+)(?::[\da-f-]+)?$/i.exec(previous)?.[1]);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, 0);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EPERM") return;
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+  // Give this stale generation one reaper, so competing callers cannot unlink a newer claim.
+  const recovery = join(lockDir, `.recovery-${createHash("sha256").update(`${path}\0${previous}`).digest("hex")}`);
+  const releaseRecovery = claimLock(recovery, candidate, owner, lockDir);
+  if (!releaseRecovery) return;
+  try {
+    if (lockOwner(path) === previous) rmSync(path, { force: true });
+    return tryClaim();
+  } finally {
+    releaseRecovery();
+  }
+}
+
 /** File-backed run history: `<runsDir>/<runId>/run.json` plus an append-only `events.jsonl`. */
 export class RunStore {
   constructor(readonly runsDir: string) {}
@@ -194,29 +240,19 @@ export class RunStore {
   }
 
   /** Reserve a branch while starting a revision, including across dashboard processes. */
-  claimBranch(run: RunRecord): (() => void) | undefined {
+  claimBranch(run: Pick<RunRecord, "repo" | "branch">): (() => void) | undefined {
     const lockDir = join(this.runsDir, ".branch-locks");
     mkdirSync(lockDir, { recursive: true });
     const key = createHash("sha256").update(`${run.repo}\0${run.branch}`).digest("hex");
     const lock = join(lockDir, key);
-    const owner = String(process.pid);
+    const token = randomUUID();
+    const owner = `${process.pid}:${token}`;
+    const candidate = join(lockDir, `.candidate-${token}`);
+    writeFileSync(candidate, owner, { flag: "wx", mode: 0o600 });
     try {
-      const previous = readlinkSync(lock);
-      try {
-        process.kill(Number(previous), 0);
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-      }
-      if (readlinkSync(lock) === previous) rmSync(lock, { force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    try {
-      symlinkSync(owner, lock);
-      return () => rmSync(lock, { force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return claimLock(lock, candidate, owner, lockDir);
+    } finally {
+      rmSync(candidate, { force: true });
     }
   }
 

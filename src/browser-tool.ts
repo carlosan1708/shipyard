@@ -47,16 +47,18 @@ const GITHUB_ORIGIN: Tool = {
   annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
 };
 
-export async function startAgentWebTools(worktree: string, browserAccess: boolean, signal?: AbortSignal, onInspection?: (detail: string) => void) {
-  const origin = await githubOrigin(worktree);
-  const tools = [PUBLIC_PAGE, ...(origin ? [GITHUB_ORIGIN] : []), ...(browserAccess ? [PREVIEW] : [])];
+export async function startAgentWebTools(worktree: string | undefined, browserAccess: boolean, signal?: AbortSignal,
+  onInspection?: (detail: string) => void, onPublicPage?: (url: string) => void) {
+  const origin = worktree ? await githubOrigin(worktree) : undefined;
+  const tools = [PUBLIC_PAGE, ...(origin ? [GITHUB_ORIGIN] : []), ...(browserAccess && worktree ? [PREVIEW] : [])];
   return startPrivateTools(tools, signal, async (name, args, stop) => {
     if (name === PUBLIC_WEB_TOOL) {
       if (typeof args.url !== "string" || args.url.length > 2048 || Object.keys(args).length !== 1) return refusal("Supply just the public URL to read.");
       const { url, text } = await readPublicPage(args.url, stop);
+      onPublicPage?.(url);
       return { content: [{ type: "text", text: `Source: ${url}\n\n${text || "The page returned no readable text."}` }] };
     }
-    if (name === GITHUB_ORIGIN_TOOL && origin) {
+    if (name === GITHUB_ORIGIN_TOOL && origin && worktree) {
       const { branch, path } = args;
       const safePath = (value: unknown, limit: number) => typeof value === "string" && value.length <= limit &&
         !/[\u0000-\u001f\u007f\\]/.test(value) && value.split("/").every((part) => part && part !== "." && part !== "..");
@@ -67,7 +69,7 @@ export async function startAgentWebTools(worktree: string, browserAccess: boolea
       return { content: [{ type: "text", text }] };
     }
     const { viewport, activate } = args;
-    if ((viewport !== "desktop" && viewport !== "phone") ||
+    if (!worktree || (viewport !== "desktop" && viewport !== "phone") ||
       (activate !== undefined && (typeof activate !== "string" || !activate.trim() || activate.length > 140)) ||
       Object.keys(args).some((key) => key !== "viewport" && key !== "activate")) {
       return refusal("Choose desktop or phone and optionally supply one visible control label.");

@@ -1,14 +1,12 @@
 import { realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { git, sh } from "./exec.ts";
+import { checkExecutable, git } from "./exec.ts";
 import { isTestPath } from "./guards.ts";
 import { isTriageReport } from "./prompts.ts";
 import type { BugVerification, RegressionObservation, RunRecord } from "./store.ts";
 import { detachedWorktree } from "./worktree.ts";
 
-const reporter = fileURLToPath(new URL("./regression-reporter.mjs", import.meta.url));
-const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+const reporter = new URL("./regression-reporter.mjs", import.meta.url).href;
 
 interface TestEvent {
   name: string;
@@ -72,7 +70,7 @@ export async function verifyBugFix(run: RunRecord, head: string, root: string, t
       evidence.gap = "The final commit does not contain the named regression test file.";
       return evidence;
     }
-    const command = `${quote(process.execPath)} --test --test-reporter=${quote(reporter)} -- ${quote(`./${testFile}`)}`;
+    const args = ["--test", `--test-reporter=${reporter}`, "--", `./${testFile}`];
     let baselineTestBlob: string | undefined;
     const observe = async (commit: string, baseline: boolean): Promise<RegressionObservation> => {
       signal?.throwIfAborted();
@@ -85,7 +83,7 @@ export async function verifyBugFix(run: RunRecord, head: string, root: string, t
         const testBlob = () => git(["hash-object", "--no-filters", "--", testFile], scratch.worktree);
         const startingBlob = await testBlob();
         if (baseline) baselineTestBlob = startingBlob;
-        const result = await sh(command, scratch.worktree, timeoutMs, signal);
+        const result = await checkExecutable(process.execPath, args, scratch.worktree, timeoutMs, signal);
         const measurement = { exitCode: result.code, durationMs: result.durationMs };
         const inconclusive = (detail: string): RegressionObservation => ({ ...measurement, outcome: "inconclusive", detail });
         if (result.timedOut || signal?.aborted) return inconclusive(result.timedOut ? "The test command timed out." : "Verification was interrupted.");

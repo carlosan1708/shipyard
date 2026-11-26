@@ -7,7 +7,7 @@ export interface RunDirective {
 
 /** Coordinates interruptions with the pipeline. Each attempt owns its process and inbox requests. */
 export class RunControl {
-  private attempt?: AbortController;
+  private readonly attempts = new Map<string, AbortController>();
   private pending?: RunDirective;
   readonly instructions: string[] = [];
   readonly attachments: FeedbackAttachment[] = [];
@@ -16,16 +16,17 @@ export class RunControl {
   stopped = false;
   get requestedProvider(): Provider | undefined { return this.pending?.provider; }
 
-  beginAttempt(): AbortSignal {
-    this.attempt = new AbortController();
-    if (this.stopped) this.attempt.abort();
-    return this.attempt.signal;
+  beginAttempt(scope = "run"): AbortSignal {
+    const attempt = new AbortController();
+    this.attempts.set(scope, attempt);
+    if (this.stopped) attempt.abort();
+    return attempt.signal;
   }
 
   stop(): void {
     this.stopped = true;
     this.stoppedSignal.abort();
-    this.attempt?.abort();
+    for (const attempt of this.attempts.values()) attempt.abort();
   }
 
   redirect(provider: Provider | undefined, message: string, attachments: FeedbackAttachment[] = []): void {
@@ -33,7 +34,7 @@ export class RunControl {
     if (provider) this.pending.provider = provider;
     if (message) this.instructions.push(message);
     this.attachments.push(...attachments);
-    this.attempt?.abort();
+    for (const attempt of this.attempts.values()) attempt.abort();
   }
 
   takeDirective(): RunDirective | undefined {

@@ -106,17 +106,23 @@ export class CodexAgentRunner implements AgentRunner {
     let browser: Awaited<ReturnType<typeof startAgentWebTools>> | undefined;
     try {
       const cwd = realpathSync(req.cwd);
-      const head = await git(["rev-parse", "HEAD"], cwd);
-      const branch = await git(["symbolic-ref", "HEAD"], cwd);
+      const head = req.advisoryOnly ? undefined : await git(["rev-parse", "HEAD"], cwd);
+      const branch = req.advisoryOnly ? undefined : await git(["symbolic-ref", "HEAD"], cwd).catch((error) => {
+        if (req.lane === "none") return ""; // Detached snapshots used by independent read-only reviews.
+        throw error;
+      });
       scratch = mkdtempSync(join(tmpdir(), "shipyard-codex-"));
       const output = join(scratch, "final.txt");
       const config = (name: string, value: unknown) => ["-c", `${name}=${JSON.stringify(value)}`];
-      browser = await startAgentWebTools(cwd, Boolean(req.browserAccess), req.signal,
-        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }));
+      browser = await startAgentWebTools(req.advisoryOnly ? undefined : cwd, Boolean(req.browserAccess), req.signal,
+        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }),
+        (url) => req.onEvent?.({ type: "tool", tool: "WebRead", detail: url }));
       const args = [
         "exec",
         ...config("approval_policy", "never"),
-        ...config("sandbox_mode", req.lane === "none" ? "read-only" : "workspace-write"),
+        "--sandbox", req.advisoryOnly || req.lane === "none" ? "read-only" : "workspace-write",
+        // --ignore-user-config also drops the Desktop Windows sandbox selection.
+        ...(process.platform === "win32" ? [...config("windows.sandbox", "elevated"), ...config("features.prefer_mxc", true)] : []),
         ...config("sandbox_workspace_write.network_access", false),
         ...config("sandbox_workspace_write.writable_roots", []),
         ...config("sandbox_workspace_write.exclude_slash_tmp", true),
@@ -127,6 +133,7 @@ export class CodexAgentRunner implements AgentRunner {
         ...config("features.plugins", false),
         ...config("features.multi_agent", false),
         ...config(`projects.${JSON.stringify(cwd)}.trust_level`, "untrusted"),
+        ...(req.advisoryOnly ? ["--skip-git-repo-check", ...config("features.shell_tool", false)] : []),
         ...config(`mcp_servers.${BROWSER_SERVER}.url`, browser.url),
         ...config(`mcp_servers.${BROWSER_SERVER}.bearer_token_env_var`, BROWSER_TOKEN_ENV),
         ...config(`mcp_servers.${BROWSER_SERVER}.enabled_tools`, browser.names),
@@ -152,7 +159,7 @@ export class CodexAgentRunner implements AgentRunner {
       delete env.CODEX_API_KEY; // Use credentials already saved by the CLI.
       delete env.OPENAI_API_KEY;
       delete env.SHIPYARD_ALLOW_PUBLISH;
-      env[BROWSER_TOKEN_ENV] = browser.token;
+      if (browser) env[BROWSER_TOKEN_ENV] = browser.token;
       req.signal?.throwIfAborted();
       if (this.stopped) throw new Error("Shipyard stopped the Codex runner");
       const child = spawn(this.executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -195,6 +202,12 @@ export class CodexAgentRunner implements AgentRunner {
         if (event?.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
           req.onEvent?.({ type: "text", text: item.text });
         }
+        if (event?.type === "item.completed" && item?.type === "web_search") {
+          const action = object(item.action);
+          if (typeof action?.url === "string" && (action.type === "open_page" || action.type === "find_in_page")) {
+            req.onEvent?.({ type: "tool", tool: "WebRead", detail: action.url });
+          } else req.onEvent?.({ type: "tool", tool: "WebSearch", detail: typeof item.query === "string" ? tail(item.query, 500) : "" });
+        }
         if (item && ((event?.type === "item.started" && item.type === "command_execution") || (event?.type === "item.completed" && item.type === "file_change"))) {
           const detail = typeof item.command === "string" ? item.command : (Array.isArray(item.changes)
             ? item.changes.map((change) => object(change)?.path).filter(Boolean).join(", ")
@@ -209,9 +222,9 @@ export class CodexAgentRunner implements AgentRunner {
         child.on("error", (err: NodeJS.ErrnoException) => { error = err; });
         child.once("close", (code) => resolve({ code, error }));
       });
-      child.stdin.end(
-        `${req.role.prompt}\n\nWork in this Shipyard worktree. Shipyard runs the configured gates separately, including local tests. Leave Git staging and commits to Shipyard. ${PUBLIC_WEB_NOTE} Report any proposed deployment or cloud resource change in the handoff for separate approval. Do not publish, deploy, or open a pull request.\n\n${req.prompt}`,
-      );
+      const worktreeInstructions = req.advisoryOnly ? "" :
+        `\n\nWork in this Shipyard worktree. Shipyard runs the configured gates separately, including local tests. Leave Git staging and commits to Shipyard. ${PUBLIC_WEB_NOTE} Report any proposed deployment or cloud resource change in the handoff for separate approval. Do not publish, deploy, or open a pull request.`;
+      child.stdin.end(`${req.role.prompt}${worktreeInstructions}\n\n${req.prompt}`);
 
       const exit = await exited.finally(() => {
         lines.close();
@@ -221,9 +234,11 @@ export class CodexAgentRunner implements AgentRunner {
       });
       if (exit.error?.code === "ENOENT") throw new Error("Codex CLI was not found on PATH. Install it and run codex login.");
       if (exit.error) throw exit.error;
-      const finalHead = await git(["rev-parse", "HEAD"], cwd);
-      const finalBranch = await git(["symbolic-ref", "HEAD"], cwd).catch(() => "");
-      if (head !== finalHead || branch !== finalBranch) throw new Error("Codex changed Git HEAD or the worktree branch. Review the preserved worktree.");
+      if (!req.advisoryOnly) {
+        const finalHead = await git(["rev-parse", "HEAD"], cwd);
+        const finalBranch = await git(["symbolic-ref", "HEAD"], cwd).catch(() => "");
+        if (head !== finalHead || branch !== finalBranch) throw new Error("Codex changed Git HEAD or the worktree branch. Review the preserved worktree.");
+      }
       req.signal?.throwIfAborted();
       if (this.stopped) throw new Error("Shipyard stopped the Codex runner");
       if (timedOut) throw new Error(`Codex attempt timed out after ${this.timeoutMs} ms`);

@@ -6,6 +6,8 @@ import { ATTACHMENT_REQUEST_LIMIT } from "../attachments.ts";
 import { dirname, join } from "node:path";
 import { CODEX_EFFORTS, EFFORTS, SHIPYARD_ROOT, type ShipyardConfig } from "../config.ts";
 import { IMPLEMENTERS, OPTIONAL_STAGES, STAGES } from "../pipeline.ts";
+import { CHAT_LIMIT, ChatProviderError } from "./chat.ts";
+import { CHAT_HISTORY_LIMIT, ChatHistoryInputError } from "./chat-history.ts";
 import { UserError, type InboxAnswer, type LiveMessage, type RunManager, type StartRequest } from "./manager.ts";
 
 export const UI_DIR = join(SHIPYARD_ROOT, "ui");
@@ -117,6 +119,7 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return json(res, 200, {
           config: { ...opts.config, demo: Boolean(opts.demo), canAddTargets: opts.manager.canAddTargets, canCloneTargets: opts.manager.canAddTargets },
           acceptsAttachments: true,
+          chatProviders: opts.manager.chatProviders(),
           feedbackReusesBranch: true,
           dashboardRevision: opts.revision,
           efforts: EFFORTS,
@@ -286,6 +289,32 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/api/chat/history") return json(res, 200, { chats: opts.manager.chatHistory.list() });
+
+      const chatMatch = url.pathname.match(/^\/api\/chat\/history\/([a-f0-9-]+)$/i);
+      if (chatMatch && req.method === "GET") {
+        const chat = opts.manager.chatHistory.get(chatMatch[1]!);
+        return chat ? json(res, 200, { chat }) : json(res, 404, { error: "Chat not found", code: "chat-not-found" });
+      }
+      if (chatMatch && req.method === "PATCH") {
+        const body = await readJson(req, CHAT_HISTORY_LIMIT);
+        return json(res, 200, { chat: opts.manager.chatHistory.save(chatMatch[1]!, body) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/chat/attachments") {
+        const body = await readJson(req, ATTACHMENT_REQUEST_LIMIT) as { attachments?: unknown } | null;
+        return json(res, 201, opts.manager.uploadChatAttachments(body?.attachments));
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/chat") {
+        const body = (await readJson(req, CHAT_LIMIT) ?? {}) as Parameters<RunManager["chat"]>[0];
+        const disconnected = new AbortController();
+        res.once("close", () => disconnected.abort());
+        const reply = await opts.manager.chat(body, disconnected.signal);
+        if (!disconnected.signal.aborted) return json(res, 200, reply);
+        return;
+      }
+
       if (req.method === "POST" && url.pathname === "/api/runs") {
         const body = (await readJson(req, ATTACHMENT_REQUEST_LIMIT)) as Partial<StartRequest>;
         const id = opts.manager.start({
@@ -293,6 +322,8 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
           kind: String(body.kind ?? "") as StartRequest["kind"], // validated by the manager
           request: String(body.request ?? ""),
           attachments: body.attachments,
+          chatAttachmentIds: body.chatAttachmentIds,
+          parallelReviews: body.parallelReviews,
           checkpoints: (Array.isArray(body.checkpoints) ? body.checkpoints.map(String) : []) as StartRequest["checkpoints"],
           // Validated by the manager.
           provider: body.provider === undefined ? undefined : String(body.provider),
@@ -341,6 +372,9 @@ export async function startUiServer(opts: UiServerOptions): Promise<UiServer> {
 
       return json(res, 404, { error: "Not found" });
     } catch (err) {
+      if (res.destroyed) return;
+      if (err instanceof ChatProviderError) return json(res, err.status, { error: err.message, code: err.code });
+      if (err instanceof ChatHistoryInputError) return json(res, 400, { error: err.message });
       if (err instanceof UserError) return json(res, 400, { error: err.message });
       console.error(err);
       return json(res, 500, { error: "Internal error" });

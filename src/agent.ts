@@ -5,7 +5,7 @@ import { agentEnv, type AuthMode } from "./auth.ts";
 import { checkToolUse, type Lane } from "./guards.ts";
 import { EFFORTS, type RunEffort } from "./config.ts";
 import type { Role } from "./roles.ts";
-import { BROWSER_SERVER, PUBLIC_WEB_NOTE, startAgentWebTools } from "./browser-tool.ts";
+import { BROWSER_SERVER, PUBLIC_WEB_NOTE, PUBLIC_WEB_TOOL, startAgentWebTools } from "./browser-tool.ts";
 
 export type AgentEvent =
   | { type: "session"; sessionId: string }
@@ -39,6 +39,8 @@ export interface AgentRequest {
   cwd: string;
   lane: Lane;
   signal?: AbortSignal;
+  /** Advisory chat can research public sources and use supplied context. */
+  advisoryOnly?: boolean;
   /** The user grants read-only inspection of this worktree’s static preview. */
   browserAccess?: boolean;
   /** Continue an earlier session of the same role (keeps its context, avoids re-reading the repo). */
@@ -146,7 +148,9 @@ export class ClaudeAgentRunner implements AgentRunner {
     // Enforced in-process for every tool call: publish guard, worktree boundary, role lane.
     const guard: HookCallback = async (input) => {
       if (input.hook_event_name !== "PreToolUse") return {};
-      const verdict = checkToolUse(input.tool_name, input.tool_input, { root: req.cwd, lane: req.lane });
+      const verdict = req.advisoryOnly ? { allowed: input.tool_name === "WebSearch" || input.tool_name === `mcp__${BROWSER_SERVER}__${PUBLIC_WEB_TOOL}`,
+        reason: "Chat tools are limited to public web research" } :
+        checkToolUse(input.tool_name, input.tool_input, { root: req.cwd, lane: req.lane });
       if (verdict.allowed) return {};
       req.onEvent?.({ type: "denied", tool: input.tool_name, reason: verdict.reason });
       return {
@@ -160,8 +164,8 @@ export class ClaudeAgentRunner implements AgentRunner {
 
     // With a human available, the agent also gets AskUserQuestion and the ask-only tools; every
     // call outside the role's allowlist goes to the human. Headless, the role's tools are all it has.
-    const ask = req.ask;
-    const allowedTools = [...new Set([...req.role.tools, "WebSearch"])];
+    const ask = req.advisoryOnly ? undefined : req.ask;
+    const allowedTools = req.advisoryOnly ? ["WebSearch"] : [...new Set([...req.role.tools, "WebSearch"])];
     const askTools = (this.opts.askTools ?? []).filter((tool) => tool !== "WebFetch" && tool !== "WebSearch");
     const tools = ask ? [...new Set([...allowedTools, "AskUserQuestion", ...askTools])] : allowedTools;
     const toolNotes = new Map<string, string>();
@@ -192,8 +196,9 @@ export class ClaudeAgentRunner implements AgentRunner {
     let browser: Awaited<ReturnType<typeof startAgentWebTools>> | undefined;
     try {
       req.signal?.throwIfAborted();
-      browser = await startAgentWebTools(req.cwd, Boolean(req.browserAccess), controller.signal,
-        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }));
+      browser = await startAgentWebTools(req.advisoryOnly ? undefined : req.cwd, Boolean(req.browserAccess), controller.signal,
+        (detail) => req.onEvent?.({ type: "tool", tool: "Browser", detail }),
+        (url) => req.onEvent?.({ type: "tool", tool: "WebRead", detail: url }));
       const session = query({
         prompt: req.images?.length ? imagePrompt(req) : req.prompt,
         options: {
@@ -203,25 +208,26 @@ export class ClaudeAgentRunner implements AgentRunner {
           model: req.model ?? req.role.model ?? this.opts.model,
           effort: EFFORTS.find((effort) => effort === req.effort) ?? this.opts.effort,
           // Keep Claude Code's own coding prompt and add the role on top.
-          systemPrompt: { type: "preset", preset: "claude_code", append: `${req.role.prompt}\n\nRead and follow the target repository’s project instructions. ${PUBLIC_WEB_NOTE} Report any proposed deployment or cloud resource change in the handoff for separate approval.` },
+          systemPrompt: req.advisoryOnly ? req.role.prompt :
+            { type: "preset", preset: "claude_code", append: `${req.role.prompt}\n\nRead and follow the target repository’s project instructions. ${PUBLIC_WEB_NOTE} Report any proposed deployment or cloud resource change in the handoff for separate approval.` },
           // The role's tools run without prompting. Anything else is denied headless, or asked of the human.
           tools,
-          allowedTools: [...allowedTools, ...browser.names.map((name) => `mcp__${BROWSER_SERVER}__${name}`)],
+          allowedTools: [...allowedTools, ...(browser?.names ?? []).map((name) => `mcp__${BROWSER_SERVER}__${name}`)],
           mcpServersDelivery: "initialize",
-          mcpServers: { [BROWSER_SERVER]: { type: "http", url: browser.url, headers: { Authorization: `Bearer ${browser.token}` }, alwaysLoad: true } },
+          mcpServers: browser ? { [BROWSER_SERVER]: { type: "http", url: browser.url, headers: { Authorization: `Bearer ${browser.token}` }, alwaysLoad: true } } : {},
           permissionMode: ask ? "default" : "dontAsk",
           canUseTool,
           // Repo settings can register hooks that execute outside the Bash sandbox.
           settingSources: [],
           strictMcpConfig: true,
-          sandbox: {
+          sandbox: req.advisoryOnly ? undefined : {
             enabled: true,
             failIfUnavailable: true,
             allowUnsandboxedCommands: false,
             network: { strictAllowlist: true, allowedDomains: [] },
           },
           maxBudgetUsd: Math.min(this.opts.maxBudgetUsd, req.maxBudgetUsd ?? Infinity),
-          maxTurns: this.opts.maxTurns,
+          maxTurns: req.advisoryOnly ? Math.min(this.opts.maxTurns, 12) : this.opts.maxTurns,
           resume: req.resumeSessionId,
           hooks: {
             PreToolUse: [{ hooks: [guard] }],
@@ -275,6 +281,7 @@ export class ClaudeAgentRunner implements AgentRunner {
     for (const block of message.message.content) {
       if (block.type === "text" && block.text.trim()) req.onEvent({ type: "text", text: block.text });
       if (block.type === "tool_use") req.onEvent({ type: "tool", tool: block.name, detail: describeToolInput(block.input) });
+      if (block.type === "server_tool_use" && block.name === "web_search") req.onEvent({ type: "tool", tool: "WebSearch", detail: describeToolInput(block.input) });
     }
   }
 }

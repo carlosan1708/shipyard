@@ -7,7 +7,8 @@ import { checkToolUse, inLane } from "../src/guards.ts";
 import { runPipeline, type PipelineDeps } from "../src/pipeline.ts";
 import { loadRoles } from "../src/roles.ts";
 import { RunControl } from "../src/run-control.ts";
-import { RunStore } from "../src/store.ts";
+import { RunStore, type RunRecord } from "../src/store.ts";
+import { createWorktree, repoRoot } from "../src/worktree.ts";
 import type { Target } from "../src/config.ts";
 import { FakeRunner, makeTargetRepo, tempDir, UNIT_TEST, writeFiles, type Step } from "./helpers.ts";
 
@@ -28,6 +29,53 @@ const fix: Step = (req) => writeFiles(req.cwd, { "src/add.js": "export const add
 const e2e: Step = (req) =>
   writeFiles(req.cwd, { "e2e/add.e2e.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("e2e", () => assert.equal(add(2, 2), 4));\n' });
 const approve = { verdict: "approve", summary: "Small, correct change.", findings: [{ severity: "nit", file: "src/add.js", line: 1, issue: "Number() twice reads a bit noisy." }] };
+
+test("parallel reviews overlap in isolated snapshots for both providers", { timeout: 12_000 }, async () => {
+  for (const provider of ["claude", "codex"] as const) {
+    const entered = new Set<string>();
+    let releaseReviews!: () => void;
+    const together = new Promise<void>((resolve) => { releaseReviews = resolve; });
+    let reviewHead = "";
+    const enteredReview: Step = async (req) => {
+      entered.add(req.cwd);
+      if (entered.size === 2) releaseReviews();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([together, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Reviews did not overlap")), 2_000); })]);
+      } finally { clearTimeout(timer); }
+      assert.equal(await git(["rev-parse", "HEAD"], req.cwd), reviewHead);
+      assert.equal(req.lane, "none");
+      if (provider === "claude") assert.ok(Math.abs(req.maxBudgetUsd! - 0.35) < 1e-9);
+      if (req.role.name === "reviewer") {
+        writeFiles(req.cwd, { "scratch.txt": "This file stays in its review snapshot." });
+        return { structured: approve };
+      }
+      assert.equal(req.role.name, "security-auditor");
+      assert.equal(existsSync(join(req.cwd, "scratch.txt")), false);
+      return { structured: { verdict: "pass", summary: "No findings.", findings: [] } };
+    };
+    const { deps, target, runner } = await setup([enteredReview, enteredReview]);
+    const repo = await repoRoot(target.path);
+    const worktree = join(deps.config.worktreeRoot, "main");
+    const branch = "shipyard/parallel-test";
+    reviewHead = await createWorktree(repo, worktree, branch);
+    deps.control = new RunControl();
+    const saved: RunRecord = { id: "parallel-test", target: target.name, request: "Review the implementation", kind: "feature", status: "stopped", tags: [],
+      createdAt: new Date().toISOString(), repo, branch, worktree, baseSha: reviewHead, provider, budgetUsd: provider === "claude" ? 0.8 : undefined,
+      crew: ["review", "security"], parallelReviews: true,
+      stages: [{ name: "implement", role: "backend", status: "passed", commit: reviewHead, finalized: true,
+        attempts: [{ attempt: 1, agentOk: true, provider, costUsd: provider === "claude" ? 0.1 : null, turns: 1, durationMs: 1, summary: "Implemented.", gates: [], passed: true }] }],
+      totals: { costUsd: 0.1, turns: 1, attempts: 1, durationMs: 1, reviewWaitMs: 0 },
+    };
+    const run = await runPipeline({ target, kind: "feature", request: saved.request, crew: ["review", "security"], resume: saved }, deps);
+    assert.equal(run.status, "passed", run.error ?? "The reviews did not finish successfully");
+    assert.deepEqual(run.stages.filter((stage) => stage.parallel).map(({ name }) => name), ["review", "security"]);
+    assert.equal(runner.calls.length, 2);
+    assert.ok([...entered].every((path) => path !== worktree && !existsSync(path)));
+    assert.equal(existsSync(join(worktree, "scratch.txt")), false);
+    assert.deepEqual(run.stages[1]?.attempts[0]?.revertedFiles, ["scratch.txt"]);
+  }
+});
 
 test("either provider can prepare a Google Cloud release without committing changes", async () => {
   for (const provider of ["claude", "codex"] as const) {

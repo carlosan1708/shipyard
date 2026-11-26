@@ -20,15 +20,23 @@
       <div class="topbar-meta" id="meta"></div>
       <div class="topbar-actions">
         <span class="conn" id="conn" role="status"><span class="conn-dot"></span><span class="conn-label">Connecting</span></span>
-        <button type="button" class="btn btn-ghost inbox-toggle" id="inbox-toggle" aria-controls="inbox" aria-expanded="false">
-          Needs you <span class="count" id="inbox-toggle-count">0</span>
+        <button type="button" class="btn btn-ghost inbox-toggle" id="inbox-toggle" aria-controls="inbox" aria-expanded="false" aria-label="Inbox">
+          Inbox <span class="count" id="inbox-toggle-count" aria-hidden="true" hidden></span>
         </button>
-        <button type="button" class="btn btn-primary" id="new-run">New run</button>
+        <button type="button" class="btn btn-ghost" id="show-chat">Chat</button>
+        <button type="button" class="btn" id="new-run">New run</button>
       </div>
     </header>
 
     <div class="layout">
       <aside class="col runs-col" aria-label="Runs">
+        <section class="chat-history" aria-labelledby="chat-history-title">
+          <div class="col-head">
+            <h2 id="chat-history-title">Chats</h2>
+          </div>
+          <ul class="chat-history-list" id="chat-history-list"></ul>
+          <p class="list-empty" id="chat-history-status" role="status">Loading chats…</p>
+        </section>
         <div class="runs-header">
           <div class="col-head">
             <h2>Runs</h2>
@@ -46,12 +54,62 @@
         <ul class="run-list" id="run-list"></ul>
       </aside>
 
-      <main class="col detail-col" id="detail" aria-live="off"></main>
+      <main class="col workspace-col">
+        <section class="chat" id="shipyard-chat" aria-labelledby="chat-title">
+          <header class="chat-heading">
+            <h1 id="chat-title">Shipyard chat</h1>
+            <div class="chat-heading-actions">
+              <details id="chat-work" class="chat-run-switcher" hidden>
+                <summary id="chat-work-label" class="btn btn-sm btn-ghost"></summary>
+                <ul id="chat-work-list"></ul>
+              </details>
+              <button type="button" class="btn btn-sm" id="chat-reset">New chat</button>
+            </div>
+          </header>
+          <aside id="chat-context" class="chat-context" aria-label="Run progress" hidden>
+            <div id="run-overview"></div>
+            <section class="detail-col" id="detail" aria-label="Run details" hidden></section>
+          </aside>
+          <div id="chat-thread" class="chat-thread" role="log" aria-label="Conversation" aria-live="polite">
+            <div id="chat-messages" class="chat-messages">
+              <section id="chat-run-update" class="chat-run-update" aria-label="Run update" hidden></section>
+            </div>
+            <section id="chat-decisions" class="chat-decisions" aria-label="Run decisions" hidden></section>
+            <section id="chat-revision" class="chat-revision" aria-label="Revision proposal" hidden></section>
+            <section id="chat-run-action" class="chat-revision" aria-label="Run action" hidden></section>
+          </div>
+          <form class="chat-composer" id="chat-form">
+            <div class="chat-compose-mode" id="chat-revision-mode" hidden>
+              <span>Drafting a revision</span>
+              <button type="button" class="btn btn-ghost btn-sm" id="chat-cancel-revision-mode">Back to chat</button>
+            </div>
+            <label class="chat-sr-only" for="chat-input">Message</label>
+            <textarea id="chat-input" rows="2" maxlength="3500" placeholder="Describe a change or ask about your options"></textarea>
+            <div id="chat-files" class="chat-files" aria-live="polite"></div>
+            <input id="chat-attachment-input" type="file" multiple hidden>
+            <p id="chat-status" class="field-help" role="status"></p>
+            <div class="chat-compose-actions">
+              <button type="button" class="btn btn-ghost btn-sm" id="chat-attach" title="Attach up to six files, 3 MB each and 8 MB total">Attach files</button>
+              <details class="chat-command-menu" id="chat-command-menu" hidden>
+                <summary class="btn btn-ghost btn-sm">Commands</summary>
+                <div class="chat-command-list" id="chat-command-list"></div>
+              </details>
+              <div class="chat-settings" id="chat-settings">
+                <label><span class="chat-sr-only" id="chat-target-label">Repository</span> <select id="chat-target" aria-labelledby="chat-target-label"><option value="">Loading repositories…</option></select></label>
+                <button type="button" class="btn btn-ghost btn-sm" id="chat-add-repo" hidden>Add repo</button>
+                <label id="chat-provider-field"><span class="chat-sr-only" id="chat-provider-label">Provider</span> <select id="chat-provider" aria-labelledby="chat-provider-label"><option value="claude">Claude</option><option value="codex">Codex</option></select></label>
+              </div>
+              <button type="button" class="btn btn-sm" id="chat-cancel" hidden>Cancel reply</button>
+              <button type="submit" class="btn btn-primary" id="chat-submit" disabled>Send</button>
+            </div>
+          </form>
+        </section>
+      </main>
 
-      <aside class="col inbox-col" id="inbox" aria-label="Needs you">
+      <aside class="col inbox-col" id="inbox" aria-label="Inbox">
         <div class="col-head">
-          <h2>Needs you</h2>
-          <span class="count count-strong" id="inbox-count" aria-live="polite">0</span>
+          <h2>Inbox</h2>
+          <span class="count count-strong" id="inbox-count" aria-live="polite" hidden></span>
           <button type="button" class="btn btn-ghost btn-icon inbox-close" id="inbox-close" aria-label="Close">✕</button>
         </div>
         <p class="col-hint">Questions, approvals, and run results appear here.</p>
@@ -73,6 +131,7 @@
           <input id="run-control-attachments" type="file" multiple aria-describedby="run-control-attachment-help">
           <span id="run-control-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
         </label>
+        <div id="run-control-chat-files" class="chat-files"></div>
         <div class="dialog-actions">
           <button type="button" class="btn btn-ghost" id="run-control-cancel">Cancel</button>
           <button type="submit" class="btn btn-primary" id="run-control-submit"></button>
@@ -234,56 +293,6 @@
       </form>
     </dialog>
 
-    <dialog class="dialog" id="run-question-dialog" aria-labelledby="run-question-title">
-      <form class="dialog-body" id="run-question-form">
-        <h2 id="run-question-title">Ask about this run</h2>
-        <p class="field-help repo-context" id="run-question-repo"></p>
-        <div class="actions" id="run-question-examples">
-          <button type="button" class="btn btn-sm" data-question="Is it deployed?">Is it deployed?</button>
-          <button type="button" class="btn btn-sm" data-question="What should I do next?">What’s next?</button>
-          <button type="button" class="btn btn-sm" data-question="Which checks passed?">Which checks passed?</button>
-        </div>
-        <label class="field">
-          <span class="field-label">Question or follow-up request</span>
-          <input id="run-question-input" type="text" maxlength="500" required placeholder="For example, I merged the PR. Deploy it now." />
-        </label>
-        <p class="field-help" id="run-question-status" role="status" hidden></p>
-        <section id="run-question-answer" aria-label="Run answer" aria-live="polite" hidden></section>
-        <div class="dialog-actions">
-          <button type="button" class="btn btn-ghost" id="run-question-close">Close</button>
-          <button type="submit" class="btn btn-primary" id="run-question-submit">Ask</button>
-        </div>
-      </form>
-    </dialog>
-
-    <dialog class="dialog" id="feedback-dialog" aria-labelledby="feedback-title">
-      <form method="dialog" class="dialog-body" id="feedback-form">
-        <h2 id="feedback-title">Request code changes</h2>
-        <p class="field-help" id="feedback-context">The crew starts a code revision on this branch. Use the run handoff for publishing and supported cloud releases.</p>
-        <p class="field-help repo-context" id="feedback-repo"></p>
-        <div class="actions"><button type="button" class="btn btn-sm" id="feedback-ask">Ask about the run instead</button></div>
-        <label class="field">
-          <span class="field-label">What should change?</span>
-          <textarea id="feedback-message" rows="6" maxlength="8000" required aria-describedby="feedback-context" placeholder="Describe what to change, what to keep, and how you’ll know it’s right."></textarea>
-        </label>
-        <label class="field">
-          <span class="field-label">Attach files or images</span>
-          <input id="feedback-attachments" type="file" multiple aria-describedby="feedback-attachment-help">
-          <span id="feedback-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
-        </label>
-        <label class="field">
-          <span class="field-label">Provider</span>
-          <select id="feedback-provider"><option value="claude">Claude</option><option value="codex">Codex</option></select>
-        </label>
-        <label class="browser-permission"><input type="checkbox" id="feedback-browser"><span><strong>Allow local browser access</strong><small>Lets agents inspect the worktree’s static app. Public web reading is already enabled.</small></span></label>
-        <p class="form-error" id="feedback-error" role="alert" hidden></p>
-        <div class="dialog-actions">
-          <button type="button" class="btn btn-ghost" id="feedback-cancel">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="feedback-submit">Start revision</button>
-        </div>
-      </form>
-    </dialog>
-
     <dialog class="dialog" id="new-run-dialog" aria-labelledby="new-run-title">
       <form method="dialog" class="dialog-body" id="new-run-form">
         <h2 id="new-run-title">New run</h2>
@@ -316,6 +325,7 @@
           <input id="nr-attachments" type="file" multiple aria-describedby="nr-attachment-help">
           <span id="nr-attachment-help" class="field-help">Up to 6 files, 3 MB each and 8 MB total.</span>
         </label>
+        <div id="nr-chat-files" class="chat-files"></div>
 
         <label class="field">
           <span class="field-label">Provider</span>
@@ -356,6 +366,7 @@
             </thead>
             <tbody id="nr-crew"></tbody>
           </table>
+            <label id="nr-parallel-field" class="browser-permission" hidden><input type="checkbox" id="nr-parallel" checked><span><strong>Run code review and security review in parallel</strong><small>They inspect isolated copies. The implementer applies fixes after both reviews.</small></span></label>
           <span class="field-help" id="nr-inbox-help"></span>
         </fieldset>
 

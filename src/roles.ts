@@ -33,7 +33,7 @@ export function parseRole(markdown: string, source = "role"): Role {
     : typeof rawTools === "string"
       ? rawTools.split(",").map((t) => t.trim()).filter(Boolean)
       : [];
-  if (tools.length === 0) throw new Error(`${source}: list the role's tools explicitly`);
+  if (tools.length === 0 && !Array.isArray(rawTools)) throw new Error(`${source}: list the role's tools explicitly`);
 
   const model = typeof meta.model === "string" && meta.model !== "inherit" ? meta.model : undefined;
   return { name: meta.name, description: meta.description, tools, model, prompt };

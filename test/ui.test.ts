@@ -2,9 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
+import { zipSync, strToU8 } from "fflate";
 import { decidePermission, type AgentAnswer, type AgentAsk } from "../src/agent.ts";
 import { parseConfig } from "../src/config.ts";
 import { loadRoles } from "../src/roles.ts";
@@ -52,6 +54,342 @@ const imageAttachment = (name: string) => ({
 });
 const e2e: Step = (req) =>
   writeFiles(req.cwd, { "e2e/add.e2e.test.js": 'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { add } from "../src/add.js";\ntest("e2e", () => assert.equal(add(2, 2), 4));\n' });
+
+test("Shipyard chat uses the selected provider and validates suggestions without starting a run", async () => {
+  const dir = tempDir("sy-chat-");
+  const config = parseConfig({ runsDir: "runs", targets: {
+    api: { path: ".", test: "npm test" },
+    web: { path: ".", test: "npm test", e2e: "npm run e2e" },
+  } }, dir);
+  const respond: Step = (req) => {
+    assert.equal(req.role.name, "chat-advisor");
+    assert.equal(req.advisoryOnly, true);
+    assert.equal(req.lane, "none");
+    assert.deepEqual(req.role.tools, []);
+    assert.deepEqual(JSON.parse(req.prompt).messages, messages);
+    assert.ok(req.outputSchema);
+    return { structured: { text: "Here is an option.", options: [
+      { title: "Reviewed change", detail: "Review the update.", request: "Add pagination.", target: "web", kind: "feature",
+        crew: ["design", "triage", "review", "e2e", "repair", "unknown"] },
+    ] } };
+  };
+  const messages = [{ role: "user", content: "I want pagination." }, { role: "assistant", content: "Which repo?" }, { role: "user", content: "Use the selected repo." }];
+  const claude = new FakeRunner([respond]);
+  const codex = new FakeRunner([respond]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const post = (body: object, auth: Record<string, string> = headers) => request(server.port, "/api/chat", { method: "POST", headers: auth, body });
+  try {
+    assert.equal((await post({ messages }, {})).status, 401);
+    assert.equal((await post({ messages: messages.slice(0, 2) })).status, 400);
+    assert.equal((await post({ messages, target: "missing" })).status, 400);
+    const first = await post({ messages, target: "api", provider: "codex" });
+    assert.equal(first.status, 200);
+    assert.deepEqual(JSON.parse(first.body).options[0].crew, ["design", "review"]);
+    assert.equal(JSON.parse(first.body).options[0].target, "api");
+    assert.equal(codex.calls.length, 1);
+    assert.equal(claude.calls.length, 0);
+    const second = await post({ messages, provider: "claude" });
+    assert.equal(second.status, 200);
+    assert.deepEqual(JSON.parse(second.body).options[0].crew, ["design", "review", "e2e", "repair"]);
+    assert.equal(claude.calls.length, 1);
+    assert.deepEqual(manager.activeRunIds(), []);
+    assert.deepEqual(manager.store.list(), []);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Shipyard chat history persists across server starts and merges saves from separate tabs", async () => {
+  const dir = tempDir("sy-chat-history-");
+  const config = parseConfig({ runsDir: "runs", targets: {} }, dir);
+  const id = randomUUID();
+  const linkedId = randomUUID();
+  const context = { target: "", provider: "claude", runId: null };
+  const messages = Array.from({ length: 44 }, (_, index) => ({ id: randomUUID(), role: "user",
+    content: index ? `Saved message ${index + 1}` : "Remember that the original goal is a read-only dashboard." }));
+  const failure = { id: randomUUID(), role: "assistant", failure: { code: "provider-timeout" } };
+  const runner = new FakeRunner([(req) => {
+    const prompt = JSON.parse(req.prompt);
+    assert.equal(prompt.earlierConversation[0].content, messages[0]!.content);
+    assert.equal(prompt.earlierConversation.some(({ content }: { content: string }) => content === messages[42]!.content), false);
+    return { structured: { text: "I remember the original goal.", options: [] } };
+  }]);
+  const first = new RunManager({ config, roles: loadRoles(), runner });
+  const server = await startUiServer({ manager: first, config });
+  const path = `/api/chat/history/${id}`;
+  const headers = { "x-shipyard-token": server.token };
+  const patch = (body: object) => request(server.port, path, { method: "PATCH", headers, body });
+  try {
+    assert.equal((await request(server.port, "/api/chat/history")).status, 401);
+    assert.equal((await patch({ messages: messages.slice(0, 28), context })).status, 200);
+    assert.equal((await patch({ messages: [...messages.slice(27), failure], context })).status, 200);
+    assert.equal((await patch({ messages: [], removed: [failure.id] })).status, 200);
+    assert.equal((await patch({ messages: [failure], context, preserveContext: true })).status, 200);
+    const listing = await request(server.port, "/api/chat/history", { headers });
+    assert.deepEqual(JSON.parse(listing.body).chats.map((chat: { id: string; messageCount: number }) => [chat.id, chat.messageCount]), [[id, 44]]);
+    const launch = await request(server.port, `/api/chat/history/${linkedId}`, { method: "PATCH", headers, body: {
+      context: { target: "app", provider: "codex", runId: "revision-run" },
+      messages: [{ id: randomUUID(), role: "assistant", content: "Run started.", runTitle: "Modernize the app", runId: "original-run" }],
+    } });
+    assert.equal(launch.status, 200);
+    assert.equal(JSON.parse(launch.body).chat.title, "Modernize the app");
+    assert.deepEqual(JSON.parse(launch.body).chat.runIds, ["revision-run", "original-run"]);
+  } finally { await Promise.all([first.shutdown(), server.close()]); }
+  const restarted = new RunManager({ config, roles: loadRoles(), runner });
+  const second = await startUiServer({ manager: restarted, config });
+  try {
+    const auth = { "x-shipyard-token": second.token };
+    const loaded = await request(second.port, path, { headers: auth });
+    assert.equal(loaded.status, 200);
+    assert.deepEqual(JSON.parse(loaded.body).chat.messages, messages);
+    assert.deepEqual(JSON.parse(loaded.body).chat.context, context);
+    const listed = await request(second.port, "/api/chat/history", { headers: auth });
+    assert.deepEqual(JSON.parse(listed.body).chats.find((entry: { id: string }) => entry.id === linkedId).runIds, ["revision-run", "original-run"]);
+    const reply = await request(second.port, "/api/chat", { method: "POST", headers: auth, body: {
+      conversationId: id, firstRecentId: messages[42]!.id, messages: [{ role: "user", content: "What was the original decision?" }],
+    } });
+    assert.equal(reply.status, 200, reply.body);
+    assert.match(JSON.parse(reply.body).text, /remember the original goal/);
+  } finally {
+    await Promise.all([restarted.shutdown(), second.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Shipyard chat researches before, during and after a run and keeps local status authoritative", async () => {
+  const dir = tempDir("sy-chat-web-");
+  const config = parseConfig({ runsDir: "runs", targets: { app: { path: ".", test: "npm test" } } }, dir);
+  const url = "https://nodejs.org/api/test.html";
+  const turnId = "40000000-0000-4000-8000-000000000004";
+  const respond: Step = (req) => {
+    const request = JSON.parse(req.prompt);
+    assert.equal(req.advisoryOnly, true);
+    assert.match(req.role.prompt, /Search the public web whenever/);
+    assert.ok(req.outputSchema?.properties);
+    if (request.run) assert.deepEqual(request.run.stages[0].checks, [{ command: "npm test", passed: true }]);
+    req.onEvent?.({ type: "tool", tool: "WebSearch", detail: "Node test runner" });
+    req.onEvent?.({ type: "tool", tool: "WebRead", detail: url });
+    return { structured: { text: "Here is the Node.js test runner reference.", options: [], sources: [
+      { title: "Node.js test runner", url }, { title: "Unsafe link", url: "javascript:alert(1)" },
+    ] } };
+  };
+  const claude = new FakeRunner([respond]);
+  const codex = new FakeRunner([respond, respond]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: claude, codexRunner: codex });
+  const live: LiveMessage[] = [];
+  manager.bus.on("message", (message: LiveMessage) => live.push(message));
+  const timestamp = new Date().toISOString();
+  const run = { id: "research-run", kind: "feature", target: "app", request: "Add an endpoint", status: "running", tags: [], createdAt: timestamp,
+    repo: dir, worktree: dir, branch: "work", baseSha: "a", totals: { turns: 1, attempts: 1, costUsd: 0, durationMs: 10, reviewWaitMs: 0 },
+    stages: [{ name: "implement", role: "backend", status: "passed", attempts: [{ attempt: 1, agentOk: true, costUsd: 0, durationMs: 10,
+      turns: 1, summary: "Implemented.", gates: [{ command: "npm test", code: 0, durationMs: 5, timedOut: false, outputTail: "" }], passed: true }] }],
+  } as const;
+  manager.store.save({ ...run, tags: [], stages: run.stages.map((stage) => ({ ...stage, attempts: stage.attempts.map((attempt) => ({ ...attempt, gates: [...attempt.gates] })) })) });
+  let localChecks = 0;
+  manager.answerRunQuestion = async () => { localChecks++; return { heading: "Project checks", details: ["Passed · npm test"] }; };
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const ask = (content: string, provider: string, runId?: string) => request(server.port, "/api/chat", { method: "POST", headers, body: {
+    messages: [{ role: "user", content }], provider, runId, turnId,
+  } });
+  const checkWeb = (response: Awaited<ReturnType<typeof ask>>) => {
+    assert.equal(response.status, 200, response.body);
+    assert.deepEqual(JSON.parse(response.body).web, { searched: true, sources: [{ title: "Node.js test runner", url }] });
+  };
+  try {
+    checkWeb(await ask("Search for the Node.js test runner docs.", "claude"));
+    checkWeb(await ask("While this run is active, search the web for current Node test flags.", "codex", run.id));
+    const saved = manager.store.get(run.id)!;
+    manager.store.save({ ...saved, status: "passed", finishedAt: timestamp });
+    checkWeb(await ask("Did the tests use the flags from the latest Node docs? Look them up.", "codex", run.id));
+    for (const question of ["Did the tests pass?", "Which unit tests passed?"]) {
+      const local = await ask(question, "codex", run.id);
+      assert.deepEqual(JSON.parse(local.body).runAnswer, { heading: "Project checks", details: ["Passed · npm test"] });
+    }
+    assert.equal(localChecks, 2);
+    assert.equal(claude.calls.length, 1);
+    assert.equal(codex.calls.length, 2);
+    assert.equal(live.filter((event) => event.type === "chat-web" && event.turnId === turnId).length, 6);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Shipyard chat handles repository setup locally and returns actionable provider errors", async () => {
+  const dir = tempDir("sy-chat-recovery-");
+  const config = parseConfig({ runsDir: "runs", targets: { portfolio: { path: ".", test: "npm test" } } }, dir);
+  const runner = new FakeRunner([
+    () => ({ ok: false, error: "Failed to authenticate: OAuth session expired and could not be refreshed\nTOKEN=private-provider-detail" }),
+    () => ({ ok: false, error: "HTTP 429 Too Many Requests" }),
+    () => ({ structured: { malformed: true } }),
+    () => ({ ok: false, error: "Codex CLI was not found on PATH. Install it and run codex login." }),
+  ]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner, configFile: join(dir, "shipyard.config.yaml"), hostedRepositoryLookup: async () => [] });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const post = (...requests: string[]) => request(server.port, "/api/chat", { method: "POST", headers, body: {
+    provider: "claude", messages: requests.map((content) => ({ role: "user", content })),
+  } });
+  try {
+    const hostedRequest = "Clone my portafolio repo, https://carlosan1708-portfolio.web.app/";
+    const hosted = await post(hostedRequest);
+    assert.equal(hosted.status, 200);
+    assert.match(JSON.parse(hosted.body).text, /deployed website/);
+    assert.ok(JSON.parse(hosted.body).repoActions.some((action: { kind: string; target?: string }) => action.kind === "use-target" && action.target === "portfolio"));
+    assert.doesNotMatch(JSON.stringify(JSON.parse(hosted.body).repoActions), /web\.app/);
+    const remote = await post(hostedRequest, "https://github.com/example/site/blob/main/README.md?plain=1");
+    assert.deepEqual(JSON.parse(remote.body).repoActions, [{ kind: "add-repo", label: "Review clone setup", locator: "https://github.com/example/site.git" }]);
+    const shorthand = await post("Clone example/site");
+    assert.equal(JSON.parse(shorthand.body).repoActions[0].locator, "https://github.com/example/site.git");
+    const local = await post("Add the repo at \"C:\\Projects\\My Site\"");
+    assert.equal(JSON.parse(local.body).repoActions[0].locator, "C:\\Projects\\My Site");
+    const directClone = await request(server.port, "/api/targets/clone", { method: "POST", headers, body: { url: "https://site.web.app/" } });
+    assert.equal(directClone.status, 400);
+    assert.match(JSON.parse(directClone.body).error, /deployed website/);
+    assert.equal(runner.calls.length, 0);
+    assert.deepEqual(manager.activeRunIds(), []);
+
+    const auth = await post("Add pagination to my repo.");
+    assert.equal(auth.status, 422);
+    assert.equal(JSON.parse(auth.body).code, "provider-auth");
+    assert.doesNotMatch(auth.body, /private-provider-detail/);
+    const limit = await post("Plan the change again.");
+    assert.equal(limit.status, 429);
+    assert.equal(JSON.parse(limit.body).code, "provider-limit");
+    const malformed = await post("How should we implement pagination?");
+    assert.equal(malformed.status, 502);
+    assert.equal(JSON.parse(malformed.body).code, "provider-response");
+    const missing = await post("Help me get started.");
+    assert.equal(missing.status, 503);
+    assert.equal(JSON.parse(missing.body).code, "provider-unavailable");
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Shipyard chat discovers a link-first source request and clones only a verified unique match", async () => {
+  const dir = tempDir("sy-chat-discovery-");
+  const checkout = await makeTargetRepo();
+  const config = parseConfig({ runsDir: "runs", targets: {} }, dir);
+  const runner = new FakeRunner([]);
+  const candidates = [{ repository: "https://github.com/example/portafolio-example", evidence: "firebase.json names this exact Firebase Hosting site" }];
+  const searched: Array<{ host: string; owner?: string }> = [];
+  const manager = new RunManager({ config, roles: loadRoles(), runner, configFile: join(dir, "shipyard.config.yaml"),
+    hostedRepositoryLookup: async (site, _signal, owner) => {
+      searched.push({ host: site.hostname, owner });
+      return candidates;
+    } });
+  const clones: string[] = [];
+  manager.cloneTarget = async (url) => {
+    clones.push(String(url));
+    return manager.inspectRepo(checkout);
+  };
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const post = (...requests: string[]) => request(server.port, "/api/chat", { method: "POST", headers, body: {
+    provider: "codex", messages: requests.map((content) => ({ role: "user", content })),
+  } });
+  const find = "https://example-portfolio.web.app/\nfind repo";
+  try {
+    const found = await post(find);
+    assert.equal(found.status, 200, found.body);
+    assert.match(JSON.parse(found.body).text, /verified.+firebase\.json/);
+    assert.deepEqual(clones, []);
+
+    const cloned = await post(`${find} and clone it`);
+    assert.equal(cloned.status, 200, cloned.body);
+    assert.deepEqual(clones, ["https://github.com/example/portafolio-example.git"]);
+    assert.match(JSON.parse(cloned.body).text, /repo is cloned at/);
+    assert.equal(JSON.parse(cloned.body).repoActions[0].label, "Review repository setup");
+
+    const identified = await post(find, "https://github.com/example");
+    assert.equal(identified.status, 200, identified.body);
+    assert.deepEqual(searched.at(-1), { host: "example-portfolio.web.app", owner: "example" });
+    assert.equal(clones.length, 1);
+
+    candidates.push({ repository: "https://github.com/example/other", evidence: "homepage matches" });
+    const ambiguous = await post(`${find} and clone it`);
+    assert.equal(ambiguous.status, 200, ambiguous.body);
+    assert.match(JSON.parse(ambiguous.body).text, /Several repositories/);
+    assert.equal(JSON.parse(ambiguous.body).repoActions.length, 2);
+    candidates.splice(0, 2, { repository: "https://github.com/example/unverified", evidence: "" });
+    const lead = await post(`${find} and clone it`);
+    assert.match(JSON.parse(lead.body).text, /potential source/);
+    assert.equal(clones.length, 1);
+    assert.equal(runner.calls.length, 0);
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Shipyard chat remembers image and document attachments and copies originals into a run", async () => {
+  const dir = tempDir("sy-chat-attachments-");
+  const repo = await makeTargetRepo();
+  const config = parseConfig({ runsDir: "runs", worktreeRoot: "worktrees", targets: { app: { path: repo, test: "npm test" } } }, dir);
+  const runner = new FakeRunner([
+    (req) => {
+      const context = JSON.parse(req.prompt).attachments;
+      assert.match(context.find(({ name }: { name: string }) => name === "criteria.txt").excerpt, /Status must be ready/);
+      assert.match(context.find(({ name }: { name: string }) => name === "notes.docx").excerpt, /Acceptance criteria & context/);
+      assert.match(context.find(({ name }: { name: string }) => name === "spec.pdf").excerpt, /PDF embedded review notes/);
+      assert.equal(req.images?.[0]?.mediaType, "image/png");
+      assert.ok(existsSync(req.images![0]!.path));
+      return { structured: { text: "Reviewed the attachments.", options: [] } };
+    },
+    (req) => {
+      assert.match(req.prompt, /criteria.txt/);
+      assert.match(req.prompt, /notes.docx/);
+      assert.match(req.prompt, /spec.pdf/);
+      assert.equal(req.images?.[0]?.mediaType, "image/png");
+      assert.ok(existsSync(req.images![0]!.path));
+      return { ok: false, error: "Stopped before the platform-specific project checks" };
+    },
+  ]);
+  const manager = new RunManager({ config, roles: loadRoles(), runner });
+  const server = await startUiServer({ manager, config });
+  const headers = { "x-shipyard-token": server.token };
+  const post = (path: string, body: object) => request(server.port, path, { method: "POST", headers, body });
+  const docx = zipSync({ "word/document.xml": strToU8('<w:document><w:p><w:t>Acceptance criteria &amp; context</w:t></w:p></w:document>') });
+  const stream = "BT /F1 12 Tf 36 100 Td (PDF embedded review notes) Tj ET\n";
+  const objects = ["<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", `<< /Length ${stream.length} >>\nstream\n${stream}endstream`];
+  let pdf = "%PDF-1.4\n";
+  const offsets = objects.map((object, i) => {
+    const offset = pdf.length;
+    pdf += `${i + 1} 0 obj\n${object}\nendobj\n`;
+    return `${String(offset).padStart(10, "0")} 00000 n \n`;
+  });
+  pdf += `xref\n0 6\n0000000000 65535 f \n${offsets.join("")}trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${pdf.length}\n%%EOF\n`;
+  try {
+    const response = await post("/api/chat/attachments", { attachments: [
+      { name: "criteria.txt", data: Buffer.from("Status must be ready").toString("base64") },
+      { name: "notes.docx", data: Buffer.from(docx).toString("base64") },
+      { name: "spec.pdf", data: Buffer.from(pdf).toString("base64") },
+      imageAttachment("screen.png"),
+    ] });
+    assert.equal(response.status, 201, response.body);
+    const attachmentIds = [JSON.parse(response.body).id];
+    const advised = await post("/api/chat", { messages: [{ role: "user", content: "Review the attached files" }], attachmentIds });
+    assert.equal(advised.status, 200, advised.body);
+    const started = await post("/api/runs", { target: "app", kind: "feature", request: "Use the attachment criteria", crew: [], chatAttachmentIds: attachmentIds });
+    assert.equal(started.status, 201, started.body);
+    const run = await manager.whenDone(JSON.parse(started.body).id);
+    assert.deepEqual(run?.attachments?.map(({ name }) => name), ["criteria.txt", "notes.docx", "spec.pdf", "screen.png"]);
+    assert.equal(runner.calls.length, 2);
+    assert.notEqual(runner.calls[0]?.images?.[0]?.path, runner.calls[1]?.images?.[0]?.path);
+    assert.equal(run?.error, "backend agent could not run: Stopped before the platform-specific project checks");
+  } finally {
+    await Promise.all([manager.shutdown(), server.close()]);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("an explicit higher budget resumes an exhausted run on its saved worktree", async () => {
   const { manager, config, runner } = await makeManager([
@@ -1712,7 +2050,7 @@ test("feedback retrieves references and routes through a read-only orchestrator 
   const { existsSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { config } = await makeManager([]);
-  config.targets.t0!.test = "true";
+  config.targets.t0!.test = 'node -e "0"';
   config.targets.t0!.e2e = "git ls-files --error-unmatch source.html";
   const github = "https://github.com/example";
   const linkedin = "https://www.linkedin.com/in/example";

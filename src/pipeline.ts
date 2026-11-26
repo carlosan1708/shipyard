@@ -7,7 +7,7 @@ import { BROWSER_CHECK, checkBrowser } from "./browser-check.ts";
 import { BROWSER_TOOL_NOTE } from "./browser-tool.ts";
 import { recordBugExpectation, verifyBugFix } from "./bug-verification.ts";
 import { providerOptions, type Provider, type RunEffort, type ShipyardConfig, type Target } from "./config.ts";
-import { git, sh, tail, type ExecResult } from "./exec.ts";
+import { git, isProjectCheckSandboxError, sh, tail, type ExecResult } from "./exec.ts";
 import { inLane, type Lane } from "./guards.ts";
 import {
   blockingFindings,
@@ -51,7 +51,7 @@ import { requireRole, type Role } from "./roles.ts";
 import type { RunControl } from "./run-control.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, type ReferenceCheck, type ReferenceReview } from "./references.ts";
 import { canRepairRevisionRole, gateOk, type AttemptRecord, type GateRecord, type RunFollowUp, type RunKind, type RunRecord, type RunStatus, type RunStore, type StageRecord } from "./store.ts";
-import { changedFiles, commitAll, createWorktree, removeWorktree, repoRoot, revertFiles, worktreeSnapshot } from "./worktree.ts";
+import { changedFiles, commitAll, createWorktree, detachedWorktree, removeWorktree, repoRoot, revertFiles, withRepoLock, worktreeSnapshot } from "./worktree.ts";
 
 /** Agent stops that still deserve grading: the agent ran out of room, but may have done the work. */
 const LIMIT_ERRORS = new Set(["error_max_turns", "error_max_budget_usd"]);
@@ -66,7 +66,7 @@ class BudgetReachedError extends Error {
 class RunStoppedError extends Error {}
 
 /** Every stage, in the order a run goes through them. */
-export const STAGES = ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release", "cloud-release"] as const;
+export const STAGES = ["triage", "plan", "implement", "design", "review", "revise", "security", "security-recheck", "harden", "e2e", "repair", "docs", "release", "cloud-release"] as const;
 export type StageName = (typeof STAGES)[number] | "reference" | "orchestrate" | RevisionSpecialist;
 
 const REVISION_SPECIALISTS = {
@@ -182,6 +182,7 @@ export interface PipelineRequest {
   effort?: RunEffort;
   /** The optional stages that run (DEFAULT_CREW when unset). Implement always runs. */
   crew?: OptionalStage[];
+  parallelReviews?: boolean;
   /** Who implements, revises and repairs. Dependency runs always use dependency-updater. */
   implementer?: Implementer;
   /** Estimated cost limit for the whole run. config.maxBudgetUsdPerRun when unset. */
@@ -190,9 +191,16 @@ export interface PipelineRequest {
 
 interface AgentSession { provider: Provider; id: string }
 
+interface ParallelReviews {
+  signal: AbortSignal;
+  active: Set<StageName>;
+  reserved: Map<StageName, number>;
+}
+
 interface StageSpec {
   name: StageName;
   role: Role;
+  isolated?: { worktree: string; group: ParallelReviews };
   repairing?: boolean;
   lane: Lane;
   prompt: string;
@@ -265,8 +273,8 @@ interface StageOutcome {
  * or stop the run.
  */
 export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Promise<RunRecord> {
-  const log = deps.log ?? (() => {});
   const { target, kind, request, resume, continueBranch } = req;
+  const log = deps.log ?? (() => {});
   const referenceUrls = resume ? resume.referenceUrls ?? []
     : parseReferencePermissions(req.referenceUrls ?? referenceLinks(request).slice(0, MAX_PUBLIC_REFERENCES));
   const followUp = resume?.followUp ?? req.followUp;
@@ -341,6 +349,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     model,
     effort: req.effort ?? defaults.effort,
     crew: OPTIONAL_STAGES.filter((s) => crew.has(s)),
+    parallelReviews: Boolean(req.parallelReviews && reviewer && auditor && deps.control) || undefined,
     implementer: orchestrator ? undefined : implementer.name,
     budgetUsd: provider === "claude" ? req.budgetUsd ?? deps.config.maxBudgetUsdPerRun : undefined,
     stages: [],
@@ -608,29 +617,55 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
       await commit(design);
     }
 
-    // 3. Review: a fresh session that never saw the implementer's reasoning. Read-only.
-    if (reviewer) {
-      const review = await runStage(
-        {
-          name: "review",
-          role: reviewer,
-          lane: "none",
-          readOnly: true,
-          prompt: reviewPrompt(kind, request, baseSha, plan),
-          gates: [],
-          maxAttempts: 1,
-          failureContinues: true,
-          outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
-          judge: (r) => {
-            if (!isReviewVerdict(r.structured)) return { passed: false, summary: r.summary || "The reviewer returned no verdict." };
-            const verdict = r.structured;
-            const blocking = blockingFindings(verdict);
-            return { passed: blocking.length === 0, summary: formatFindings(verdict), output: verdict, feedback: blocking.length ? revisePrompt(verdict) : undefined };
-          },
-        },
-        run,
-        deps,
-      );
+    // Independent reviewers can inspect the same committed change from isolated snapshots.
+    const reviewSpec: StageSpec | undefined = reviewer && {
+      name: "review",
+      role: reviewer,
+      lane: "none",
+      readOnly: true,
+      prompt: reviewPrompt(kind, request, baseSha, plan),
+      gates: [],
+      maxAttempts: 1,
+      failureContinues: true,
+      outputSchema: REVIEW_SCHEMA as unknown as Record<string, unknown>,
+      judge: (r) => {
+        if (!isReviewVerdict(r.structured)) return { passed: false, summary: r.summary || "The reviewer returned no verdict." };
+        const verdict = r.structured;
+        const blocking = blockingFindings(verdict);
+        return { passed: blocking.length === 0, summary: formatFindings(verdict), output: verdict, feedback: blocking.length ? revisePrompt(verdict) : undefined };
+      },
+    };
+    const auditSpec: StageSpec | undefined = auditor && {
+      name: "security",
+      role: auditor,
+      lane: "none",
+      readOnly: true,
+      prompt: securityPrompt(kind, request, baseSha),
+      gates: [],
+      maxAttempts: 1,
+      failureContinues: true,
+      outputSchema: SECURITY_SCHEMA as unknown as Record<string, unknown>,
+      judge: (r) => {
+        if (!isSecurityVerdict(r.structured)) return { passed: false, summary: r.summary || "The security auditor returned no verdict." };
+        const verdict = r.structured;
+        const blocking = blockingSecurityFindings(verdict);
+        return { passed: blocking.length === 0, summary: formatSecurityFindings(verdict), output: verdict,
+          feedback: blocking.length ? hardenPrompt(verdict) : undefined };
+      },
+    };
+    let parallelAudit: StageOutcome | undefined;
+    let parallelReview: StageOutcome | undefined;
+    const savedReview = run.stages.find((stage) => stage.name === "review");
+    const savedAudit = run.stages.find((stage) => stage.name === "security");
+    const needsReview = !savedReview || ["running", "stopped"].includes(savedReview.status);
+    const needsAudit = !savedAudit || ["running", "stopped"].includes(savedAudit.status);
+    if (run.parallelReviews && reviewSpec && auditSpec && needsReview && needsAudit &&
+        (budgetLeft(run) ?? Infinity) >= 2 * MIN_ATTEMPT_BUDGET_USD && !(await changedFiles(worktree)).length) {
+      [parallelReview, parallelAudit] = await runParallelReviews([reviewSpec, auditSpec], run, deps);
+    }
+    let revisionCommit: string | undefined;
+    if (reviewSpec) {
+      const review = parallelReview ?? await runStage(reviewSpec, run, deps);
       if (review.stopped) return finish("stopped");
       if (!review.passed) {
         if (!review.judgeFeedback) {
@@ -657,38 +692,16 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
         if (revise.stopped) return finish("stopped");
         if (!revise.passed) return finish("failed");
         await commit(revise);
+        revisionCommit = revise.record.commit;
         implementerSession = revise.session ?? implementerSession;
       }
     }
 
     // 3c. Security audit: read-only, like an attacker would look at it. Critical/high -> harden.
-    if (auditor) {
-      const audit = await runStage(
-        {
-          name: "security",
-          role: auditor,
-          lane: "none",
-          readOnly: true,
-          prompt: securityPrompt(kind, request, baseSha),
-          gates: [],
-          maxAttempts: 1,
-          failureContinues: true,
-          outputSchema: SECURITY_SCHEMA as unknown as Record<string, unknown>,
-          judge: (r) => {
-            if (!isSecurityVerdict(r.structured)) return { passed: false, summary: r.summary || "The security auditor returned no verdict." };
-            const verdict = r.structured;
-            const blocking = blockingSecurityFindings(verdict);
-            return {
-              passed: blocking.length === 0,
-              summary: formatSecurityFindings(verdict),
-              output: verdict,
-              feedback: blocking.length ? hardenPrompt(verdict) : undefined,
-            };
-          },
-        },
-        run,
-        deps,
-      );
+    if (auditSpec) {
+      const snapshotAudit = parallelAudit || run.stages.some((stage) => stage.name === "security" && stage.parallel);
+      const audit = revisionCommit && snapshotAudit ? await runStage({ ...auditSpec, name: "security-recheck" }, run, deps) :
+        parallelAudit ?? await runStage(auditSpec, run, deps);
       if (audit.stopped) return finish("stopped");
       if (!audit.passed) {
         if (!audit.judgeFeedback) {
@@ -842,7 +855,8 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     deps.store.save(run);
     const mark = run.status === "passed" ? "✓" : run.status === "stopped" ? "■" : "✗";
     const { durationMs, reviewWaitMs } = run.totals;
-    const time = reviewWaitMs > 0 ? `${secs(durationMs - reviewWaitMs)} working + ${secs(reviewWaitMs)} waiting for you` : secs(durationMs);
+    const time = reviewWaitMs <= 0 ? secs(durationMs) : run.stages.some(({ parallel }) => parallel) ?
+      `${secs(durationMs)} elapsed · ${secs(reviewWaitMs)} combined agent wait` : `${secs(durationMs - reviewWaitMs)} working + ${secs(reviewWaitMs)} waiting for you`;
     const spend = run.totals.costUsd === null
       ? `cost unavailable${run.totals.usage ? ` · ${run.totals.usage.inputTokens} input / ${run.totals.usage.outputTokens} output tokens` : ""}`
       : `~$${run.totals.costUsd.toFixed(2)} est.`;
@@ -877,9 +891,32 @@ function budgetReached(run: RunRecord, stage: StageName): BudgetReachedError {
     `Approve a higher limit in the dashboard to continue this run.`);
 }
 
+async function runParallelReviews(specs: [StageSpec, StageSpec], run: RunRecord, deps: PipelineDeps) {
+  const abort = new AbortController();
+  const group: ParallelReviews = { signal: abort.signal, active: new Set(specs.map(({ name }) => name)), reserved: new Map() };
+  const head = await git(["rev-parse", "HEAD"], run.worktree);
+  const snapshots: Awaited<ReturnType<typeof detachedWorktree>>[] = [];
+  try {
+    for (const _ of specs) snapshots.push(await withRepoLock(run.repo, () => detachedWorktree(run.repo, deps.config.worktreeRoot, head)));
+    const results = await Promise.allSettled(specs.map((spec, i) => runStage({ ...spec, isolated: { worktree: snapshots[i]!.worktree, group } }, run, deps)
+      .catch((error) => { abort.abort(); throw error; })
+      .finally(() => { group.active.delete(spec.name); group.reserved.delete(spec.name); })));
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected) throw rejected.reason;
+    if (await git(["rev-parse", "HEAD"], run.worktree) !== head || (await changedFiles(run.worktree)).length) {
+      throw new Error("The main worktree changed during the parallel reviews. Its edits are saved for inspection.");
+    }
+    return results.map((result) => (result as PromiseFulfilledResult<StageOutcome>).value);
+  } finally {
+    for (const snapshot of snapshots) await withRepoLock(run.repo, snapshot.close);
+  }
+}
+
 async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Promise<StageOutcome> {
   const log = deps.log ?? (() => {});
   const control = deps.control;
+  const cwd = spec.isolated?.worktree ?? run.worktree;
+  const group = spec.isolated?.group;
   if (control?.stopped) throw new RunStoppedError();
   const previous = run.stages.find((stage) => stage.name === spec.name);
   const last = previous?.attempts.at(-1);
@@ -895,7 +932,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
     deps.store.event(run.id, { stage: spec.name, attempt, type: "attempt_start", provider: run.provider, rechecked: true });
     const noChanges = !spec.allowNoChanges && !(await changedFiles(run.worktree)).length;
     const snapshot = noChanges ? undefined : await worktreeSnapshot(run.worktree);
-    const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run.worktree, deps, signal);
+    const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run, deps, attempt, signal);
     const changed = snapshot !== undefined && !signal?.aborted &&
       (await worktreeSnapshot(run.worktree).catch(() => undefined)) !== snapshot;
     const stopped = Boolean(control?.stopped);
@@ -943,13 +980,16 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   const stage: StageRecord = previous ?? { name: spec.name, role: spec.role.name, status: "running", attempts: [] };
   if (!previous) run.stages.push(stage);
   stage.status = "running";
+  if (group) stage.parallel = true;
   if (spec.repairing) stage.repairRole = spec.role.name;
   deps.store.save(run);
 
   const reviewed = deps.checkpoints?.stages.includes(spec.name) ?? false;
   let verifiedSnapshot: string | undefined;
   const freshRepair = spec.repairing && (deps.repairStage === spec.name || last?.role !== spec.role.name);
-  let session = freshRepair ? undefined : sessionFor(last) ?? spec.resumeSession;
+  // A resumed parallel stage gets a new snapshot path and starts a fresh provider session.
+  const freshSnapshot = Boolean(group || previous?.parallel);
+  let session = freshRepair || freshSnapshot ? undefined : sessionFor(last) ?? spec.resumeSession;
   const deliveredImages = new Set<string>();
   let prompt = spec.prompt;
   let summary = last?.summary ?? "";
@@ -966,7 +1006,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
         agentOk: false, costUsd: null, durationMs: 0, turns: 0, summary: "", gates: [], passed: false,
       });
       // A provider session from an earlier attempt can be used only if it matches the interrupted turn.
-      session = sessionId ? { provider, id: sessionId } : session?.provider === provider ? session : undefined;
+      if (!freshSnapshot) session = sessionId ? { provider, id: sessionId } : session?.provider === provider ? session : undefined;
     }
     if (!spec.repairing) {
       prompt = `${spec.prompt}\n\nResume the interrupted stage on the existing worktree. Inspect any changes already present before continuing. A previous question may need to be asked again.`;
@@ -984,7 +1024,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   };
 
   for (let attempt = (stage.attempts.at(-1)?.attempt ?? 0) + 1; ; attempt++) {
-    if (control?.stopped) return done("stopped");
+    if (control?.stopped || group?.signal.aborted) return done("stopped");
     const directive = control?.takeDirective();
     const switching = directive?.provider && directive.provider !== run.provider;
     if (switching && directive?.provider) {
@@ -1001,17 +1041,22 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
       session = undefined;
       deliveredImages.clear();
     }
-    if (outOfBudget(run)) {
+    const left = budgetLeft(run);
+    const allowance = group && left !== undefined ?
+      (left - [...group.reserved.values()].reduce((a, b) => a + b, 0)) / Math.max(1, group.active.size - group.reserved.size) : left;
+    if (allowance !== undefined && allowance + 1e-9 < MIN_ATTEMPT_BUDGET_USD) {
       if (!previous && attempt === 1) {
-        run.stages.pop();
+        run.stages.splice(run.stages.indexOf(stage), 1);
         deps.store.save(run);
       } else {
-        done("failed");
+        done(group ? "stopped" : "failed");
       }
       throw budgetReached(run, spec.name);
     }
+    if (group && allowance !== undefined) group.reserved.set(spec.name, allowance);
     if (directive) failuresInARow = 0;
-    const signal = control?.beginAttempt();
+    const attemptSignal = control?.beginAttempt(group ? spec.name : undefined);
+    const signal = group ? AbortSignal.any(attemptSignal ? [attemptSignal, group.signal] : [group.signal]) : attemptSignal;
     const retry = failuresInARow > 0 ? ` · retry ${failuresInARow}/${spec.maxAttempts - 1}` : "";
     log(`▸ ${spec.name} · ${spec.role.name} · attempt ${attempt}${retry}`);
     const ask = provider === "claude" ? deps.ask : undefined;
@@ -1081,7 +1126,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
         prompt: attemptPrompt,
         images: images.length ? images : undefined,
         signal,
-        cwd: run.worktree,
+        cwd,
         lane: spec.lane,
         browserAccess: run.browserAccess,
         resumeSessionId: session?.id,
@@ -1089,7 +1134,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
         model: run.model,
         effort: run.effort,
         outputSchema: spec.outputSchema,
-        maxBudgetUsd: budgetLeft(run),
+        maxBudgetUsd: allowance,
         onEvent: (event) => {
           if (event.type === "tool" && event.tool === "Browser" && browserInspections.length < 12) browserInspections.push(event.detail);
           deps.store.event(run.id, { stage: spec.name, attempt, ...event });
@@ -1133,14 +1178,15 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
 
     // Backstop for the lane hook: an agent can still write files through Bash.
     // For read-only roles every change is out of lane, so this undoes anything they touched.
-    const outOfLane = (await changedFiles(run.worktree)).filter((f) => !inLane(f, spec.lane));
+    const outOfLane = (await changedFiles(cwd)).filter((f) => !inLane(f, spec.lane));
     if (outOfLane.length > 0) {
-      await revertFiles(run.worktree, outOfLane);
+      await revertFiles(cwd, outOfLane);
       log(`    reverted out-of-lane changes: ${outOfLane.join(", ")}`);
     }
 
     const recordInterruption = (gates: GateRecord[] = []) => {
-      const interrupted = control?.stopped ? "stopped" : "redirected";
+      const interrupted = control?.stopped || group?.signal.aborted ? "stopped" : "redirected";
+      group?.reserved.delete(spec.name);
       stage.attempts.push({ ...base, interrupted, revertedFiles: outOfLane.length ? outOfLane : undefined, gates, passed: false });
       run.totals = { ...sumAttempts(run), durationMs: run.totals.durationMs };
       deps.store.event(run.id, { stage: spec.name, attempt, type: "attempt_interrupted", interrupted });
@@ -1148,7 +1194,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
     };
     if (signal?.aborted) {
       recordInterruption();
-      if (control?.stopped) return done("stopped");
+      if (control?.stopped || group?.signal.aborted) return done("stopped");
       continue;
     }
 
@@ -1163,16 +1209,23 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
 
     // Green tests on an unchanged tree prove nothing: stages that build must change something.
     const requireChanges = !spec.readOnly && !spec.allowNoChanges;
-    const noChanges = requireChanges && (await changedFiles(run.worktree)).length === 0;
+    const noChanges = requireChanges && (await changedFiles(cwd)).length === 0;
     if (noChanges) log(`    ✗ no changes in the worktree`);
 
     // Gates run here, by the pipeline, regardless of what the agent claims.
-    verifiedSnapshot = reviewed && spec.name === "triage" && !noChanges ? await worktreeSnapshot(run.worktree) : undefined;
-    const { gates, failed } = noChanges ? { gates: [], failed: undefined } : await runStageGates(spec, run.worktree, deps, signal);
+    verifiedSnapshot = reviewed && spec.name === "triage" && !noChanges ? await worktreeSnapshot(cwd) : undefined;
+    const { gates, failed } = noChanges ? { gates: [], failed: undefined } :
+      await runStageGates(spec, run, deps, attempt, signal).catch((error: unknown) => {
+        if (error instanceof Error && isProjectCheckSandboxError(error.message)) {
+          stage.attempts.push({ ...base, revertedFiles: outOfLane.length ? outOfLane : undefined, gates: [], passed: false });
+          done("stopped");
+        }
+        throw error;
+      });
 
     if (signal?.aborted) {
       recordInterruption(gates);
-      if (control?.stopped) return done("stopped");
+      if (control?.stopped || group?.signal.aborted) return done("stopped");
       continue;
     }
 
@@ -1194,6 +1247,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
       passed,
     };
     stage.attempts.push(record);
+    group?.reserved.delete(spec.name);
     run.totals = { ...sumAttempts(run), durationMs: run.totals.durationMs };
     deps.store.save(run);
 
@@ -1223,9 +1277,10 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
       expectedBehavior: spec.name === "triage" && isTriageReport(record.output) ? record.output.expected : undefined,
       gates,
       noChanges,
-      worktree: run.worktree,
+      worktree: cwd,
       sessionId: session?.id,
     }, signal);
+    if (group?.signal.aborted) return done("stopped");
     if (signal?.aborted && !control?.stopped) {
       record.interrupted = "redirected";
       record.interruptionWaitMs = Date.now() - reviewStarted;
@@ -1247,6 +1302,7 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
 
     if (decision.action === "stop") {
       log(`    ■ stopped at the ${spec.name} checkpoint`);
+      if (group) control?.stop();
       return done("stopped");
     }
     if (decision.action === "continue") {
@@ -1261,12 +1317,15 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   }
 }
 
-async function runStageGates(spec: StageSpec, worktree: string, deps: PipelineDeps, signal?: AbortSignal) {
+async function runStageGates(spec: StageSpec, run: RunRecord, deps: PipelineDeps, attempt: number, signal?: AbortSignal) {
+  const worktree = spec.isolated?.worktree ?? run.worktree;
   const log = deps.log ?? (() => {});
   const checks = spec.browserCheck ? [...spec.gates, BROWSER_CHECK] : spec.gates;
   const gates: GateRecord[] = [];
   for (const [index, command] of checks.entries()) {
-    const gate = index === spec.gates.length
+    const browser = index === spec.gates.length;
+    deps.store.event(run.id, { stage: spec.name, attempt, type: "gate_start", command });
+    const gate = browser
       ? await checkBrowser(worktree, deps.gateTimeoutMs, signal)
       : await sh(command, worktree, deps.gateTimeoutMs, signal);
     if (signal?.aborted) break;

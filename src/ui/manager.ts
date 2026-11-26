@@ -6,7 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentAnswer, AgentAsk, AgentQuestion, AgentRunner } from "../agent.ts";
 import { attachmentContext, parseFeedbackAttachments, resolveAttachments, writeFeedbackAttachments, type FeedbackAttachment } from "../attachments.ts";
 import { BROWSER_CHECK, checkBrowser } from "../browser-check.ts";
-import { DEPLOYMENT_LABELS, SHIPYARD_ROOT, WORKFLOW_DEPLOYMENT_PROVIDERS, isBudget, resolveProvider, validateRunOptions, type DeploymentProvider, type Provider, type RunEffort, type ShipyardConfig, type Target } from "../config.ts";
+import { DEPLOYMENT_LABELS, SHIPYARD_ROOT, WORKFLOW_DEPLOYMENT_PROVIDERS, isBudget, providerOptions, resolveProvider, validateRunOptions, type DeploymentProvider, type Provider, type RunEffort, type ShipyardConfig, type Target } from "../config.ts";
 import { addTargetToConfigFile, cloneRepo, defaultRepoRoots, findLocalRepos, inspectRepo, validateTargetName, type RepoInspection } from "../targets.ts";
 import { DEFAULT_DEPS_REQUEST } from "../prompts.ts";
 import {
@@ -27,7 +27,7 @@ import {
 } from "../pipeline.ts";
 import { requireRole, type Role } from "../roles.ts";
 import { RunControl } from "../run-control.ts";
-import { git, sh } from "../exec.ts";
+import { git, isProjectCheckSandboxError, sh } from "../exec.ts";
 import { MAX_PUBLIC_REFERENCES, missingReferencePermissions, parseReferencePermissions, readPublicReference, referenceLinks, sharedReference, validReferenceText, type ReviewedReference } from "../references.ts";
 import { canPreview, startPreview, type LocalPreview } from "./preview.ts";
 import { launchLocalApp, LOCAL_APP_SCHEMA } from "./local-app.ts";
@@ -39,12 +39,19 @@ import { CloudRunReleases } from "./cloud-release.ts";
 import { FirebaseHostingReleases } from "./firebase-release.ts";
 import { WorkflowDeployments } from "./workflow-deployment.ts";
 import { parseReferenceDraft, ReferenceHandoffs, type ReferenceScope } from "./reference-handoff.ts";
+import { CHAT_SCHEMA, ChatProviderError, chatProviderFailure, chatResearch, chatSourceUrl, isLocalRunQuestion, parseChatMessages, parseChatReply, type ChatReply } from "./chat.ts";
+import { isHostedProjectUrl, repositoryChat } from "./repository-chat.ts";
+import { findHostedRepositories } from "./repository-discovery.ts";
+import { ChatAttachments } from "./chat-attachments.ts";
+import { ChatHistory, type ChatSummary } from "./chat-history.ts";
 import { gateOk, recoverableStage, repairableRevisionStage, RunStore, type GateRecord, type RunKind, type RunRecord } from "../store.ts";
 import { changedFiles, commitTree, createWorktree, detachedWorktree, diffSinceHead, repoRoot, squashCommit, withRepoLock, worktreeSnapshot, type WorktreeDiff } from "../worktree.ts";
 
 /** Everything the UI is told about, as it happens. */
 export type LiveMessage =
   | { type: "run"; run: RunRecord }
+  | { type: "chat-web"; turnId: string; activity: "search" | "read" }
+  | { type: "chat-history"; chat: ChatSummary }
   | { type: "run-deleted"; runId: string }
   | { type: "preview"; runId: string; url?: string }
   | { type: "local-app"; runId: string; app?: { url?: string; starting: boolean } }
@@ -110,6 +117,8 @@ export interface StartRequest {
   kind: RunKind;
   request: string;
   attachments?: unknown;
+  chatAttachmentIds?: unknown;
+  parallelReviews?: unknown;
   checkpoints: StageName[];
   provider?: string;
   /** One of the chosen provider’s models. The default model when unset. */
@@ -136,6 +145,7 @@ export interface ManagerOptions {
   log?: (line: string) => void;
   /** The config file new targets are saved to. Without it (demo mode), adding repos is off. */
   configFile?: string;
+  hostedRepositoryLookup?: typeof findHostedRepositories;
 }
 
 interface LocalAppSession {
@@ -151,6 +161,8 @@ interface LocalAppSession {
 export class RunManager {
   readonly bus = new EventEmitter();
   readonly store: LiveRunStore;
+  readonly chatHistory: ChatHistory;
+  private readonly chatAttachments: ChatAttachments;
   private readonly pending = new Map<string, { item: InboxItem; resolve: (answer: InboxAnswer<FeedbackAttachment[]> | undefined) => void }>();
   private readonly allowedForRun = new Map<string, Set<string>>();
   private readonly active = new Map<string, Promise<RunRecord | undefined>>();
@@ -175,6 +187,8 @@ export class RunManager {
   constructor(private readonly opts: ManagerOptions) {
     this.bus.setMaxListeners(100);
     this.store = new LiveRunStore(opts.runsDir ?? opts.config.runsDir, (m) => this.emit(m));
+    this.chatAttachments = new ChatAttachments(join(opts.runsDir ?? opts.config.runsDir, ".chat-attachments"));
+    this.chatHistory = new ChatHistory(join(opts.runsDir ?? opts.config.runsDir, ".chat-history"), (chat) => this.emit({ type: "chat-history", chat }));
     for (const source of this.store.list()) {
       if (source.deployment?.phase === "publishing" && source.deployment.workflowRun) this.trackDeployment(source.id);
       const receipt = source.kind !== "deployment" ? source.firebaseRelease : undefined;
@@ -205,10 +219,16 @@ export class RunManager {
     return Boolean(this.opts.configFile);
   }
 
+  chatProviders(): Provider[] {
+    return this.opts.codexRunner ? ["claude", "codex"] : ["claude"];
+  }
+
   /** Repos on this machine that could be added, for the Add repo list. */
   repoSuggestions() {
     const taken = this.targets().map((t) => t.path);
-    return findLocalRepos(defaultRepoRoots(SHIPYARD_ROOT), [SHIPYARD_ROOT, ...taken]);
+    const roots = defaultRepoRoots(SHIPYARD_ROOT);
+    if (this.opts.configFile) roots.unshift(join(dirname(this.opts.configFile), ".shipyard", "repos"));
+    return findLocalRepos(roots, [SHIPYARD_ROOT, ...taken]);
   }
 
   inspectRepo(path: string): Promise<RepoInspection> {
@@ -218,6 +238,9 @@ export class RunManager {
   cloneTarget(input: unknown): Promise<RepoInspection> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     if (!this.opts.configFile) throw new UserError("Cloning repos is off in demo mode");
+    if (typeof input === "string" && isHostedProjectUrl(input.trim())) {
+      throw new UserError("This address opens a deployed website. Use the source repository’s HTTPS or SSH clone URL.");
+    }
     const url = gitRemoteUrl(input);
     const pending = this.clones.get(url);
     if (pending) return pending;
@@ -267,6 +290,105 @@ export class RunManager {
     return this.active.get(runId) ?? Promise.resolve(this.store.get(runId) ?? undefined);
   }
 
+  uploadChatAttachments(input: unknown) {
+    try { return this.chatAttachments.upload(input); }
+    catch (error) { throw new UserError((error as Error).message); }
+  }
+
+  async chat(input: { messages?: unknown; target?: unknown; provider?: unknown; attachmentIds?: unknown; runId?: unknown; turnId?: unknown;
+    conversationId?: unknown; firstRecentId?: unknown }, disconnected: AbortSignal): Promise<ChatReply> {
+    if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
+    const messages = parseChatMessages(input.messages);
+    if (!messages) throw new UserError("Enter a message of up to 3,500 characters");
+    const targets = this.targets();
+    const run = typeof input.runId === "string" ? this.store.get(input.runId) : undefined;
+    const signal = AbortSignal.any([this.stopResultChecks.signal, disconnected]);
+    const setup = !input.runId && await repositoryChat(messages, targets, this.canAddTargets ? {
+      local: () => this.repoSuggestions(),
+      hosted: (site, owner) => (this.opts.hostedRepositoryLookup ?? findHostedRepositories)(site, signal, owner),
+      clone: (url) => {
+        signal.throwIfAborted();
+        return this.cloneTarget(url);
+      },
+    } : undefined);
+    if (setup && !setup.needsResearch) return setup;
+    const fallback: ChatReply | undefined = setup ? { text: setup.text, options: [], repoActions: setup.repoActions } : undefined;
+    const question = messages.at(-1)!.content;
+    if (run?.finishedAt && !run.deployment && isLocalRunQuestion(question) &&
+        (input.attachmentIds === undefined || Array.isArray(input.attachmentIds) && !input.attachmentIds.length)) {
+      const runAnswer = await this.answerRunQuestion(run.id, question);
+      return { text: [runAnswer.heading, ...runAnswer.details].join("\n\n"), options: [], runAnswer };
+    }
+    const target = targets.find(({ name }) => name === input.target);
+    if (input.target && !target) throw new UserError("Choose a configured repository");
+    let provider: Provider;
+    try {
+      provider = resolveProvider(input.provider ?? this.opts.config.defaultProvider);
+    } catch (error) {
+      throw new UserError((error as Error).message);
+    }
+    const runner = provider === "codex" ? this.opts.codexRunner : this.opts.runner;
+    if (!runner) {
+      if (fallback) return fallback;
+      throw new ChatProviderError("provider-unavailable");
+    }
+    let files;
+    try { files = await this.chatAttachments.forReply(input.attachmentIds); }
+    catch (error) { throw new UserError((error as Error).message); }
+    const timeout = AbortSignal.timeout(120_000);
+    let searched = false;
+    const pages = new Set<string>();
+    const turnId = typeof input.turnId === "string" && /^[a-f0-9-]{36}$/i.test(input.turnId) ? input.turnId : undefined;
+    const result = await runner.run({
+      role: requireRole(this.opts.roles, "chat-advisor"),
+      cwd: SHIPYARD_ROOT,
+      lane: "none",
+      advisoryOnly: true,
+      prompt: JSON.stringify({ target: run?.target ?? target?.name ?? "", targets: targets.map(({ name, e2e }) => ({ name, e2e: Boolean(e2e) })), messages,
+        earlierConversation: this.chatHistory.earlierContext(input.conversationId, input.runId, input.firstRecentId),
+        run: run ? { request: run.request, status: run.status, active: this.active.has(run.id),
+          awaitingInput: this.inbox().filter(({ runId }) => runId === run.id).map(({ role, stage, kind }) => ({ role, stage, kind })),
+          stages: run.stages.map(({ name, role, status, attempts }) => ({ name, role, status,
+            summary: attempts.at(-1)?.summary?.slice(0, 1_200), checks: attempts.at(-1)?.gates.map((gate) => ({ command: gate.command, passed: gateOk(gate) })),
+          })),
+        } : undefined,
+        repositoryLookup: fallback ? { result: fallback.text, candidates: fallback.repoActions?.flatMap((action) =>
+          action.kind === "add-repo" && action.locator?.startsWith("https://github.com/") ? [action.locator] : []) } : undefined,
+        attachments: files.context.length ? files.context : undefined,
+      }),
+      images: files.images.length ? files.images : undefined,
+      outputSchema: CHAT_SCHEMA,
+      signal: AbortSignal.any([this.stopResultChecks.signal, disconnected, timeout]),
+      model: providerOptions(this.opts.config, provider).model,
+      effort: "low",
+      maxBudgetUsd: Math.min(this.opts.config.maxBudgetUsdPerStage, 1),
+      onEvent: (event) => {
+        if (event.type !== "tool") return;
+        if (event.tool === "WebSearch") {
+          searched = true;
+          if (turnId) this.emit({ type: "chat-web", turnId, activity: "search" });
+        }
+        if (event.tool === "WebRead") {
+          const url = chatSourceUrl(event.detail);
+          if (url && pages.size < 12) pages.add(url);
+          if (turnId) this.emit({ type: "chat-web", turnId, activity: "read" });
+        }
+      },
+    }).catch((error: unknown) => {
+      if (fallback) return undefined;
+      if (timeout.aborted) throw new ChatProviderError("provider-timeout");
+      throw chatProviderFailure(error instanceof Error ? error.message : undefined);
+    });
+    if (fallback && (!result?.ok || timeout.aborted)) return fallback;
+    if (timeout.aborted) throw new ChatProviderError("provider-timeout");
+    if (!result?.ok) throw chatProviderFailure(result?.error);
+    const reply = parseChatReply(result.structured, targets, target);
+    const web = chatResearch(result.structured, searched, pages);
+    if (fallback) return reply && web?.sources.length ? { ...fallback, text: reply.text, web } : fallback;
+    if (!reply) throw new ChatProviderError("provider-response");
+    return web ? { ...reply, web } : reply;
+  }
+
   /** Start a run in the background and return its id straight away. */
   start(req: StartRequest): string {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
@@ -295,10 +417,11 @@ export class RunManager {
       throw new UserError(`implementer must be ${IMPLEMENTERS.join(" or ")}`);
     }
     if (req.browserAccess !== undefined && typeof req.browserAccess !== "boolean") throw new UserError("Browser access must be true or false");
+    if (req.parallelReviews !== undefined && typeof req.parallelReviews !== "boolean") throw new UserError("Parallel reviews must be true or false");
     if (req.browserReferenceHelp !== undefined && typeof req.browserReferenceHelp !== "boolean") throw new UserError("Browser reference help must be true or false");
 
     const id = makeRunId(request);
-    const attachments = this.saveAttachments(id, req.attachments, true);
+    const attachments = this.saveAttachments(id, req.attachments, true, req.chatAttachmentIds);
     return this.startPipeline({
       target,
       kind: req.kind,
@@ -308,12 +431,13 @@ export class RunManager {
       model: req.model,
       effort: req.effort,
       crew: req.crew,
+      parallelReviews: req.parallelReviews,
       implementer: req.implementer,
       browserAccess: req.browserAccess,
       referenceUrls,
       browserReferenceHelp: req.browserReferenceHelp,
       budgetUsd: req.budgetUsd,
-    }, req.checkpoints, id);
+    }, req.parallelReviews && req.checkpoints.includes("security") ? [...req.checkpoints, "security-recheck"] : req.checkpoints, id);
   }
 
   resume(runId: string, mode: "resume" | "recheck" | "fix" = "resume", budgetUsd?: unknown): void {
@@ -327,7 +451,8 @@ export class RunManager {
     const stage = mode === "recheck" ? recoverableStage(run) : mode === "fix" ? repairableRevisionStage(run) : undefined;
     if (mode === "fix" && !stage) throw new UserError("There is no failed revision stage the crew can repair here");
     if (mode === "recheck" && !stage) throw new UserError("This run has no failed check that can be rechecked on the saved edits");
-    if (mode === "resume" && run.status !== "running" && run.status !== "stopped" && !(pause && budgetUsd !== undefined)) {
+    const sandboxInterrupted = run.status === "error" && isProjectCheckSandboxError(run.error);
+    if (mode === "resume" && run.status !== "running" && run.status !== "stopped" && !sandboxInterrupted && !(pause && budgetUsd !== undefined)) {
       throw new UserError(pause ? "Approve a higher budget to continue this run" : "Only stopped or interrupted runs can be resumed");
     }
     if (this.verifications.has(runId)) throw new UserError("Wait for the current project checks to finish");
@@ -357,7 +482,7 @@ export class RunManager {
     }, checkpoints, run.id, { recheckStage: mode === "recheck" ? stage?.name : undefined, repairStage: mode === "fix" ? stage?.name : undefined });
   }
 
-  async startFollowUp(runId: string, input: { message?: unknown; provider?: unknown; browserAccess?: unknown; referenceUrls?: unknown; browserReferenceHelp?: unknown; attachments?: unknown }): Promise<string> {
+  async startFollowUp(runId: string, input: { message?: unknown; provider?: unknown; browserAccess?: unknown; referenceUrls?: unknown; browserReferenceHelp?: unknown; attachments?: unknown; chatAttachmentIds?: unknown }): Promise<string> {
     if (this.shuttingDown) throw new UserError("Shipyard is shutting down");
     const run = this.inactiveBranchRun(runId);
     const message = typeof input.message === "string" ? input.message.trim() : "";
@@ -406,7 +531,7 @@ export class RunManager {
           return { ...check, browserHelpSkipped: undefined };
         });
         const id = makeRunId(message);
-        const attachments = this.saveAttachments(id, input.attachments, true);
+        const attachments = this.saveAttachments(id, input.attachments, true, input.chatAttachmentIds);
         this.startPipeline({
           target, kind: "feature", request: message, provider, crew: [],
           browserAccess: browserAccess ?? run.browserAccess,
@@ -425,10 +550,10 @@ export class RunManager {
     }
   }
 
-  private saveAttachments(runId: string, input: unknown, newRun = false): FeedbackAttachment[] | undefined {
+  private saveAttachments(runId: string, input: unknown, newRun = false, chatAttachmentIds?: unknown): FeedbackAttachment[] | undefined {
     let files: ReturnType<typeof parseFeedbackAttachments>;
     try {
-      files = parseFeedbackAttachments(input);
+      files = [...this.chatAttachments.forRun(chatAttachmentIds), ...parseFeedbackAttachments(input)];
     } catch (error) {
       throw new UserError((error as Error).message);
     }
@@ -496,7 +621,7 @@ export class RunManager {
     return id;
   }
 
-  controlRun(runId: string, input: { action?: unknown; message?: unknown; provider?: unknown; attachments?: unknown }): void {
+  controlRun(runId: string, input: { action?: unknown; message?: unknown; provider?: unknown; attachments?: unknown; chatAttachmentIds?: unknown }): void {
     const control = this.controls.get(runId);
     if (!control || control.stopped) throw new UserError("This run has finished or is stopping");
     const { action } = input;
@@ -516,7 +641,7 @@ export class RunManager {
       provider = input.provider;
       if (provider === "codex" && !this.opts.codexRunner) throw new UserError("Codex runs are unavailable in this UI session");
     }
-    const attachments = this.saveAttachments(runId, input.attachments);
+    const attachments = this.saveAttachments(runId, input.attachments, false, input.chatAttachmentIds);
     this.store.event(runId, { type: action === "steer" ? "steer_requested" : "provider_requested", provider, message, attachments });
     control.redirect(provider, message, attachments);
     if (provider) {
@@ -691,6 +816,8 @@ export class RunManager {
       latestRevisionId: historical ? latest.id : undefined,
       budgetPause: !historical && !run.cleanedUp && target && uncommitted !== undefined ? budgetPause(run) : undefined,
       canGiveFeedback: !historical && uncommitted?.length === 0 && this.canGiveFeedback(run),
+      canResumeProjectCheck: !historical && uncommitted !== undefined && Boolean(target) &&
+        run.status === "error" && isProjectCheckSandboxError(run.error),
       canPrepareBranch: !historical && uncommitted?.length === 0 && this.canPrepareBranch(run),
       publish: destination && canPush ? {
         remote: destination.remote, label: destination.label, destination: destination.key, head,

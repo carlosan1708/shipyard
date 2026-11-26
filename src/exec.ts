@@ -41,17 +41,60 @@ export function localProcess(command: string, args: string[], hostLoopback = fal
     "Shipyard needs the macOS network sandbox or Linux bubblewrap to run project checks.");
 }
 
+/** MXC allows the test's loopback server while the proxy has no external destinations to allow. */
+function windowsGate(executable: string, args: string[], cwd: string, ready: string, verbatim: boolean): [string, string[]] {
+  const token = JSON.stringify(join(SHIPYARD_ROOT, ".shipyard", "ui-token").replaceAll("\\", "/"));
+  const profile = 'permissions.shipyard-checks={ extends=":workspace", ' +
+    `filesystem={ ${token}="deny" }, ` +
+    'network={ enabled=true, allow_local_binding=true, allow_upstream_proxy=false, domains={} } }';
+  const launcher = `
+    const { spawn } = require("node:child_process");
+    process.stdout.write(${JSON.stringify(ready)});
+    const child = spawn(${JSON.stringify(executable)}, ${JSON.stringify(args)},
+      { stdio: ["ignore", "inherit", "inherit"], windowsHide: true, windowsVerbatimArguments: ${verbatim} });
+    process.stdin.once("data", () => process.exit(124));
+    child.once("error", (error) => console.error(error.message));
+    child.once("close", (code) => { process.stdin.pause(); process.exitCode = code ?? 1; });
+  `;
+  return ["codex", [
+    "-c", "windows.sandbox=mxc", "-c", "features.network_proxy=true", "-c", profile,
+    "sandbox", "--include-managed-config", "--permission-profile", "shipyard-checks",
+    "-C", cwd, "--", process.execPath, "-e", launcher,
+  ]];
+}
+
+export function isProjectCheckSandboxError(message: string | undefined): boolean {
+  return Boolean(message?.startsWith("Could not start the project check in its network sandbox:") ||
+    message === "Shipyard needs the macOS network sandbox or Linux bubblewrap to run project checks.");
+}
+
 /**
  * Run a shell command (a gate) and capture stdout+stderr together.
  * Runs in its own process group so a hung test server is killed on timeout.
  */
-export async function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, signal?: AbortSignal): Promise<ExecResult> {
+export function sh(command: string, cwd: string, timeoutMs?: number, signal?: AbortSignal): Promise<ExecResult> {
+  const windows = process.platform === "win32";
+  const program = windows ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
+  const args = windows ? ["/d", "/s", "/v:off", "/c", `"${command}"`] : ["-c", command];
+  return projectCheck(command, program, args, cwd, timeoutMs, signal, windows);
+}
+
+/** Pass internally generated check arguments directly, including paths containing spaces. */
+export function checkExecutable(program: string, args: string[], cwd: string, timeoutMs?: number, signal?: AbortSignal): Promise<ExecResult> {
+  const command = [program, ...args].map((arg) => JSON.stringify(arg)).join(" ");
+  return projectCheck(command, program, args, cwd, timeoutMs, signal);
+}
+
+async function projectCheck(command: string, program: string, commandArgs: string[], cwd: string,
+  timeoutMs = 10 * 60_000, signal?: AbortSignal, verbatim = false): Promise<ExecResult> {
   const started = Date.now();
   if (signal?.aborted) return { command, code: 130, output: "", durationMs: 0, timedOut: false };
   const verdict = checkCommand(command, {});
   if (verdict.blocked) throw new Error(verdict.reason);
   const ready = "[shipyard: sandbox ready]\n";
-  const [executable, args] = localProcess("/bin/sh", ["-c", 'printf "%s\\n" "$1"; exec /bin/sh -c "$2"', "shipyard", ready.trimEnd(), command]);
+  const windows = process.platform === "win32";
+  const [executable, args] = windows ? windowsGate(program, commandArgs, cwd, ready, verbatim) :
+    localProcess("/bin/sh", ["-c", 'printf "%s\\n" "$1"; shift; exec "$@"', "shipyard", ready.trimEnd(), program, ...commandArgs]);
   return new Promise((resolvePromise, reject) => {
     // Gates must see a clean environment. NODE_TEST_CONTEXT in particular makes a nested
     // `node --test` report to its parent instead of exiting non-zero on failure.
@@ -66,19 +109,28 @@ export async function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, 
     }
     const child = spawn(executable, args, {
       cwd,
-      detached: true,
+      detached: !windows,
+      windowsHide: true,
       env: { ...env, CI: "1", FORCE_COLOR: "0", NO_COLOR: "1" },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [windows ? "pipe" : "ignore", "pipe", "pipe"],
     });
     let output = "";
     let timedOut = false;
-    child.stdout.on("data", (d) => (output += d));
-    child.stderr.on("data", (d) => (output += d));
+    child.stdout?.on("data", (d) => (output += d));
+    child.stderr?.on("data", (d) => (output += d));
+    child.stdin?.on("error", () => {}); // The sandbox may exit just before a cancellation arrives.
+    let cancelFallback: NodeJS.Timeout | undefined;
     const kill = () => {
       if (child.pid === undefined) return;
+      if (windows) {
+        if (cancelFallback) return;
+        // Ending the foreground launcher tells MXC to terminate its sandboxed child processes.
+        child.stdin?.end("stop\n");
+        cancelFallback = setTimeout(() => child.kill("SIGKILL"), 2000);
+        return;
+      }
       try {
-        if (process.platform === "win32") child.kill("SIGKILL");
-        else process.kill(-child.pid, "SIGKILL");
+        process.kill(-child.pid, "SIGKILL");
       } catch {
         child.kill("SIGKILL");
       }
@@ -88,9 +140,11 @@ export async function sh(command: string, cwd: string, timeoutMs = 10 * 60_000, 
       timedOut = true;
       kill();
     }, timeoutMs);
+    if (signal?.aborted) kill();
     child.on("error", (error) => { output += error.message; });
     child.on("close", (code) => {
       clearTimeout(timer);
+      clearTimeout(cancelFallback);
       signal?.removeEventListener("abort", kill);
       if (!output.includes(ready) && !signal?.aborted && !timedOut) {
         reject(new Error(`Could not start the project check in its network sandbox: ${output.trim() || executable}`));

@@ -31,9 +31,15 @@ npm ci
 npm run shipyard -- ui --demo
 ```
 
-Choose **New run** and enter `Add a GET /health endpoint that returns {"status": "ok"}.` Answer the planner and approve its plan, then review the implementation and revision checkpoints. You can deny the optional web request and still finish the run.
+In **Chat**, enter `Add a GET /health endpoint that returns {"status": "ok"}.` Compare the focused and reviewed options and choose **Review setup** to edit the crew and checkpoints before starting. The reviewed option includes a planner and independent end-to-end verification. You can also configure a run directly with **New run**.
 
-For live agent runs, sign in with `claude auth login` or `codex login`, then run `npm run shipyard -- ui`. Under **New run → Add repo**, choose a local Git checkout or clone a Git URL, and review the detected test commands. Live runs use your selected provider account. [Provider settings and usage](docs/reference.md#providers-and-usage)
+For live agent runs, sign in with `claude auth login` or `codex login`, then run `npm run shipyard -- ui`. The **Repository** dropdown in chat shows added repos and local Git checkouts Shipyard finds. Select a local checkout to review and confirm its test commands. Use **Add repo** to enter a folder or clone a Git URL. Live runs use your selected provider account. [Provider settings and usage](docs/reference.md#providers-and-usage)
+
+Chat uses the provider you select. Claude and Codex can search the web and read public pages during planning, follow-ups, and conversations about active or finished runs. Research replies show links to their sources. To find the source of a hosted site, paste its URL and ask for the source repo. Shipyard checks repository metadata using your existing GitHub CLI sign-in, and can clone a verified match when you ask it to. Attach files, paste screenshots, or drop files into the composer. When you review a run or send a revision or instruction, you can keep or remove the original chat attachments before confirming. Chat can read images and text excerpts from text files, PDFs with embedded text, and Word documents. Other files are kept for the run.
+
+The run panel shows which subagents are active, queued, or working in parallel. When both code review and security review are enabled, they can inspect the same commit on separate snapshots. Independent runs can also overlap in separate worktrees. Answer questions and review checkpoints in the conversation. Completed runs show the outcome and a suggested next step in chat. **Run details** gives a short summary, with logs, checks, and the handoff under **Technical details**. Type **Open preview**, **Run browser check**, or **Request code changes** in chat. **Commands** shows the actions available for the current run.
+
+The **Chats** list keeps conversations on this computer under Shipyard’s run-history directory. Open a saved chat to continue with its earlier context. Reload open tabs from older versions to import any conversations still stored in those tabs.
 
 You can also launch from a coding chat with the [Codex skill](docs/reference.md#codex-skill) or the [Claude Code plugin](docs/reference.md#claude-code-plugin).
 

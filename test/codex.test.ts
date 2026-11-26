@@ -73,15 +73,42 @@ function fakeExecutable(root: string): string {
   return path;
 }
 
+test("Codex advisory chat enables native web search and emits search and page events", async (t) => {
+  const cwd = fixture(t);
+  // The runner normally starts `codex exec`. Node can run a fixture named `exec` on every platform.
+  writeFileSync(join(cwd, "exec"), `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.readFileSync(0, "utf8");
+console.log(JSON.stringify({type: "item.completed", item: {type: "web_search", query: "Node.js test runner"}}));
+console.log(JSON.stringify({type: "item.completed", item: {type: "web_search", query: "", action: {type: "open_page", url: "https://nodejs.org/api/test.html"}}}));
+console.log(JSON.stringify({type: "turn.completed"}));
+fs.writeFileSync(args[args.indexOf("--output-last-message") + 1], JSON.stringify(args));
+`);
+  const events: AgentEvent[] = [];
+  const runner = new CodexAgentRunner(10_000, process.execPath);
+  const reply = await runner.run({ role: requireRole(loadRoles(), "chat-advisor"), prompt: "Find the documentation", cwd, lane: "none", advisoryOnly: true,
+    onEvent: (event) => events.push(event) });
+  assert.ok(reply.ok, reply.error ?? "Codex advisory runner failed");
+  const args = JSON.parse(reply.summary) as string[];
+  assert.ok(args.includes('web_search="live"'));
+  assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
+  assert.ok(args.includes("features.shell_tool=false"));
+  assert.ok(args.includes('mcp_servers.shipyard_browser.enabled_tools=["read_public_page"]'));
+  assert.deepEqual(events, [
+    { type: "tool", tool: "WebSearch", detail: "Node.js test runner" },
+    { type: "tool", tool: "WebRead", detail: "https://nodejs.org/api/test.html" },
+  ]);
+});
+
 test("Codex reads JSONL events and final structured output, and resumes with the current lane", async (t) => {
   const root = fixture(t);
-  const executable = fakeExecutable(root);
   const repo = join(root, "repo");
-  writeFiles(repo, { "README.md": "# test\n" });
+  writeFiles(repo, { "README.md": "# test\n", exec: fake });
   await initRepoWithCommit(repo);
   const events: AgentEvent[] = [];
   const role = requireRole(loadRoles(), "reviewer");
-  const runner = new CodexAgentRunner(10_000, executable);
+  const runner = new CodexAgentRunner(10_000, process.execPath);
   const review = await runner.run({ role, lane: "none", cwd: repo, prompt: "Review the change", outputSchema: REVIEW_SCHEMA, onEvent: (event) => events.push(event) });
   assert.ok(review.ok, review.error ?? "Review failed");
   assert.equal(review.sessionId, "thread-abc");
@@ -96,7 +123,11 @@ test("Codex reads JSONL events and final structured output, and resumes with the
   const { args, prompt } = JSON.parse(retry.summary) as { args: string[]; prompt: string };
   assert.equal(args[args.indexOf("resume") + 1], "thread-abc");
   assert.equal(args[args.indexOf("--model") + 1], "codex-test");
-  assert.ok(args.includes('sandbox_mode="workspace-write"'));
+  assert.equal(args[args.indexOf("--sandbox") + 1], "workspace-write");
+  if (process.platform === "win32") {
+    assert.ok(args.includes('windows.sandbox="elevated"'));
+    assert.ok(args.includes("features.prefer_mxc=true"));
+  }
   assert.ok(args.includes('model_reasoning_effort="xhigh"'));
   assert.ok(args.includes("sandbox_workspace_write.network_access=false"));
   assert.ok(args.includes('approval_policy="never"'));
@@ -109,7 +140,7 @@ test("Codex reads JSONL events and final structured output, and resumes with the
   const plan = await runner.run({ role, lane: "none", cwd: repo, prompt: "Plan it", images: [{ path: image, mediaType: "image/png" }] });
   assert.ok(plan.ok, plan.error ?? "Plan failed");
   const planArgs = JSON.parse(plan.summary).args;
-  assert.ok(planArgs.includes('sandbox_mode="read-only"'));
+  assert.equal(planArgs[planArgs.indexOf("--sandbox") + 1], "read-only");
   assert.ok(!planArgs.includes("--model"));
   assert.ok(!planArgs.some((arg: string) => arg.startsWith("model_reasoning_effort=")));
   assert.equal(planArgs[planArgs.indexOf("--image") + 1], image);

@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { AgentRequest, AgentResult, AgentRunner } from "../agent.ts";
+import type { ChatMessage, ChatReply } from "./chat.ts";
 
 /**
  * A scripted crew for `shipyard ui --demo`: it makes real, passing changes to the demo-shop app,
@@ -28,6 +29,11 @@ export class DemoRunner implements AgentRunner {
     let summary: string;
     let structured: unknown;
     switch (req.role.name) {
+      case "chat-advisor":
+        await sleep(this.stepMs, undefined, { signal: req.signal });
+        structured = await demoChat(req.prompt, tool);
+        summary = "Suggested demo run options.";
+        break;
       case "local-app":
         await tool("Read", join(req.cwd, "package.json"));
         structured = existsSync(join(req.cwd, "index.html"))
@@ -271,6 +277,38 @@ export class DemoRunner implements AgentRunner {
     await tool("Bash", "npm run e2e");
     return "Added e2e/smoke.e2e.test.js: the product list and cart still work over real HTTP after the change. No defects found.";
   }
+}
+
+async function demoChat(prompt: string, tool: Tool): Promise<ChatReply & { sources?: Array<{ title: string; url: string }> }> {
+  const { messages } = JSON.parse(prompt) as { messages: ChatMessage[] };
+  const requests = messages.filter(({ role }) => role === "user").map(({ content }) => content);
+  const latest = requests.at(-1) ?? "";
+  if (/\bsearch (?:the )?web\b/i.test(latest)) {
+    const url = "https://nodejs.org/api/test.html";
+    await tool("WebSearch", "Node.js test runner documentation");
+    await tool("WebRead", url);
+    return { text: "The demo’s example source is the Node.js test runner reference.", options: [],
+      sources: [{ title: "Node.js test runner documentation", url }] };
+  }
+  const original = requests.find((request) => /health|endpoint|uptime/i.test(request));
+  if (!original) return { text: "The demo shop can walk through adding a health endpoint. What should GET /health return?", options: [] };
+  const kind = /\b(fix|bug|404)\b/i.test(original) ? "bug" : "feature";
+  const request = [original, ...(latest === original ? [] : [`Follow-up: ${latest}`])].join("\n");
+  const option = { request, target: "demo-shop", kind } as const;
+  const triage = kind === "bug" ? ["triage" as const] : [];
+  if (latest !== original && /\b(quick|lean|minimal|fast|first)\b/i.test(latest)) {
+    return { text: "The focused run keeps the project checks and uses the smaller crew.", options: [
+      { ...option, title: "Focused change", detail: "Build and test the endpoint with a smaller crew.", crew: [...triage] },
+    ] };
+  }
+  if (/\b(security|parallel|audit)\b/i.test(latest)) return { text: "The code reviewer and security auditor can inspect the same change in parallel.", options: [
+    { ...option, title: "Parallel reviews", detail: "The implementer builds the endpoint first. Code and security reviewers inspect isolated copies before any follow-up fixes.",
+      crew: [...triage, "review", "security"] },
+  ] };
+  return { text: "The demo can implement this with a focused crew or add independent review and end-to-end verification.", options: [
+    { ...option, title: "Focused change", detail: "Build and test the endpoint with a smaller crew.", crew: [...triage] },
+    { ...option, title: "Reviewed change", detail: "The planner confirms the expected response. The reviewer and E2E tester independently check the result.", crew: [...triage, "plan", "review", "e2e", "repair"] },
+  ] };
 }
 
 type Tool = (name: string, detail: string, effect?: () => void) => Promise<void>;
