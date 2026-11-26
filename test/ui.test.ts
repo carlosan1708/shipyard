@@ -2196,9 +2196,16 @@ test("rechecking a failed revision verifies saved edits and continues the same r
   config.maxGateRetries = 0;
   const target = config.targets.t0!;
   target.test = 'node -e "0"';
-  target.e2e = "sh e2e/metric.sh";
-  const e2eCheck = (metric: number) => `grep -q '${metric}%' index.html || { echo "Missing metric ${metric}%"; exit 1; }\n`;
-  writeFiles(target.path, { "index.html": "<p>50%</p>", "e2e/metric.sh": e2eCheck(50) });
+  const checkPath = "e2e/metric.cjs";
+  target.e2e = `node ${checkPath}`;
+  const e2eCheck = (metric: number) => `
+const html = require('node:fs').readFileSync('index.html', 'utf8');
+if (!html.includes('${metric}%')) {
+  console.error('Missing metric ${metric}%');
+  process.exitCode = 1;
+}
+`;
+  writeFiles(target.path, { "index.html": "<p>50%</p>", [checkPath]: e2eCheck(50) });
   await commitAll(target.path, "Add the original portfolio metric");
   const plan: Step = () => ({ structured: { assignments: [
     { role: "frontend", task: "Update the displayed metric" },
@@ -2207,7 +2214,7 @@ test("rechecking a failed revision verifies saved edits and continues the same r
   const update: Step = (req) => writeFiles(req.cwd, { "index.html": "<p>18%</p>" });
   const docs: Step = (req) => {
     assert.equal(req.role.name, "docs-writer");
-    assert.match(readFileSync(join(req.cwd, "e2e/metric.sh"), "utf8"), /18%/);
+    assert.match(readFileSync(join(req.cwd, checkPath), "utf8"), /18%/);
     writeFiles(req.cwd, { "README.md": "The corrected metric is 18%.\n" });
   };
   const unsuccessfulRepair: Step = () => ({ summary: "Could not repair the failed check." });
@@ -2238,7 +2245,7 @@ test("rechecking a failed revision verifies saved edits and continues the same r
       assert.equal(runner.calls.length, callsBeforeRecheck);
       assert.equal(await git(["rev-parse", "HEAD"], failed.worktree), failed.baseSha);
 
-      writeFiles(failed.worktree, { "e2e/metric.sh": e2eCheck(18) });
+      writeFiles(failed.worktree, { [checkPath]: e2eCheck(18) });
       assert.equal((await manager.result(id)).savedEditsCheck, "unchecked");
       assert.equal((await verify()).status, 200);
       assert.equal((await manager.result(id)).savedEditsCheck, "passed");
@@ -2256,10 +2263,10 @@ test("rechecking a failed revision verifies saved edits and continues the same r
       ]);
       assert.equal(runner.calls.length, callsBeforeRecheck + 1);
       assert.equal((await manager.result(id)).recheckStage, undefined);
-      assert.match(await git(["show", "HEAD:e2e/metric.sh"], failed.worktree), /18%/);
+      assert.match(await git(["show", `HEAD:${checkPath}`], failed.worktree), /18%/);
       assert.equal(await git(["status", "--porcelain"], failed.worktree), "");
     }
-    assert.match(readFileSync(join(target.path, "e2e/metric.sh"), "utf8"), /50%/);
+    assert.match(readFileSync(join(target.path, checkPath), "utf8"), /50%/);
   } finally {
     await Promise.all([manager.shutdown(), server.close()]);
   }
@@ -2272,9 +2279,17 @@ test("frontend revisions repair in place, with a dashboard retry when automatic 
   config.maxGateRetries = 0;
   const target = config.targets.t0!;
   target.test = 'node -e "0"';
-  target.e2e = "sh e2e/title.sh";
-  const check = (title: string) => `grep -Fq '${title}' index.html || { echo "Expected title: ${title}"; exit 1; }\n`;
-  writeFiles(target.path, { "index.html": "<h1>Original title</h1>", "e2e/title.sh": check("Original title") });
+  const checkPath = "e2e/title.cjs";
+  const checkCommand = `node ${checkPath}`;
+  target.e2e = checkCommand;
+  const check = (title: string) => `
+const html = require('node:fs').readFileSync('index.html', 'utf8');
+if (!html.includes(${JSON.stringify(title)})) {
+  console.error(${JSON.stringify(`Expected title: ${title}`)});
+  process.exitCode = 1;
+}
+`;
+  writeFiles(target.path, { "index.html": "<h1>Original title</h1>", [checkPath]: check("Original title") });
   await commitAll(target.path, "Add the original title and its test");
   const plan: Step = () => ({ structured: { assignments: [{ role: "frontend", task: "Change the heading" }] } });
   const frontend: Step = (req) => {
@@ -2287,7 +2302,7 @@ test("frontend revisions repair in place, with a dashboard retry when automatic 
     assert.equal(req.resumeSessionId, undefined);
     assert.match(req.prompt, /Expected title: Original title/);
     assert.match(readFileSync(join(req.cwd, "index.html"), "utf8"), /Updated title/);
-    writeFiles(req.cwd, { "e2e/title.sh": check("Updated title") });
+    writeFiles(req.cwd, { [checkPath]: check("Updated title") });
   };
   const requestDecision: Step = async (req) => {
     assert.equal(req.role.name, "backend");
@@ -2317,15 +2332,15 @@ test("frontend revisions repair in place, with a dashboard retry when automatic 
         assert.ok(inboxOrCompletion && "kind" in inboxOrCompletion && inboxOrCompletion.kind === "permission");
         const repairing = manager.store.get(id);
         assert.equal(repairing?.status, "running");
-        assert.equal(repairing?.stages.at(-1)?.autoRepair?.command, "sh e2e/title.sh");
+        assert.equal(repairing?.stages.at(-1)?.autoRepair?.command, checkCommand);
         manager.answer(inboxOrCompletion.id, { kind: "permission", decision: "allow" });
       }
       const automatic = await manager.whenDone(id);
       assert.equal(automatic?.status, "passed", automatic?.error ?? "Automatic repair did not pass");
       const repairedStage = automatic?.stages.at(-1);
-      assert.deepEqual(repairedStage?.autoRepair, { command: "sh e2e/title.sh", afterAttempt: 1 });
+      assert.deepEqual(repairedStage?.autoRepair, { command: checkCommand, afterAttempt: 1 });
       assert.deepEqual(repairedStage?.attempts.map(({ passed, role }) => [passed, role]), [[false, undefined], [true, "backend"]]);
-      assert.match(await git(["show", "HEAD:e2e/title.sh"], automatic!.worktree), /Updated title/);
+      assert.match(await git(["show", `HEAD:${checkPath}`], automatic!.worktree), /Updated title/);
 
       const retryId = await manager.startFollowUp(await startParent(provider), { message: "Still use Updated title as the heading", provider });
       const failed = await manager.whenDone(retryId);
@@ -2340,9 +2355,9 @@ test("frontend revisions repair in place, with a dashboard retry when automatic 
       assert.equal(recovered?.worktree, failed?.worktree);
       assert.deepEqual(recovered?.stages.map((stage) => stage.name), ["orchestrate", "frontend"]);
       assert.equal(recovered?.stages.at(-1)?.attempts.at(-1)?.role, "backend");
-      assert.match(await git(["show", "HEAD:e2e/title.sh"], recovered!.worktree), /Updated title/);
+      assert.match(await git(["show", `HEAD:${checkPath}`], recovered!.worktree), /Updated title/);
     }
-    assert.match(readFileSync(join(target.path, "e2e/title.sh"), "utf8"), /Original title/);
+    assert.match(readFileSync(join(target.path, checkPath), "utf8"), /Original title/);
   } finally {
     await Promise.all([manager.shutdown(), server.close()]);
   }
