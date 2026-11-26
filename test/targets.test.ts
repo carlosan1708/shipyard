@@ -69,7 +69,7 @@ test("inspectRepo uses the repo root, counts commits and warns about uncommitted
   writeFiles(repo, { "src/add.js": "// edited\n", "notes.txt": "new\n" });
   const info = await inspectRepo(join(repo, "src"), "/", {});
   assert.equal(info.ok, true);
-  assert.equal(info.path, realpathSync(repo));
+  assert.equal(realpathSync(info.path), realpathSync(repo));
   assert.equal(info.commits, 1);
   assert.equal(info.branch, "main");
   assert.ok(info.warnings.some((w) => /repository root/.test(w)));
@@ -130,9 +130,12 @@ test("the manager adds a repo live: saved to the file, broadcast, and usable for
   await assert.rejects(manager.addTarget({ name: "tiny", path: tempDir(), test: "npm test" }), /not a git repository/);
 
   const target = await manager.addTarget({ name: "tiny", path: repo, test: "npm test" });
-  assert.equal(target.path, realpathSync(repo));
+  assert.equal(realpathSync(target.path), realpathSync(repo));
   assert.match(readFileSync(configFile, "utf8"), /tiny:\n {4}path: .+\n {4}test: npm test/);
-  assert.deepEqual(messages.find((m) => m.type === "targets"), { type: "targets", targets: [{ name: "tiny", path: realpathSync(repo), e2e: false }] });
+  const updated = messages.find((m) => m.type === "targets");
+  assert.ok(updated);
+  assert.deepEqual(updated.targets.map((entry) => ({ ...entry, path: realpathSync(entry.path) })),
+    [{ name: "tiny", path: realpathSync(repo), e2e: false }]);
 
   const id = manager.start({ target: "tiny", kind: "feature", request: "touch a file", checkpoints: [] });
   assert.equal((await manager.whenDone(id))?.status, "passed");

@@ -91,7 +91,7 @@ test("a run delivers approved references and records warnings for links outside 
     writeFiles(req.cwd, { "README.md": "Updated the project." });
   }]);
   const run = await runPipeline({
-    target: { name: "fixture", path: await makeTargetRepo(), test: "true", browserAccess: true },
+    target: { name: "fixture", path: await makeTargetRepo(), test: 'node -e "0"', browserAccess: true },
     kind: "feature", request: "Use https://github.com/example and https://www.linkedin.com/in/unapproved", crew: [],
     browserAccess: false, referenceUrls: ["https://github.com/example"],
   }, { config: { model: "test", maxGateRetries: 0, worktreeRoot: tempDir() }, runner, store, roles: loadRoles() });
@@ -111,7 +111,7 @@ test("public links in a run request are read by default without approval", async
     assert.match(req.prompt, /Public source text/);
     writeFiles(req.cwd, { "README.md": "Updated the project." });
   }]);
-  const run = await runPipeline({ target: { name: "fixture", path: await makeTargetRepo(), test: "true" },
+  const run = await runPipeline({ target: { name: "fixture", path: await makeTargetRepo(), test: 'node -e "0"' },
     kind: "feature", request: `Use ${url}`, crew: [], browserReferenceHelp: true }, {
     config: { model: "test", maxGateRetries: 0, worktreeRoot: tempDir() }, runner, store: new RunStore(tempDir()), roles: loadRoles(),
     approveReference: async () => assert.fail("Public reads should not ask for approval"),

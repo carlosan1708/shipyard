@@ -13,6 +13,7 @@ import { loadRoles } from "../src/roles.ts";
 import { DemoRunner } from "../src/ui/demo.ts";
 import { RunManager, type InboxItem, type LiveMessage } from "../src/ui/manager.ts";
 import { startUiServer } from "../src/ui/server.ts";
+import { findTestExecutable, testPath, writeTestExecutable } from "./executables.ts";
 import { FakeRunner, makeTargetRepo, tempDir, UNIT_TEST, writeFiles, type Step } from "./helpers.ts";
 
 async function makeManager(steps: Step[] | "demo", targets = 1) {
@@ -529,8 +530,10 @@ test("'allow for this run' stops asking for that tool, but only in that run", as
   assert.equal(events.filter((e) => e.type === "auto-allowed").length, 1);
 });
 
-test("bad start requests are refused with a clear message", async () => {
-  const { manager } = await makeManager([]);
+test("bad start requests are refused with a clear message", () => {
+  const root = tempDir();
+  const config = parseConfig({ runsDir: "runs", targets: { t0: { path: ".", test: "npm test" } } }, root);
+  const manager = new RunManager({ config, roles: loadRoles(), runner: new FakeRunner([]) });
   assert.throws(() => manager.start({ target: "nope", kind: "bug", request: "x", checkpoints: [] }), /Unknown target/);
   assert.throws(() => manager.start({ target: "t0", kind: "bug", request: "  ", checkpoints: [] }), /Describe/);
   assert.throws(() => manager.start({ target: "t0", kind: "bug", request: "x", checkpoints: ["deploy" as never] }), /Unknown stage/);
@@ -576,7 +579,7 @@ test("the UI token survives restarts, is owner-only, and rotates on request", as
   const file = join(tempDir(), "sub", "ui-token");
   const first = loadOrCreateToken(file);
   assert.match(first, /^[0-9a-f]{48}$/);
-  assert.equal(statSync(file).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(statSync(file).mode & 0o777, 0o600);
   assert.equal(loadOrCreateToken(file), first, "restart keeps the token, so open tabs keep working");
   const rotated = loadOrCreateToken(file, true);
   assert.notEqual(rotated, first);
@@ -649,7 +652,7 @@ test("the server needs its token, checks Host and Origin, and serves the API", a
     const state = JSON.parse((await request(server.port, "/api/state", { headers: auth })).body);
     assert.equal(state.acceptsAttachments, true);
     assert.deepEqual(state.targets.map((t: { name: string }) => t.name), ["t0"]);
-    assert.deepEqual(state.stages, ["triage", "plan", "implement", "design", "review", "revise", "security", "harden", "e2e", "repair", "docs", "release", "cloud-release"]);
+    assert.deepEqual(state.stages, ["triage", "plan", "implement", "design", "review", "revise", "security", "security-recheck", "harden", "e2e", "repair", "docs", "release", "cloud-release"]);
     assert.deepEqual(state.optionalStages, ["triage", "plan", "design", "review", "security", "e2e", "repair", "docs", "release", "cloud-release"]);
     assert.deepEqual(state.implementers, ["backend", "frontend", "ui-ux"]);
     assert.deepEqual(state.config.models, ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
@@ -926,7 +929,7 @@ test("stop interrupts a running gate and keeps the worktree and unrelated runs",
   const { setTimeout: sleep } = await import("node:timers/promises");
   const { config } = await makeManager([], 2);
   config.targets.t0!.test = `node -e "require('node:fs').writeFileSync('gate-ready', 'ready'); setInterval(() => {}, 1000)"`;
-  config.targets.t1!.test = "true";
+  config.targets.t1!.test = 'node -e "0"';
   const runner = new FakeRunner([fix, fix]);
   const manager = new RunManager({ config, roles: loadRoles(), runner });
   const start = (target: string) => manager.start({ target, request: "Fix addition", kind: "feature", crew: [], checkpoints: [] });
@@ -1084,7 +1087,7 @@ test("completed runs persist an unread result and can acknowledge only the curre
 
 test("multiple references request approval and browser help independently before either provider starts", { timeout: 45_000 }, async (t) => {
   const { config } = await makeManager([]);
-  config.targets.t0!.test = "true";
+  config.targets.t0!.test = 'node -e "0"';
   const source = "https://www.linkedin.com/in/example";
   const other = "https://www.linkedin.com/in/another";
   const skipped = "https://www.linkedin.com/in/skip";
@@ -1157,7 +1160,7 @@ test("multiple references request approval and browser help independently before
 
 test("checking another reference after completion preserves previously reviewed notes", async (t) => {
   const { manager, config } = await makeManager([fix]);
-  config.targets.t0!.test = "true";
+  config.targets.t0!.test = 'node -e "0"';
   const first = "https://www.linkedin.com/in/first";
   const second = "https://www.linkedin.com/in/second";
   const fetched = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 302, headers: { location: "/authwall" } }));
@@ -1181,7 +1184,7 @@ test("checking another reference after completion preserves previously reviewed 
 
 test("native handoffs open the selected provider and return a draft for human review", { timeout: 25_000 }, async (t) => {
   const { config } = await makeManager([]);
-  config.targets.t0!.test = "true";
+  config.targets.t0!.test = 'node -e "0"';
   const source = "https://www.linkedin.com/in/example";
   const text = "Reviewed notes returned by the interactive browser";
   t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 302, headers: { location: "/authwall" } }));
@@ -1396,11 +1399,11 @@ else if (endpoint === "repos/example/fixture/pulls" && args.includes("POST")) {
   console.log(${JSON.stringify(pr)});
 }
 `;
-    writeFileSync(join(fake, "gh"), script, { mode: 0o755 });
+    writeTestExecutable(fake, "gh", script);
     const originalPath = process.env.PATH;
     const originalHead = process.env.SHIPYARD_TEST_GITHUB_HEAD;
     const originalComparison = process.env.SHIPYARD_TEST_GITHUB_COMPARISON;
-    process.env.PATH = `${fake}:${originalPath}`;
+    process.env.PATH = testPath(fake, originalPath);
     try {
       process.env.SHIPYARD_TEST_GITHUB_HEAD = run.baseSha;
       assert.match((await create(confirmation)).body, /no longer matches the pushed commit/);
@@ -1491,16 +1494,16 @@ test("the draft PR handoff reviews, verifies, publishes, and reopens only after 
     const base = await git(["rev-parse", "HEAD"], defaultRepo);
     await git(["fetch", "--no-write-fetch-head", "--", remote, base], source.repo);
     await git(["remote", "add", "origin", "https://github.com/example/draft-fixture"], source.repo);
-    const realGit = (await promisify(execFile)("which", ["git"])).stdout.trim();
-    writeFileSync(join(fake, "git"), `#!/usr/bin/env node
+    const realGit = findTestExecutable("git");
+    writeTestExecutable(fake, "git", `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const origin = args.indexOf("origin");
 if (args.includes("push") && origin >= 0) args[origin] = ${JSON.stringify(remote)};
 process.exit(spawnSync(${JSON.stringify(realGit)}, args, { stdio: "inherit" }).status ?? 1);
-`, { mode: 0o755 });
+`);
     const pr = "https://github.com/example/draft-fixture/pull/42";
-    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+    writeTestExecutable(fake, "gh", `#!/usr/bin/env node
 const { execFileSync } = require("node:child_process");
 const { existsSync, readFileSync, unlinkSync, writeFileSync } = require("node:fs");
 const args = process.argv.slice(2);
@@ -1531,8 +1534,8 @@ else if (endpoint.endsWith("/pulls") && args.includes("POST")) {
   } else console.log(isClosed ? "closed" : "open");
 }
 else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !existsSync(${JSON.stringify(closed)})) console.log(${JSON.stringify(pr)});
-`, { mode: 0o755 });
-    process.env.PATH = `${fake}:${originalPath}`;
+`);
+    process.env.PATH = testPath(fake, originalPath);
     const ready = (await manager.result(id)).publish!;
     assert.equal(ready.pushed, false);
     assert.equal(ready.canDraftPullRequest, true);
@@ -1549,7 +1552,7 @@ else if (endpoint.endsWith("/pulls") && existsSync(${JSON.stringify(log)}) && !e
     assert.equal((await post({ action: "create", token: "stale" })).status, 400);
     assert.equal((await post({ action: "create", token: review.token, description: " \n " })).status, 400);
     const originalTest = target.test;
-    target.test = "false";
+    target.test = 'node -e "process.exit(1)"';
     assert.match((await post({ action: "create", token: review.token })).body, /failed on the proposed draft branch/);
     target.test = originalTest;
     assert.equal(await git(["branch", "--list", review.branch], remote), "");
@@ -1621,15 +1624,14 @@ test("a follow-up can review a merged Firebase release and deploy only the appro
     const destination = (await pushDestination(repo, "origin"))!;
     manager.store.save({ ...run, publication: { head: run.stages[0]!.commit!, destination: destination.key, pullRequestUrl: link, pushedAt: new Date().toISOString() } });
     writeFileSync(ref, head);
-    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+    writeTestExecutable(fake, "gh", `#!/usr/bin/env node
 const args = process.argv.slice(2);
 if (args.includes(".default_branch")) console.log("main");
 else if (args.includes(".object.sha")) console.log(require("node:fs").readFileSync(${JSON.stringify(ref)}, "utf8"));
 else if (args.includes("--jq")) console.log("merged");
 else console.log(JSON.stringify({ state: "closed", merged: true, base: { ref: "main" }, merge_commit_sha: ${JSON.stringify(head)} }));
-`, { mode: 0o755 });
-    writeFileSync(join(fake, "firebase"), `#!/usr/bin/env node
-const fs = require("node:fs");
+`);
+    const firebase = `const fs = require("node:fs");
 const args = process.argv.slice(2);
 let result;
 if (args[0] === "login:list") result = [{ user: { email: "operator@example.test" } }];
@@ -1637,8 +1639,16 @@ else if (args[0] === "hosting:sites:list") result = { sites: [{ name: "projects/
 else if (args[0] === "deploy") fs.appendFileSync(${JSON.stringify(deployed)}, JSON.stringify({ args, config: JSON.parse(fs.readFileSync("firebase.json", "utf8")), head: require("node:child_process").execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim() }) + "\\n");
 else process.exit(1);
 console.log(JSON.stringify({ status: "success", result }));
-`, { mode: 0o755 });
-    process.env.PATH = `${fake}:${originalPath}`;
+`;
+    if (process.platform === "win32") {
+      writeFiles(fake, {
+        "firebase.cmd": "@exit /b 99\r\n",
+        "node_modules/firebase-tools/lib/bin/firebase.js": firebase,
+      });
+    } else {
+      writeTestExecutable(fake, "firebase", firebase);
+    }
+    process.env.PATH = testPath(fake, originalPath);
     const question = await post("question", { question: "I merged the PR. Deploy it now." });
     assert.equal(JSON.parse(question.body).review, "firebase-release");
     assert.equal(existsSync(deployed), false);
@@ -1745,7 +1755,7 @@ jobs:
     const destination = (await pushDestination(repo, "origin"))!;
     manager.store.save({ ...source, publication: { head: source.stages[0]!.commit!, destination: destination.key, pullRequestUrl, pushedAt: new Date().toISOString() } });
     writeFileSync(ref, head);
-    writeFileSync(join(fake, "gh"), `#!/usr/bin/env node
+    writeTestExecutable(fake, "gh", `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 const endpoint = args[3];
@@ -1765,8 +1775,8 @@ else if (endpoint.endsWith("/dispatches") && args.includes("POST")) {
   console.log(JSON.stringify({ head_sha: head, head_branch: "main", workflow_id: Number(endpoint.split("/").at(-1)) - 1000,
     event: "workflow_dispatch", status: completed ? "completed" : "in_progress", conclusion: completed ? "success" : null }));
 } else process.exit(1);
-`, { mode: 0o755 });
-    process.env.PATH = `${fake}:${originalPath}`;
+`);
+    process.env.PATH = testPath(fake, originalPath);
     const question = async (question: string) => JSON.parse((await post(sourceId, "question", { question })).body);
     const unconfigured = await question("Deploy to Azure.");
     assert.equal(unconfigured.review, undefined);
@@ -1851,7 +1861,7 @@ test("a Cloud Run release requires approval of the exact service and image befor
     assert.equal(runner.calls.at(-1)?.role.name, "google-cloud-releaser");
     assert.equal(runner.calls.at(-1)?.lane, "none");
     assert.equal((await manager.result(id)).canReleaseToCloudRun, true);
-    writeFileSync(join(fake, "gcloud"), `#!/usr/bin/env node
+    writeTestExecutable(fake, "gcloud", `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
@@ -1869,8 +1879,8 @@ else if (command === "run services describe" && args.some((arg) => arg.includes(
     status: { conditions: [{ type: "Ready", status: "True" }] } }] : []);
 } else if (command === "run services update") fs.writeFileSync(deployed, args.find((arg) => arg.startsWith("--image=")).slice(8));
 else process.exitCode = 1;
-`, { mode: 0o755 });
-    process.env.PATH = `${fake}:${originalPath}`;
+`);
+    process.env.PATH = testPath(fake, originalPath);
     const image = `us-central1-docker.pkg.dev/example-project/app/portfolio@sha256:${"a".repeat(64)}`;
     const target = { action: "prepare", project: "example-project", region: "us-central1", service: "portfolio", image };
     assert.equal((await post(target, false)).status, 401);
@@ -1913,19 +1923,19 @@ test("adding a repository URL clones and inspects once, then registers its local
   const remote = await makeTargetRepo();
   const folder = tempDir("sy-clone-");
   const configFile = join(folder, "shipyard.config.yaml");
-  const ssh = join(folder, "fixture-ssh");
   writeFileSync(configFile, "targets: {}\n");
-  writeFileSync(ssh, `#!/usr/bin/env node
+  const ssh = writeTestExecutable(folder, "fixture-ssh", `#!/usr/bin/env node
 const { spawnSync } = require("node:child_process");
 if (!process.argv.at(-1).includes("example/fixture-app.git")) {
   console.error("Repository not found");
   process.exit(1);
 }
 process.exit(spawnSync("git", ["upload-pack", ${JSON.stringify(remote)}], { stdio: "inherit" }).status ?? 1);
-`, { mode: 0o700 });
-  for (const [key, value] of Object.entries({ GIT_SSH_COMMAND: ssh, GIT_SSH_VARIANT: "simple" })) {
+`);
+  for (const [key, value] of Object.entries({ GIT_SSH: ssh, GIT_SSH_COMMAND: undefined, GIT_SSH_VARIANT: "simple" })) {
     const previous = process.env[key];
-    process.env[key] = value;
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
     t.after(() => {
       if (previous === undefined) delete process.env[key];
       else process.env[key] = previous;
@@ -2003,7 +2013,7 @@ test("the result can save a Git remote locally while preserving an existing orig
 
 test("the handoff can verify a finished worktree and approve references without starting a new run", async (t) => {
   const { manager, config, runner } = await makeManager([fix]);
-  config.targets.t0!.e2e = "printf 'host E2E passed'";
+  config.targets.t0!.e2e = `node -e "console.log('host E2E passed')"`;
   const server = await startUiServer({ manager, config, token: "q".repeat(48) });
   const auth = { "x-shipyard-token": server.token };
   const requested = "Use https://github.com/example";
@@ -2185,7 +2195,7 @@ test("rechecking a failed revision verifies saved edits and continues the same r
   const { config } = await makeManager([]);
   config.maxGateRetries = 0;
   const target = config.targets.t0!;
-  target.test = "true";
+  target.test = 'node -e "0"';
   target.e2e = "sh e2e/metric.sh";
   const e2eCheck = (metric: number) => `grep -q '${metric}%' index.html || { echo "Missing metric ${metric}%"; exit 1; }\n`;
   writeFiles(target.path, { "index.html": "<p>50%</p>", "e2e/metric.sh": e2eCheck(50) });
@@ -2261,7 +2271,7 @@ test("frontend revisions repair in place, with a dashboard retry when automatic 
   const { config } = await makeManager([]);
   config.maxGateRetries = 0;
   const target = config.targets.t0!;
-  target.test = "true";
+  target.test = 'node -e "0"';
   target.e2e = "sh e2e/title.sh";
   const check = (title: string) => `grep -Fq '${title}' index.html || { echo "Expected title: ${title}"; exit 1; }\n`;
   writeFiles(target.path, { "index.html": "<h1>Original title</h1>", "e2e/title.sh": check("Original title") });
@@ -2369,7 +2379,7 @@ test("a Git-only revision can review and create a verified squashed branch from 
     assert.equal((await approve({ head: source.baseSha })).status, 400);
     const target = config.targets.t0!;
     const originalTest = target.test;
-    target.test = "false";
+    target.test = 'node -e "process.exit(1)"';
     assert.match((await approve()).body, /project check failed/i);
     target.test = originalTest;
     assert.equal(await git(["branch", "--list", "shipyard/portfolio-update"], source.repo), "");
@@ -2419,13 +2429,21 @@ createServer((req, res) => res.end(process.cwd())).listen(port, host);
       assert.equal((await request(server.port, path, { method: "POST" })).status, 401);
       assert.equal((await manager.result(id)).canRunLocally, true);
       const launches = await Promise.all(Array.from({ length: 2 }, () => request(server.port, path, { method: "POST", headers })));
+      assert.equal(runner.calls.length, 2);
+      if (process.platform !== "darwin") {
+        for (const launch of launches) {
+          assert.equal(launch.status, 400);
+          assert.match(launch.body, /cannot sandbox a process-backed local preview/);
+        }
+        assert.equal((await manager.result(id)).localApp, undefined);
+        continue;
+      }
       for (const launch of launches) assert.equal(launch.status, 200, launch.body);
       const { url } = JSON.parse(launches[0]!.body);
       assert.equal(JSON.parse(launches[1]!.body).url, url);
       assert.equal(new URL(url).hostname, "[::1]");
       const { realpath } = await import("node:fs/promises");
       assert.equal(await (await fetch(url)).text(), await realpath(run.worktree));
-      assert.equal(runner.calls.length, 2);
       assert.equal((await manager.result(id)).localApp?.url, url);
       assert.equal((await request(server.port, path, { method: "DELETE", headers })).status, 200);
       await assert.rejects(fetch(url));
@@ -2437,7 +2455,7 @@ createServer((req, res) => res.end(process.cwd())).listen(port, host);
 });
 
 test("the result endpoint serves a private static preview on a separate loopback origin", { timeout: 20_000 }, async () => {
-  const { symlinkSync, writeFileSync } = await import("node:fs");
+  const { symlinkSync } = await import("node:fs");
   const { join } = await import("node:path");
   const { manager, config } = await makeManager([
     (req) => {
@@ -2446,12 +2464,9 @@ test("the result endpoint serves a private static preview on a separate loopback
         "style.css": "main { color: black; }",
         ".private.json": '{"private":true}',
       });
-      const outside = join(tempDir(), "outside.json");
-      writeFileSync(outside, '{"outside":true}');
-      symlinkSync(outside, join(req.cwd, "linked.json"));
     },
   ]);
-  config.targets.t0!.test = "true";
+  config.targets.t0!.test = 'node -e "0"';
   const token = "q".repeat(48);
   const server = await startUiServer({ manager, config, token });
   const origin = `http://127.0.0.1:${server.port}`;
@@ -2465,9 +2480,12 @@ test("the result endpoint serves a private static preview on a separate loopback
     const result = await fetch(resultPath, { headers }).then((res) => res.json());
     assert.equal(result.hasRemote, false);
     assert.equal(result.canPreview, true);
-    assert.equal(result.handoff.fileCount, 4);
+    assert.equal(result.handoff.fileCount, 3);
     assert.equal(result.handoff.uncommittedCount, 0);
     assert.ok(result.handoff.files.some(({ path }: { path: string }) => path === "index.html"));
+    const outside = tempDir();
+    writeFiles(outside, { "outside.json": '{"outside":true}' });
+    symlinkSync(outside, join(run!.worktree, "linked"), process.platform === "win32" ? "junction" : "dir");
     assert.equal((await fetch(previewPath, { method: "POST" })).status, 401);
     const launches = await Promise.all(Array.from({ length: 2 }, () =>
       fetch(previewPath, { method: "POST", headers }).then((res) => res.json())));
@@ -2484,7 +2502,7 @@ test("the result endpoint serves a private static preview on a separate loopback
     assert.match(await (await get("/")).text(), /Fixture preview/);
     assert.equal((await get("/style.css")).status, 200);
     assert.equal((await get("/.private.json")).status, 404);
-    assert.equal((await get("/linked.json")).status, 404);
+    assert.equal((await get("/linked/outside.json")).status, 404);
     const dismiss = await fetch(`${origin}/api/runs/${id}`, {
       method: "PATCH", headers, body: JSON.stringify({ acknowledgeCompletion: run?.finishedAt }),
     });

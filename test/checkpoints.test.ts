@@ -145,7 +145,8 @@ test("repair reruns the gates without requiring an unrelated code change after a
     [fix(), e2e("assert.equal(add(2, 3), 5);"), () => writeFiles(markerDir, { ready: "" })],
     [{ action: "continue" }, { action: "continue" }, { action: "continue" }],
   );
-  target.e2e = `test -f '${join(markerDir, "ready").replaceAll("'", "'\\''")}' && npm run e2e`;
+  const marker = Buffer.from(join(markerDir, "ready")).toString("base64");
+  target.e2e = `node -e "process.exit(require('node:fs').existsSync(Buffer.from('${marker}', 'base64').toString()) ? 0 : 1)" && npm run e2e`;
   const run = await runPipeline({ target, kind: "feature", request: "Check the browser test" }, deps);
   assert.equal(run.status, "passed");
   assert.equal(run.stages.find(({ name }) => name === "e2e")?.status, "failed");

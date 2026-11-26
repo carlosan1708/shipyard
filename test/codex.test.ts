@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, cpSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { promisify } from "node:util";
@@ -13,12 +13,12 @@ import { REVIEW_SCHEMA } from "../src/prompts.ts";
 import { loadRoles, requireRole } from "../src/roles.ts";
 import { RunStore } from "../src/store.ts";
 import { initRepoWithCommit } from "../src/worktree.ts";
+import { findTestExecutable, testPath, writeTestExecutable } from "./executables.ts";
 import { tempDir, writeFiles } from "./helpers.ts";
 
 const execFileAsync = promisify(execFile);
 
-const fake = `#!/usr/bin/env node
-const {readFileSync, writeFileSync} = require("node:fs");
+const fake = `const {readFileSync, writeFileSync} = require("node:fs");
 const args = process.argv.slice(2);
 const prompt = readFileSync(0, "utf8");
 const get = (flag) => args[args.indexOf(flag) + 1];
@@ -64,13 +64,6 @@ function fixture(t: TestContext): string {
   const root = tempDir("shipyard-codex-test-");
   t.after(() => rmSync(root, { recursive: true, force: true }));
   return root;
-}
-
-function fakeExecutable(root: string): string {
-  const path = join(root, "codex");
-  writeFileSync(path, fake);
-  chmodSync(path, 0o755);
-  return path;
 }
 
 test("Codex advisory chat enables native web search and emits search and page events", async (t) => {
@@ -149,22 +142,21 @@ test("Codex reads JSONL events and final structured output, and resumes with the
 test("Codex reports a missing CLI, authentication error, timeout, and schema mismatch", async (t) => {
   const root = fixture(t);
   const repo = join(root, "repo");
-  writeFiles(repo, { "README.md": "demo\n" });
+  writeFiles(repo, { "README.md": "demo\n", exec: fake });
   await initRepoWithCommit(repo);
-  const executable = fakeExecutable(root);
   const role = requireRole(loadRoles(), "reviewer");
   const req = { role, cwd: repo, lane: "none" as const, prompt: "" };
   const missing = await new CodexAgentRunner(5_000, join(root, "missing")).run(req);
   assert.equal(missing.ok, false);
   assert.match(missing.error!, /not found on PATH/);
-  const runner = new CodexAgentRunner(5_000, executable);
+  const runner = new CodexAgentRunner(5_000, process.execPath);
   const auth = await runner.run({ ...req, prompt: "FAKE_AUTH" });
   assert.equal(auth.ok, false);
   assert.match(auth.error!, /Unauthorized.*codex login/);
   const invalid = await runner.run({ ...req, prompt: "FAKE_INVALID", outputSchema: REVIEW_SCHEMA });
   assert.equal(invalid.ok, false);
   assert.match(invalid.error!, /did not match the requested schema/);
-  const timeout = await new CodexAgentRunner(150, executable).run({ ...req, prompt: "FAKE_HANG" });
+  const timeout = await new CodexAgentRunner(150, process.execPath).run({ ...req, prompt: "FAKE_HANG" });
   assert.equal(timeout.ok, false);
   assert.match(timeout.error!, /timed out after 150 ms/);
 });
@@ -172,10 +164,10 @@ test("Codex reports a missing CLI, authentication error, timeout, and schema mis
 test("interrupting Codex stops its active process and keeps its session ID for same-provider steering", async (t) => {
   const root = fixture(t);
   const repo = join(root, "repo");
-  writeFiles(repo, { "README.md": "demo\n" });
+  writeFiles(repo, { "README.md": "demo\n", exec: fake });
   await initRepoWithCommit(repo);
   const controller = new AbortController();
-  const result = await new CodexAgentRunner(5_000, fakeExecutable(root)).run({
+  const result = await new CodexAgentRunner(5_000, process.execPath).run({
     cwd: repo,
     role: requireRole(loadRoles(), "backend"),
     lane: "any",
@@ -193,8 +185,17 @@ test("the CLI routes Codex through the demo pipeline and displays persisted prov
   const repo = join(root, "demo");
   cpSync(join(SHIPYARD_ROOT, "examples", "demo-shop"), repo, { recursive: true });
   await initRepoWithCommit(repo);
-  fakeExecutable(root);
-  symlinkSync(join(SHIPYARD_ROOT, "plugins"), join(root, "plugins"), "dir");
+  const cliFixture = process.platform === "win32" ? `
+if (process.argv.includes("sandbox") && process.argv[2] !== "exec") {
+  const child = require("node:child_process").spawn(${JSON.stringify(findTestExecutable("codex"))}, process.argv.slice(2), { stdio: "inherit" });
+  child.on("error", error => { console.error(error.message); process.exitCode = 1; });
+  child.on("exit", code => { process.exitCode = code ?? 1; });
+} else {
+${fake}
+}
+` : fake;
+  writeTestExecutable(root, "codex", cliFixture);
+  cpSync(join(SHIPYARD_ROOT, "plugins"), join(root, "plugins"), { recursive: true });
   writeFiles(root, {
     "shipyard.config.yaml": `
 model: claude-test
@@ -211,7 +212,7 @@ targets:
   });
   const cli = (...args: string[]) => execFileAsync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
     cwd: SHIPYARD_ROOT,
-    env: { ...process.env, SHIPYARD_ROOT: root, PATH: `${root}:${process.env.PATH}` },
+    env: { ...process.env, SHIPYARD_ROOT: root, PATH: testPath(root) },
   });
 
   await assert.rejects(cli("ship", "demo", "FAKE_BUILD", "--model=codex-test", "--provider=claude"), /Unknown model "codex-test" for claude/);

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { checkCommand, checkToolUse } from "../src/guards.ts";
 import { SHIPYARD_ROOT } from "../src/config.ts";
 import { sh } from "../src/exec.ts";
+import { tempDir, writeFiles } from "./helpers.ts";
 
 test("publishing commands are blocked by default", () => {
   for (const cmd of [
@@ -63,8 +64,14 @@ external.on('error', error => {
   if (!['EPERM', 'EACCES', 'ENETUNREACH'].includes(error.code)) process.exitCode = 1;
   console.log('external blocked');
 });`;
-  const scriptArg = `'${program.replaceAll("'", "'\\''")}'`;
-  const result = await sh(`sh -c 'node -e "$1"' shipyard ${scriptArg}`, SHIPYARD_ROOT, 5_000);
+  const workspace = tempDir();
+  writeFiles(workspace, { "check.cjs": `
+const { spawnSync } = require("node:child_process");
+const child = spawnSync(process.execPath, ["-e", ${JSON.stringify(program)}], { stdio: "inherit" });
+if (child.error) throw child.error;
+process.exitCode = child.status ?? 1;
+` });
+  const result = await sh("node check.cjs", workspace, 10_000);
   assert.equal(result.code, 0, result.output);
   assert.match(result.output, /local/);
   assert.match(result.output, /external blocked/);

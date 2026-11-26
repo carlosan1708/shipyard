@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { git } from "../exec.ts";
 import { gateOk, type GateRecord } from "../store.ts";
@@ -29,13 +30,33 @@ export interface FirebaseHostingReview extends Omit<FirebaseHostingRelease, "dep
   token: string;
 }
 
+function firebaseCommand(path: string | undefined): [string, string[]] | undefined {
+  if (process.platform !== "win32") return ["firebase", []];
+  for (const directory of (path ?? "").split(delimiter).map((entry) => entry.replace(/^"(.*)"$/, "$1"))) {
+    if (!isAbsolute(directory)) continue;
+    const executable = join(directory, "firebase.exe");
+    if (existsSync(executable)) return [executable, []];
+    if (!existsSync(join(directory, "firebase.cmd"))) continue;
+    // npm's Windows shim invokes this module. Run the module directly so values stay separate from shell syntax.
+    for (const root of [join(directory, "node_modules"), join(directory, "..")]) {
+      const script = join(root, "firebase-tools", "lib", "bin", "firebase.js");
+      if (existsSync(script)) return [process.execPath, [script]];
+    }
+  }
+}
+
 async function firebase(args: string[], signal: AbortSignal, cwd?: string, timeout = 20_000): Promise<unknown> {
   // Select an existing CLI account explicitly. Do not inherit the host's credential or endpoint overrides.
-  const { PATH, HOME, XDG_CONFIG_HOME, TMPDIR, HTTPS_PROXY, HTTP_PROXY, NO_PROXY } = process.env;
+  const { PATH, HOME, XDG_CONFIG_HOME, TMPDIR, HTTPS_PROXY, HTTP_PROXY, NO_PROXY,
+    USERPROFILE, APPDATA, LOCALAPPDATA, SystemRoot } = process.env;
+  const command = firebaseCommand(PATH);
+  if (!command) throw new Error("Install the Firebase CLI and sign in with firebase login.");
+  const [executable, prefix] = command;
   try {
-    const { stdout } = await exec("firebase", [...args, "--non-interactive", "--json"], {
+    const { stdout } = await exec(executable, [...prefix, ...args, "--non-interactive", "--json"], {
       cwd, signal, timeout, maxBuffer: 4 * 1024 * 1024,
-      env: { PATH, HOME, XDG_CONFIG_HOME, TMPDIR, HTTPS_PROXY, HTTP_PROXY, NO_PROXY, CI: "1" },
+      env: { PATH, HOME, XDG_CONFIG_HOME, TMPDIR, HTTPS_PROXY, HTTP_PROXY, NO_PROXY,
+        USERPROFILE, APPDATA, LOCALAPPDATA, SystemRoot, CI: "1" },
     });
     const output = JSON.parse(stdout) as { status?: string; result?: unknown };
     if (output.status !== "success") throw new Error("Firebase did not confirm success");

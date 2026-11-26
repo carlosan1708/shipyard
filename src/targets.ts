@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import YAML from "yaml";
 import { expandPath, type Target } from "./config.ts";
@@ -55,8 +55,10 @@ export function suggestName(dir: string): string {
 
 /** Show home-folder paths with ~, so the config stays readable and portable between your machines. */
 export function displayPath(abs: string): string {
-  const home = homedir();
-  return abs === home ? "~" : abs.startsWith(home + "/") ? `~${abs.slice(home.length)}` : abs;
+  const fromHome = relative(homedir(), abs);
+  if (!fromHome) return "~";
+  if (isAbsolute(fromHome) || fromHome === ".." || fromHome.startsWith(`..${sep}`)) return abs;
+  return `~/${fromHome.split(sep).join("/")}`;
 }
 
 /** Guess the unit test and E2E commands from the repo's own files. Best guesses first. */
@@ -171,7 +173,8 @@ export async function cloneRepo(url: string, root: string, signal: AbortSignal):
   const reuse = async () => {
     if (!lstatSync(path, { throwIfNoEntry: false })?.isDirectory()) return undefined;
     const origin = await git(["config", "--local", "--get", "remote.origin.url"], path).catch(() => "");
-    if (origin !== url || await git(["rev-parse", "--show-toplevel"], path).catch(() => "") !== realpathSync(path)) {
+    const checkoutRoot = await git(["rev-parse", "--show-toplevel"], path).catch(() => "");
+    if (origin !== url || !checkoutRoot || pathKey(checkoutRoot) !== pathKey(realpathSync(path))) {
       throw new Error("The clone destination is occupied by a different checkout");
     }
     return { path, name };
