@@ -38,7 +38,7 @@ Usage:
   shipyard roles                               list agent roles
   shipyard targets                             list configured target repositories
   shipyard demo-init                           create the demo-shop target repo
-  shipyard ui [--port 4710] [--no-open] [--demo] [--new-token]
+  shipyard ui [--port 4710] [--no-open] [--demo [--docker-checks]] [--new-token]
                                                open the web UI: start runs, watch every agent, answer
                                                checkpoints, questions and permission requests in parallel
                                                (--demo: scripted agents, no provider usage)
@@ -294,10 +294,12 @@ async function main(argv: string[]): Promise<number> {
           "no-open": { type: "boolean", default: false },
           "quiet-link": { type: "boolean", default: false },
           demo: { type: "boolean", default: false },
+          "docker-checks": { type: "boolean", default: false },
           "new-token": { type: "boolean", default: false },
         },
       });
       let uiConfig = config;
+      if (values["docker-checks"] && !values.demo) throw new Error("Use --docker-checks with --demo, or set checksDocker on a target in shipyard.config.yaml.");
       let runner = claudeRunner(config);
       const codexRunner = new CodexAgentRunner(config.codex?.timeoutMsPerAttempt);
       process.once("exit", () => codexRunner.stop());
@@ -310,7 +312,8 @@ async function main(argv: string[]): Promise<number> {
           ...config,
           defaultProvider: "claude",
           runsDir: join(SHIPYARD_ROOT, ".shipyard", "demo-runs"),
-          targets: { "demo-shop": { name: "demo-shop", path, test: "npm test", e2e: "npm run e2e" } },
+          targets: { "demo-shop": { name: "demo-shop", path, test: "npm test", e2e: "npm run e2e",
+            checksDocker: values["docker-checks"] ? config.targets["demo-shop"]?.checksDocker ?? { image: "node:22-bookworm-slim" } : undefined } },
         };
         runner = new DemoRunner();
       }

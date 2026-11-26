@@ -3,7 +3,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { checkCommand } from "./guards.ts";
-import { SHIPYARD_ROOT } from "./config.ts";
+import { SHIPYARD_ROOT, type DockerChecks } from "./config.ts";
+import { DOCKER_CHECK_ERROR, dockerProjectCheck } from "./docker-check.ts";
 
 const execFileAsync = promisify(execFile);
 const MAC_GATE_BROWSERS = [
@@ -65,6 +66,7 @@ function windowsGate(executable: string, args: string[], cwd: string, ready: str
 
 export function isProjectCheckSandboxError(message: string | undefined): boolean {
   return Boolean(message?.startsWith("Could not start the project check in its network sandbox:") ||
+    message?.startsWith(DOCKER_CHECK_ERROR) ||
     message === "Shipyard needs the macOS network sandbox or Linux bubblewrap to run project checks.");
 }
 
@@ -72,7 +74,8 @@ export function isProjectCheckSandboxError(message: string | undefined): boolean
  * Run a shell command (a gate) and capture stdout+stderr together.
  * Runs in its own process group so a hung test server is killed on timeout.
  */
-export function sh(command: string, cwd: string, timeoutMs?: number, signal?: AbortSignal): Promise<ExecResult> {
+export function sh(command: string, cwd: string, timeoutMs?: number, signal?: AbortSignal, docker?: DockerChecks): Promise<ExecResult> {
+  if (docker) return dockerProjectCheck(command, cwd, docker, timeoutMs, signal);
   const windows = process.platform === "win32";
   const program = windows ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
   const args = windows ? ["/d", "/s", "/v:off", "/c", `"${command}"`] : ["-c", command];

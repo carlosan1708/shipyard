@@ -30,6 +30,29 @@ test("config rejects bad values", () => {
   assert.throws(() => parseConfig({ maxBudgetUsdPerRun: "ten" }, "/"), /maxBudgetUsdPerRun/);
 });
 
+test("Docker project checks are opt-in per target and accept tagged or pinned images", () => {
+  const tagged = { image: "node:22-bookworm", install: "npm ci --ignore-scripts" };
+  const pinned = { image: `registry.example:5000/project/node@sha256:${"a".repeat(64)}` };
+  const { targets } = parseConfig({ targets: {
+    native: { path: "repo", test: "npm test" },
+    tagged: { path: "repo", test: "npm test", checksDocker: tagged },
+    pinned: { path: "repo", test: "npm test", checksDocker: pinned },
+  } }, "/");
+  assert.equal(targets.native?.checksDocker, undefined);
+  assert.deepEqual(targets.tagged?.checksDocker, tagged);
+  assert.deepEqual(targets.pinned?.checksDocker, pinned);
+});
+
+test("Docker project check config rejects image flags and invalid install commands", () => {
+  const configure = (checksDocker: unknown) => parseConfig({ targets: { sample: { path: "repo", test: "npm test", checksDocker } } }, "/");
+  for (const image of [undefined, "", "--privileged", "node:22 --privileged", "node:22\n", "node;echo"]) {
+    assert.throws(() => configure({ image }), /targets\.sample\.checksDocker\.image/);
+  }
+  for (const install of [true, " ", "a\0b"]) {
+    assert.throws(() => configure({ image: "node:22", install }), /targets\.sample\.checksDocker\.install/);
+  }
+});
+
 test("the shipped roles load from the plugin's agent files", () => {
   const roles = loadRoles();
   assert.deepEqual([...roles.keys()].sort(), ["backend", "bug-triager", "chat-advisor", "dependency-updater", "docs-writer", "e2e-tester", "frontend", "google-cloud-releaser", "local-app", "orchestrator", "planner", "release-manager", "reviewer", "security-auditor", "ui-ux"]);

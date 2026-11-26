@@ -18,6 +18,12 @@ export interface DeploymentWorkflow {
   environment: string;
 }
 
+export interface DockerChecks {
+  image: string;
+  /** Optional dependency setup command for a fresh check container. */
+  install?: string;
+}
+
 export interface Target {
   name: string;
   /** Absolute path to the target git repository. */
@@ -26,11 +32,27 @@ export interface Target {
   test: string;
   /** E2E command, run as the gate after the E2E stage. Optional. */
   e2e?: string;
+  /** Run project check commands in this Linux container image. */
+  checksDocker?: DockerChecks;
   /** Verify static pages in a host-managed Chrome session. */
   browserCheck?: boolean;
   /** Default browser-tool permission for new runs against this target. */
   browserAccess?: boolean;
   deployments?: Partial<Record<WorkflowDeploymentProvider, DeploymentWorkflow>>;
+}
+
+function dockerChecks(value: unknown, target: string): DockerChecks | undefined {
+  if (value === undefined) return;
+  const field = `targets.${target}.checksDocker`;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${field} must specify a Docker image`);
+  const { image, install } = value as Record<string, unknown>;
+  if (typeof image !== "string" || image.trim() !== image || !/^[a-z0-9][a-z0-9._/:@-]*$/i.test(image)) {
+    throw new Error(`${field}.image must be a Docker image reference without spaces or flags`);
+  }
+  if (install !== undefined && (typeof install !== "string" || !install.trim() || install.includes("\0"))) {
+    throw new Error(`${field}.install must be a non-empty shell command`);
+  }
+  return install === undefined ? { image } : { image, install };
 }
 
 function deploymentWorkflows(value: unknown, target: string): Target["deployments"] {
@@ -181,12 +203,14 @@ export function parseConfig(raw: Record<string, unknown>, baseDir: string): Ship
     if (typeof t.test !== "string") throw new Error(`targets.${name}.test is required`);
     if (t.browserCheck !== undefined && typeof t.browserCheck !== "boolean") throw new Error(`targets.${name}.browserCheck must be true or false`);
     if (t.browserAccess !== undefined && typeof t.browserAccess !== "boolean") throw new Error(`targets.${name}.browserAccess must be true or false`);
+    const checksDocker = dockerChecks(t.checksDocker, name);
     const deployments = deploymentWorkflows(t.deployments, name);
     targets[name] = {
       name,
       path: expandPath(t.path, baseDir),
       test: t.test,
       e2e: typeof t.e2e === "string" ? t.e2e : undefined,
+      ...(checksDocker === undefined ? {} : { checksDocker }),
       ...(t.browserCheck === undefined ? {} : { browserCheck: t.browserCheck }),
       ...(t.browserAccess === undefined ? {} : { browserAccess: t.browserAccess }),
       ...(deployments === undefined ? {} : { deployments }),

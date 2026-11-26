@@ -7,6 +7,7 @@ import { BROWSER_CHECK, checkBrowser } from "./browser-check.ts";
 import { BROWSER_TOOL_NOTE } from "./browser-tool.ts";
 import { recordBugExpectation, verifyBugFix } from "./bug-verification.ts";
 import { providerOptions, type Provider, type RunEffort, type ShipyardConfig, type Target } from "./config.ts";
+import { requireDockerChecks } from "./docker-check.ts";
 import { git, isProjectCheckSandboxError, sh, tail, type ExecResult } from "./exec.ts";
 import { inLane, type Lane } from "./guards.ts";
 import {
@@ -161,6 +162,8 @@ export interface PipelineDeps {
   approveReference?: (runId: string, url: string, signal?: AbortSignal) => Promise<boolean>;
 }
 
+type StageDeps = PipelineDeps & Pick<Target, "checksDocker">;
+
 export interface PipelineRequest {
   target: Target;
   kind: RunKind;
@@ -272,8 +275,9 @@ interface StageOutcome {
  * reviews each stage's result and can approve it, send feedback into the agent's session,
  * or stop the run.
  */
-export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Promise<RunRecord> {
+export async function runPipeline(req: PipelineRequest, inputDeps: PipelineDeps): Promise<RunRecord> {
   const { target, kind, request, resume, continueBranch } = req;
+  const deps: StageDeps = { ...inputDeps, checksDocker: target.checksDocker };
   const log = deps.log ?? (() => {});
   const referenceUrls = resume ? resume.referenceUrls ?? []
     : parseReferencePermissions(req.referenceUrls ?? referenceLinks(request).slice(0, MAX_PUBLIC_REFERENCES));
@@ -397,6 +401,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
   };
 
   try {
+    if (target.checksDocker) await requireDockerChecks(deps.control?.stopSignal);
     const missingReferences = missingReferencePermissions(request, referenceUrls);
     const recorded = new Map((run.references ?? []).map((check) => [check.url ?? check.label, check]));
     const saveReference = (check: ReferenceCheck) => {
@@ -836,7 +841,7 @@ export async function runPipeline(req: PipelineRequest, deps: PipelineDeps): Pro
     log(`  error: ${run.error}`);
     // Don't leave an empty branch and worktree behind in the target repo for a run that produced nothing.
     if (
-      !existing && run.stages.every((s) => !s.commit) &&
+      !existing && !isProjectCheckSandboxError(run.error) && run.stages.every((s) => !s.commit) &&
       (await changedFiles(worktree).catch(() => ["?"])).length === 0 &&
       (await git(["rev-parse", "HEAD"], worktree).catch(() => "")) === baseSha &&
       (await git(["symbolic-ref", "HEAD"], worktree).catch(() => "")) === `refs/heads/${branch}`
@@ -891,7 +896,7 @@ function budgetReached(run: RunRecord, stage: StageName): BudgetReachedError {
     `Approve a higher limit in the dashboard to continue this run.`);
 }
 
-async function runParallelReviews(specs: [StageSpec, StageSpec], run: RunRecord, deps: PipelineDeps) {
+async function runParallelReviews(specs: [StageSpec, StageSpec], run: RunRecord, deps: StageDeps) {
   const abort = new AbortController();
   const group: ParallelReviews = { signal: abort.signal, active: new Set(specs.map(({ name }) => name)), reserved: new Map() };
   const head = await git(["rev-parse", "HEAD"], run.worktree);
@@ -912,7 +917,7 @@ async function runParallelReviews(specs: [StageSpec, StageSpec], run: RunRecord,
   }
 }
 
-async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Promise<StageOutcome> {
+async function runStage(spec: StageSpec, run: RunRecord, deps: StageDeps): Promise<StageOutcome> {
   const log = deps.log ?? (() => {});
   const control = deps.control;
   const cwd = spec.isolated?.worktree ?? run.worktree;
@@ -1317,22 +1322,25 @@ async function runStage(spec: StageSpec, run: RunRecord, deps: PipelineDeps): Pr
   }
 }
 
-async function runStageGates(spec: StageSpec, run: RunRecord, deps: PipelineDeps, attempt: number, signal?: AbortSignal) {
+async function runStageGates(spec: StageSpec, run: RunRecord, deps: StageDeps, attempt: number, signal?: AbortSignal) {
   const worktree = spec.isolated?.worktree ?? run.worktree;
   const log = deps.log ?? (() => {});
   const checks = spec.browserCheck ? [...spec.gates, BROWSER_CHECK] : spec.gates;
   const gates: GateRecord[] = [];
   for (const [index, command] of checks.entries()) {
     const browser = index === spec.gates.length;
-    deps.store.event(run.id, { stage: spec.name, attempt, type: "gate_start", command });
+    const docker = browser ? undefined : deps.checksDocker;
+    const runner = docker ? "docker" : undefined;
+    deps.store.event(run.id, { stage: spec.name, attempt, type: "gate_start", command, runner });
     const gate = browser
       ? await checkBrowser(worktree, deps.gateTimeoutMs, signal)
-      : await sh(command, worktree, deps.gateTimeoutMs, signal);
+      : await sh(command, worktree, deps.gateTimeoutMs, signal, docker);
     if (signal?.aborted) break;
     // Triage expects a failing command. Final regression verification checks the named assertion separately.
     const wrongWay = spec.expectGateFailure ? gate.code === 0 || gate.timedOut : gate.code !== 0;
     gates.push({
       command,
+      runner,
       expectFailure: spec.expectGateFailure || undefined,
       code: gate.code,
       durationMs: gate.durationMs,
@@ -1340,7 +1348,7 @@ async function runStageGates(spec: StageSpec, run: RunRecord, deps: PipelineDeps
       outputTail: tail(gate.output, 4000),
     });
     const note = spec.expectGateFailure ? (gate.timedOut ? " (timed out)" : wrongWay ? " (expected failure, got a pass)" : " (failed as expected)") : "";
-    log(`    ${wrongWay ? "✗" : "✓"} gate \`${command}\`${note} (${(gate.durationMs / 1000).toFixed(1)}s)`);
+    log(`    ${wrongWay ? "✗" : "✓"} gate \`${command}\`${docker ? " in Docker" : ""}${note} (${(gate.durationMs / 1000).toFixed(1)}s)`);
     if (wrongWay) {
       return { gates, failed: gate };
     }

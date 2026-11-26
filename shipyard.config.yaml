@@ -44,9 +44,15 @@ targets:
     path: .shipyard/targets/demo-shop
     test: npm test
     e2e: npm run e2e
+    # Optional Linux runner for this target's project commands.
+    # checksDocker:
+    #   image: node:22-bookworm-slim
 
   # Add your own repos here, e.g.:
   # my-api:
   #   path: ~/Documents/GitHub/my-api
   #   test: npm test
   #   e2e: npm run test:e2e
+  #   checksDocker:
+  #     image: node:22-bookworm-slim
+  #     install: npm ci --ignore-scripts

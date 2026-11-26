@@ -1513,8 +1513,9 @@ export class RunManager {
     const checks: GateRecord[] = [];
     for (const command of new Set([target.test, target.e2e])) {
       if (!command) continue;
-      const { code, timedOut, durationMs, output } = await sh(command, worktree, undefined, signal);
-      checks.push({ command, code, timedOut, durationMs, outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
+      const { code, timedOut, durationMs, output } = await sh(command, worktree, undefined, signal, target.checksDocker);
+      checks.push({ command, runner: target.checksDocker ? "docker" : undefined, code, timedOut, durationMs,
+        outputTail: output.slice(-4000), checkedAt: new Date().toISOString() });
     }
     if (browser) {
       const { code, timedOut, durationMs, output } = await checkBrowser(worktree, undefined, signal);

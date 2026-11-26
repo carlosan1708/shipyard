@@ -530,7 +530,7 @@ async function loadEvents(runId) {
 
 const isRunActivity = (event) => ["tool", "text", "gate_start", "attempt_start"].includes(event.type);
 function runActivityLabel(event) {
-  if (event.type === "gate_start") return `Running check · ${event.command}`;
+  if (event.type === "gate_start") return `Running check${event.runner === "docker" ? " in Docker" : ""} · ${event.command}`;
   if (event.type === "attempt_start") return `Starting ${event.stage} · attempt ${event.attempt}`;
   if (event.type === "text") return "Agent update";
   return ({ Bash: "Ran a command", Edit: "Edited the worktree", WebRead: "Read a web page",
@@ -1051,9 +1051,11 @@ function runSummaryChecks(run, result) {
   }
   if (run.browserCheck && !savedEdits) latest.set(run.browserCheck.command, run.browserCheck);
   const passed = [...latest.values()].filter(gateOk).length;
+  const docker = [...latest.values()].filter((gate) => gate.runner === "docker").length;
   const skipped = [...latest.values()].reduce((count, gate) => count + Number(gate.outputTail?.match(/^# skipped\s+(\d+)/m)?.[1] ?? 0), 0);
   if (!latest.size) return "No checks recorded.";
-  return `${passed} of ${latest.size} recorded checks passed.${skipped ? ` ${skipped} tests skipped.` : ""}`;
+  const environment = docker === latest.size ? " Ran in Docker." : docker > 0 ? ` ${docker} ran in Docker.` : "";
+  return `${passed} of ${latest.size} recorded checks passed.${environment}${skipped ? ` ${skipped} tests skipped.` : ""}`;
 }
 
 function deliveredBrief(run) {
@@ -1170,6 +1172,10 @@ function runSummary(run, result) {
     return offer("Continue run", "Continue this run", "The saved edits passed their checks. You can continue.");
   }
   if (result.canResumeProjectCheck || !run.cleanedUp && ["stopped", "interrupted"].includes(status)) {
+    if (result.canResumeProjectCheck && run.error?.startsWith("Could not run the project check in Docker:")) {
+      return { ...offer("Resume run", "Resume run", "Resolve the Docker issue above, then resume this run."),
+        heading: "Docker needs attention", description: run.error.slice("Could not run the project check in Docker:".length).trim().slice(0, 320) };
+    }
     return offer("Resume run", "Resume run", "Continue from the saved worktree.");
   }
   if (result.canFixRevision) return offer("Retry repair", "Retry repair", "The crew can retry the failed check.");

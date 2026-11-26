@@ -35,6 +35,7 @@ export interface ReviewRecord {
 
 export interface GateRecord {
   command: string;
+  runner?: "docker";
   /** Bug triage expects the project test command to fail. */
   expectFailure?: boolean;
   code: number;

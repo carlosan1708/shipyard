@@ -22,9 +22,30 @@ When a Claude run reaches its estimated limit, choose **Increase budget** in tha
 
 Claude and Codex can search the web and read public websites without approval. The `read_public_page` tool reads public text without signing in. For a GitHub target, `read_github_origin` reads branch heads and text files from that run’s configured `origin`, using the host’s `gh` sign-in for private repositories. Git pushes, PR creation, and Cloud Run releases use the dashboard handoff for approval.
 
-Agent shells run with external networking disabled, including shell `git fetch` and package installs. Prepare dependencies ahead of time. Shipyard runs project checks with local networking on macOS and in a private network namespace on Linux. On Windows, project checks use the Codex CLI with MXC, host loopback for local test servers, and a proxy that blocks external destinations. Linux requires bubblewrap for project checks and the Claude sandbox also requires its platform dependencies. Process-backed dashboard previews use the macOS sandbox. Static previews are available on Linux.
+Agent shells run with external networking disabled, including shell `git fetch` and package installs. Prepare dependencies ahead of time for native checks. Shipyard runs native project checks with local networking on macOS and in a private network namespace on Linux. On Windows, native project checks use the Codex CLI with MXC, host loopback for local test servers, and a proxy that blocks external destinations. Native Linux checks require bubblewrap and the Claude sandbox also requires its platform dependencies. Process-backed dashboard previews use the macOS sandbox. Static previews are available on Linux.
 
 macOS project checks that honor `CHROME_PATH` can use Shipyard’s launcher for an installed Chrome or Chromium. The launcher runs the browser with the gate’s existing Seatbelt profile because macOS rejects Chrome’s nested sandbox. An explicit host `CHROME_PATH` takes precedence.
+
+### Project checks in Docker
+
+Set `checksDocker` on a target to run its configured `test` and `e2e` commands in Linux containers, including when Shipyard verifies a branch for publication. Start a local Docker daemon in Linux container mode. An image with `/bin/sh` and the project's tools is required. Choose an image with the matching browser installed if your `e2e` command needs one.
+
+```yaml
+targets:
+  my-api:
+    path: ./my-api
+    test: npm test
+    e2e: npm run test:e2e
+    checksDocker:
+      image: node:22-bookworm-slim
+      install: npm ci --ignore-scripts
+```
+
+Shipyard copies the current tracked and non-ignored untracked files before each check, including edits that have yet to be committed. The container writes only to that disposable copy. The checkout must use regular files. Symlinks and submodules need a different setup. Shipyard omits the host Git metadata and keeps agent sessions and publishing credentials in their existing environments.
+
+The optional `install` command has outbound network access and runs before each check in a separate container. Use a trusted command and a trusted image. Test commands use an isolated loopback network so they can start and reach their own test servers. Shipyard removes the container when the check finishes, times out, or is cancelled. The built-in static browser audit and the named before-and-after regression verifier use their existing runners.
+
+To try the scripted demo with Docker, run `npm run shipyard -- ui --demo --docker-checks`. It uses the `demo-shop` image from your configuration when present and defaults to `node:22-bookworm-slim`. The demo has zero package dependencies and uses scripted agents.
 
 ## Targets
 
